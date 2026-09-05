@@ -39,7 +39,7 @@ about your data that the code does not keep is worse than a narrower one:
 | Alters a tool result | **never** | **never** |
 | Claims rollouts from the control plane | **no** | yes |
 | Puts a task into your agent’s context | **no** | yes |
-| Starts turns by itself | **no** | yes (`PERCEPTEYE_UNATTENDED=0` to stop) |
+| Starts turns by itself | **no** | yes |
 | Uploads production turns | [not yet — see below](#production-capture-is-opt-in) | n/a |
 
 In `production` the rollout hooks **are not registered at all** — the guarantee
@@ -119,10 +119,9 @@ default.
 each in its own `percepteye-rollout-*` session — never a session you are using.
 So a training install works the flywheel on its own; you do not have to poke it.
 
-```bash
-# to keep claiming rollouts but only deliver them into turns YOU start:
-export PERCEPTEYE_UNATTENDED=0
-```
+There is no separate switch for this: `PERCEPTEYE_AGENT_MODE=production` is how
+you stop it, and it stops more than the turns — the whole rollout driver is
+never constructed.
 
 **It degrades rather than failing.** OpenClaw restricts its documented
 `scheduleSessionTurn` API to plugins bundled with the host, while handing the

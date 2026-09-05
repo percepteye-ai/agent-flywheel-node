@@ -15,6 +15,8 @@ import { createRolloutDriver } from "../src/rollout.js";
 import {
   JOB_PREFIX, createUnattendedRunner, cronTurnStarter, sessionKeyFor,
 } from "../src/unattended.js";
+import { readFileSync } from "node:fs";
+
 import { resolveConfig } from "../src/config.js";
 
 const trainingApi = () => {
@@ -29,58 +31,41 @@ const trainingApi = () => {
 };
 const TRAINING_ENV = { PERCEPTEYE_AGENT_MODE: "training", PERCEPTEYE_API_KEY: "k" };
 
-describe("unattended is ON in training mode, with a kill switch", () => {
-  it("defaults to true", () => {
-    // Training mode already means "this install claims rollouts and runs
-    // them". Starting the turn is how that is kept, not a further capability,
-    // and a second switch only left the flywheel idle waiting to be poked.
-    assert.equal(resolveConfig({}, {}).unattended, true);
-  });
-
-  it("a typo does not silently switch it OFF", () => {
-    for (const v of ["offf", "disabled", "nope", ""]) {
-      assert.equal(resolveConfig({ unattended: v }, {}).unattended, true,
-        `${JSON.stringify(v)} silently disabled the runner`);
-    }
-  });
-
-  it("honours the kill switch, by config and by environment", () => {
-    for (const v of ["0", "false", "no", "off", "OFF"]) {
-      assert.equal(resolveConfig({ unattended: v }, {}).unattended, false);
-      assert.equal(resolveConfig({}, { PERCEPTEYE_UNATTENDED: v }).unattended, false);
-    }
-  });
-
-  it("registers the gateway hooks in training mode by default", () => {
+describe("the mode is the only switch", () => {
+  it("training mode subscribes the gateway hooks; nothing else is needed", () => {
     const api = trainingApi();
     register(api, {}, TRAINING_ENV);
     for (const h of ["gateway_start", "gateway_stop"]) {
       assert.ok(api.hooks.includes(h), `${h} must be subscribed`);
     }
-    // AND the attended lane stays: unattended ADDS, it does not replace.
+    // AND the delivery lane stays: starting turns ADDS to it, so a host with
+    // no cron seam still claims and delivers rather than losing rollouts.
     assert.ok(api.hooks.includes("session_start"));
   });
 
-  it("registers no gateway hook once the kill switch is thrown", () => {
+  it("NEVER starts turns in production mode", () => {
+    // Structural, not conditional: the rollout driver is not constructed in
+    // production, so this module is never reached. This is the one combination
+    // that would be indefensible -- a plugin starting its own turns inside a
+    // process serving real users.
     const api = trainingApi();
-    register(api, { unattended: false }, TRAINING_ENV);
-    assert.ok(!api.hooks.includes("gateway_start"),
-      "the kill switch must stop the runner being subscribed at all");
-    assert.ok(api.hooks.includes("session_start"),
-      "and the default lane must keep working");
-  });
-
-  it("NEVER starts turns in production mode, kill switch or not", () => {
-    // Structural: the rollout driver is not constructed in production, so
-    // `unattended` is never read there. Asserted because this is the one
-    // combination that would be indefensible -- a plugin starting its own
-    // turns inside a process serving real users.
-    const api = trainingApi();
-    register(api, { unattended: true },
-      { PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_API_KEY: "k" });
+    register(api, {}, { PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_API_KEY: "k" });
     for (const h of ["gateway_start", "gateway_stop", "session_start"]) {
       assert.ok(!api.hooks.includes(h), `production mode subscribed '${h}'`);
     }
+  });
+
+  it("carries no second switch for the same question", () => {
+    // `PERCEPTEYE_AGENT_MODE` answers "does this install drive?". A second
+    // flag would be a second answer to it, and the state it could name --
+    // claim rollouts but wait for a human to start each turn -- has no
+    // customer behind it.
+    const schema = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ).configSchema;
+    assert.ok(!("unattended" in schema.properties),
+      "a per-feature rollout switch is back; the mode already answers this");
+    assert.equal(resolveConfig({}, {}).unattended, undefined);
   });
 });
 

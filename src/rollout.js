@@ -419,17 +419,23 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));
 
-  // ── THE UNATTENDED LANE, ON BY DEFAULT IN TRAINING MODE ───────────────
+  // ── RUNNING THE ROLLOUTS THIS LANE CLAIMS ─────────────────────────────
+  //
+  // Not behind its own switch. `PERCEPTEYE_AGENT_MODE` already answers "does
+  // this install drive?" -- training means it claims rollouts and runs them,
+  // production means it does not -- and a second flag was a second answer to
+  // that same question. The state it would have named, "claim rollouts but
+  // wait for a human to start each turn", is a distinction with no customer
+  // behind it: an operator who wants the agent left alone sets production.
   //
   // Reached only from training mode, because that is the only mode in which
   // this function is called at all. Note what is NOT done here: the hooks
-  // above stay subscribed either way, so if the cron seam is unavailable the
+  // above stay subscribed regardless, so if the cron seam is unavailable the
   // plugin keeps claiming and delivering through injection rather than losing
-  // rollouts entirely. Unattended is an ADDITION to that lane, not a
-  // replacement for it -- which is what makes the kill switch cheap and the
-  // degradation path safe.
+  // rollouts entirely. Starting turns is an ADDITION to that lane, not a
+  // replacement for it -- which is what makes the degradation path safe.
   let unattended = null;
-  if (config.unattended) {
+  {
     // `getCron` lives on the gateway hook CONTEXT and nowhere else, so it has
     // to be captured when the hook fires and resolved lazily afterwards -- the
     // service may not be up at `gateway_start`, which is why this stores the
@@ -451,11 +457,9 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
     api.on("cron_changed", safe(capture));
     api.on(GATEWAY_STOP, safe(() => unattended.stop()));
     logger?.info?.(
-      `[${pluginId}] unattended rollouts are ON: this plugin starts its own ` +
-      `turns in dedicated 'percepteye-rollout-*' sessions, one at a time, in ` +
-      `training mode only. Set config.unattended=false (or ` +
-      `PERCEPTEYE_UNATTENDED=0) to keep claiming rollouts but only deliver ` +
-      `them into turns you start.`,
+      `[${pluginId}] training mode: this plugin claims rollouts and runs them, ` +
+      `starting its own turns in dedicated 'percepteye-rollout-*' sessions, ` +
+      `one at a time. Set PERCEPTEYE_AGENT_MODE=production to stop.`,
     );
   }
 

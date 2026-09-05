@@ -1,23 +1,27 @@
 /**
  * UNATTENDED ROLLOUTS: the plugin starts the turn itself.
  *
- * ON IN TRAINING MODE, with a kill switch (`unattended: false`, or
- * `PERCEPTEYE_UNATTENDED=0`). Never in production mode, where the rollout
- * driver is not constructed at all and this module is never reached.
+ * WHAT TRAINING MODE DOES. There is no switch of its own here, and there were
+ * two wrong answers before this one.
  *
- * IT WAS OPT-IN FIRST, AND THAT WAS WRONG. The argument was that this reaches
- * past a restriction the host states for its own scheduling API, so an
- * operator should choose it. But that treated "the plugin runs the rollout" as
- * something beyond what was asked for, and it is not:
+ * First it was opt-in, on the argument that this reaches past a restriction
+ * the host states for its own scheduling API. That treated "the plugin runs
+ * the rollout" as something beyond what was asked for, and it is not:
  * `PERCEPTEYE_AGENT_MODE=training` already means "this install claims rollouts
  * and runs them", and in that mode the plugin already claims work and puts
  * tasks into the agent's context. Starting the turn is how that promise is
- * kept. A second switch only meant the flywheel sat idle waiting for somebody
- * to poke it -- which is the dormant-by-default drift this project rules
- * against.
+ * kept, so opt-in only meant the flywheel sat idle waiting to be enabled.
  *
- * The real risk is handled below by DEGRADING, not by dormancy: dormancy never
- * made the host seam more stable, it only meant nobody got the capability.
+ * Then it was default-on with its own kill switch, which was the same mistake
+ * one step smaller: `PERCEPTEYE_AGENT_MODE` already answers "does this install
+ * drive?", so a second flag was a second answer to a settled question. The one
+ * state it could have named -- claim rollouts but wait for a human to start
+ * each turn -- has no customer behind it. An operator who wants the agent left
+ * alone sets `production`, and gets a stronger guarantee than a flag: this
+ * module is never even reached.
+ *
+ * The real risk is handled below by DEGRADING, not by a switch: a flag never
+ * made the host seam more stable, it only meant somebody had to know about it.
  *
  * ── WHAT IT REACHES PAST, AND WHY THAT IS SURVIVABLE ──────────────────────
  *

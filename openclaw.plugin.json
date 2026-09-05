@@ -31,14 +31,6 @@
         "default": true,
         "description": "Set false/0/off to disable local capture entirely."
       },
-      "unattended": {
-        "type": [
-          "string",
-          "boolean"
-        ],
-        "default": true,
-        "description": "In training mode, the plugin starts rollout turns itself rather than waiting for you to start one. Has NO effect in production mode. Set false/0/off to keep claiming rollouts but only deliver them into turns you start."
-      },
       "mode": {
         "type": "string",
         "enum": [
