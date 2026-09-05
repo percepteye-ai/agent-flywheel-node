@@ -1,327 +1,203 @@
 <div align="center">
 
-# 🎡 percepteye-agent-flywheel — Node
+# <img src="docs/assets/flywheel-spinner.gif" height="44" alt="" align="absmiddle"> percepteye-agent-flywheel — Node
 
-### **Self-improving agents through continual learning, for OpenClaw and DeepSeek Harness.**
+### **Your agent gets better at its own job, every day, without you writing a training pipeline.**
 
-**Your agent keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
-One plugin. Zero dependencies. Zero lines changed in your agent.
+**It keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
+One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
 [![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
-[![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#dependencies)
-[![tests](https://img.shields.io/badge/tests-node%3Atest-22c55e?style=for-the-badge)](#tests)
+[![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
+[![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
+[![tests](https://img.shields.io/badge/tests-281_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
-**[Install](#install)** · [What it writes](#what-it-writes) · [Why `unknown` is real](#why-unknown-is-a-real-answer) · [Which hook, and why](#which-hook-and-why) · [Python or Node?](#python-or-node)
+<img src="docs/assets/flywheel-overview.gif"
+     width="1040"
+     alt="Your agent — prompt, tools and model — sits inside your infrastructure. The plugin wraps it from the outside with zero lines changed inside. Rollouts and observed outcomes go out; a trained policy comes back. The model row flips from your-model to a policy trained on this agent's own work, while the prompt and tools rows stay untouched.">
+
+**[Install](#-install-in-one-call)** · [How the loop closes](#-how-the-loop-closes) · [Modes](#-two-modes-one-switch) · [Production observability](#-production-observability) · [Harnesses](#-harnesses) · [Python or Node?](#-python-or-node)
 
 </div>
 
 ---
 
-Records what your agent's tools actually did — `ok`, `failed` or **`unknown`** —
-into the trajectory the PerceptEye flywheel trains on.
+**Your agent already does real work. This turns that work into training data, and hands back a model trained on it.**
 
-**It never alters a tool result.** In no mode can this plugin change, block,
-delay or replace what your agent's tools return — that is a property of the
-hook it uses, not a promise about the code. See
-[Which hook, and why](#which-hook-and-why) for the surfaces that *could* have
-changed your run, and why each was rejected.
+No container to build. No cluster to run. No GPU to provision. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you.
 
-**Beyond that, what it does depends on one setting — `PERCEPTEYE_AGENT_MODE`.**
-The guarantee is scoped rather than blanket, because a blanket "observes only"
-stopped being true the moment the plugin could claim rollouts, and a promise
-about your data that the code does not keep is worse than a narrower one:
+<br/>
 
-| | `production` | `training` (default) |
-|---|---|---|
-| Records tool outcomes locally | yes | yes |
-| Alters a tool result | **never** | **never** |
-| Claims rollouts from the control plane | **no** | yes |
-| Puts a task into your agent’s context | **no** | yes |
-| Starts turns by itself | **no** | yes |
-| Captures the turns you serve | yes | n/a |
-| Uploads them | [with consent](#production-capture-is-opt-in) | n/a |
+## 🎯 What you get
 
-In `production` the rollout hooks **are not registered at all** — the guarantee
-is the absence of the subscription, not a branch inside a handler that a later
-edit could invert. `PERCEPTEYE_AGENT_MODE=production` is what you set on the
-process that serves your users.
+| | |
+|:--|:--|
+| 🔁 **A continual-learning loop** | your agent runs graded tasks, its real outcomes go back, and the next model is trained on *this agent's* work — not a generic benchmark |
+| 🤖 **Autonomous post-training** | task generation, grading, dataset construction, training and promotion happen on our side. You build none of it |
+| 🧪 **Tasks from your real tool surface** | the plugin reads the system prompt your host actually assembled and the tool list actually sent to the model, so the work you're graded on is work you can actually do |
+| 📈 **Honest telemetry on day one** | your agent's true tool-failure rate, recorded locally, with **no account and no network** |
+| 📡 **Production observability** | capture the turns you actually serve — the user's message, the tool calls, the answer — and turn live traffic into evidence |
+| 🛡️ **It cannot break your agent** | the hook it uses returns `void`. It can never change, block, delay or replace what a tool returns |
 
-Rollouts are the **OpenClaw** lane. DeepSeek Harness exposes no seam for
-handing a task to a running agent, so on dsh this plugin records outcomes and
-nothing else, in every mode.
+<br/>
 
-## Install
+## ⚡ Install in one call
 
-One package, two harnesses:
+One package, two harnesses. Pick your line:
 
 ```bash
 openclaw plugins install percepteye-agent-flywheel          # OpenClaw
 dsh plugin --profile <name> add percepteye-agent-flywheel   # DeepSeek Harness
 ```
 
-Then set the mode on the process running your agent. This is the setting that
-decides what the install does:
+**That's the integration.** No import, no wrapper process, no sidecar. Start your agent exactly the way you always did.
+
+Want it to start contributing? Add a key and one host setting:
 
 ```bash
-export PERCEPTEYE_AGENT_MODE=production   # observe-only: no rollout is claimed
-export PERCEPTEYE_AGENT_MODE=training     # the default: claim and run rollouts
+export PERCEPTEYE_API_KEY=pefw_...        # optional — without it, nothing leaves the machine
 ```
 
-`PERCEPTEYE_TRAJECTORY_DIR` names where a **training** rollout's tool outcomes
-are written, and the rollout driver sets it per rollout. With it unset,
-training mode writes no trajectory.
+```jsonc
+// your OpenClaw config
+{ "plugins": { "entries": { "percepteye-agent-flywheel": {
+    "hooks": { "allowConversationAccess": true } } } } }
+```
 
-**It is not an off switch for the plugin, and this section used to say it
-was.** In `production` mode the plugin captures the turns your agent serves —
-the end user's message, the tool calls, and the agent's answer — under
-`PERCEPTEYE_CAPTURE_DIR`, default `~/.percepteye/captured`, whether or not
-`PERCEPTEYE_TRAJECTORY_DIR` is set. `PERCEPTEYE_TRAJECTORY_DIR` is not
-consulted there at all, by design: a production trajectory belongs to one
-turn, not to one rollout. Sending those turns anywhere is separately gated and
-off until an operator turns it on — see
-[Production capture is opt-in](#production-capture-is-opt-in) — but writing
-them to disk is not.
+That setting is what lets the plugin read your agent's answer and describe your agent, and it **refuses to claim work without it** rather than half-working. The agent's *answer* arrives on the `agent_end` hook, which OpenClaw drops for non-bundled plugins unless you opt in — and a claimed rollout nobody can report is a lease that just expires. It prints the exact line to add.
 
-The switch that stops the OpenClaw plugin outright, in either mode, is:
+> [!TIP]
+> Everything here is also settable in your OpenClaw config — `apiKey`, `agentId`, `mode`, `capture`, `controlPlaneUrl` — where it lives under the host's own secret handling. Config wins over the environment.
+
+<br/>
+
+## 🔁 How the loop closes
+
+<p align="center">
+  <img src="docs/assets/flywheel-loop.gif" width="980"
+       alt="The SDK inside the customer's agent, talking to the control plane. On the left, inside your infrastructure: install the plugin, your harness loads it, your agent runs unchanged, and its trajectory is recorded. A dashed trust boundary splits the picture. On the right, the control plane: it generates tasks from your tool surface, scores every rollout, trains the policy, and hands a candidate back as an endpoint you can call. A return arrow closes the ring — the better agent runs the next lap.">
+</p>
+
+| beat | what happens | who does the work |
+|:--|:--|:--|
+| **⓪ Describe** | the plugin reads the fully assembled system prompt and the real tool list, and writes `discovered_agent.json` into the rollout's trajectory | automatic |
+| **① Claim** | training mode claims one graded task at a time from the control plane | you dial out — no inbound port |
+| **② Run** | the task is delivered into your agent's context, in a dedicated `percepteye-rollout-*` session | your agent, unchanged |
+| **③ Record** | every executed tool call lands as `ok` / `failed` / **`unknown`** | the `after_tool_call` hook |
+| **④ Report** | the trajectory and the agent's answer go back | the plugin |
+| **⑤ Train** | tasks generated, rollouts graded, dataset built, policy trained and promoted | **Percepteye — you build none of it** |
+| **⑥ Serve** | the trained candidate comes back as an endpoint you can point your agent at | your config, your call |
+
+That last beat is what makes it a flywheel rather than a pipeline: **the better agent generates the better evidence.**
+
+<br/>
+
+## 🎚 Two modes, one switch
+
+Everything the plugin does beyond local recording is decided by `PERCEPTEYE_AGENT_MODE`.
+
+```bash
+export PERCEPTEYE_AGENT_MODE=training     # the default — claim rollouts and run them
+export PERCEPTEYE_AGENT_MODE=production   # observe only — for the process serving your users
+```
+
+| | `training` (default) | `production` |
+|---|---|---|
+| Records tool outcomes locally | yes | yes |
+| Alters a tool result | **never** | **never** |
+| Claims rollouts | yes | **no** |
+| Puts a task into your agent's context | yes | **no** |
+| Starts turns by itself | yes | **no** |
+| Captures the turns you serve | n/a | yes |
+| Uploads them | n/a | only once an operator enables it |
+
+**In `production` the rollout hooks are not registered at all** — the guarantee is the absence of the subscription, not a branch inside a handler that a later edit could invert.
+
+**In `training` the plugin works the flywheel on its own**, starting each rollout's turn in its own `percepteye-rollout-*` session — never one you are using. If the host closes that seam, it says so once and falls back to delivering the task into the next turn you start; rollouts keep working either way.
+
+`PERCEPTEYE_TRAJECTORY_DIR` names where a **training** rollout's outcomes are written, and the rollout driver sets it per rollout. It is not an off switch. This is:
 
 ```bash
 export PERCEPTEYE_CAPTURE=0   # register nothing, record nothing, claim nothing
 ```
 
-With it set the OpenClaw entry registers no hooks at all and says so once at
-startup. That — not an unset trajectory dir — is what lets you leave it
-installed permanently on a process serving your users.
+<br/>
 
-On **DeepSeek Harness** the older claim still holds and is the whole story:
-that lane has no rollout driver and no turn capture, so it writes only to
-`PERCEPTEYE_TRAJECTORY_DIR` and with the variable unset it writes nothing.
+## 📡 Production observability
 
-## Python or Node?
+In `production` mode the plugin records the turns your agent is already serving — one directory per turn, in the same on-disk format the Python SDK writes:
 
-**Pick one.** These are two implementations of the same flywheel for two
-different homes, and a customer installs whichever matches the harness their
-agent already runs in — never both.
+```
+$PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured
+    turns.jsonl        {"kind":"task"|"answer","text","turn_id","conversation_id"}
+    conversation_id
+    tool_calls.jsonl
+```
+
+**Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown.
+
+Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
+
+<br/>
+
+## 🧩 Harnesses
+
+| harness | records outcomes | rollouts | production turn capture |
+|:--|:--|:--|:--|
+| **OpenClaw** | ✅ `after_tool_call` | ✅ training mode | ✅ |
+| **DeepSeek Harness** | ✅ `tools/result` | — | — |
+
+**Rollouts are the OpenClaw lane.** DeepSeek Harness exposes no seam for handing a task to a running agent, so on dsh this plugin records outcomes and nothing else, in every mode — it writes to `PERCEPTEYE_TRAJECTORY_DIR` and with that unset it writes nothing.
+
+Both hooks are structurally incapable of altering a run: OpenClaw's `after_tool_call` returns `void`, and dsh's `tools/result` is `@mode emit` over deep-frozen objects. The mutation seams both harnesses expose — result middleware, `tools/post` — are deliberately unused. A collector that can corrupt the run it is measuring is worse than no collector.
+
+<br/>
+
+## 📄 What it writes
+
+One JSON object per executed tool call, appended to `tool_calls.jsonl`:
+
+```json
+{"name":"exec","arguments":{"command":"exit 3"},"outcome":"failed","status_code":null,"error":"(Command exited with code 3)","error_class":"ToolError","latency_ms":155,"agent_name":"main","tool_call_id":"call_percepteye_1"}
+```
+
+That line is real output from a live OpenClaw run, and it is the same format the Python SDK writes and reads.
+
+<br/>
+
+## ✨ Why it earns its place
+
+- 🪶 **Zero runtime dependencies.** Node builtins only — no version conflict imposed on a customer who did not ask for one, enforced by a CI job.
+- 🔌 **A kill switch that really is one.** `PERCEPTEYE_CAPTURE=0` subscribes no hooks and records nothing, which is what lets it stay installed on a process serving users.
+- 🎯 **`unknown` is a real answer** — a tool call whose verdict nobody stated is never rounded up to `ok`, because a failure scored as a success is training data that teaches the model the failure was fine.
+- 🤝 **One on-disk format across both SDKs**, kept honest by a shared contract schema ([`schema/flywheel-1.json`](schema/flywheel-1.json)) and a test that asserts this package's wire types match it.
+- 🧯 **It degrades, it doesn't fail.** A missing key, an unreachable control plane, a closed host seam — each costs the feature that needed it and says so once. Local recording keeps running.
+- 🔒 **Every lane is opened from your side.** There is no listening socket anywhere in this package.
+
+<br/>
+
+## 🐍 Python or Node?
+
+**Pick one.** Two implementations of the same flywheel for two different homes — install whichever matches the harness your agent already runs in, never both.
 
 | | this package | [`percepteye-agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) (PyPI) |
 |---|---|---|
 | **you have** | an OpenClaw or DeepSeek Harness agent | a Python agent, or a CLI agent you launch yourself |
 | **you install** | a harness plugin | a pip package |
 | **you change** | nothing — the harness loads it | nothing — one import, one call |
-| **runtime deps** | none | one (`httpx`) |
 
-The two are kept honest against each other by a shared contract schema
-([`schema/flywheel-1.json`](schema/flywheel-1.json)) and a test that asserts
-this package's wire types match it — because a comment saying "keep these in
-sync" is not a mechanism.
+<br/>
 
-## Rollouts, in training mode
-
-A rollout is a graded task the control plane hands out. In `training` mode this
-plugin claims one, delivers it into your agent's context, and reports what the
-agent did — which is what produces the trajectories the model is fine-tuned on.
+## 🛠 Develop
 
 ```bash
-export PERCEPTEYE_AGENT_MODE=training     # the default
-export PERCEPTEYE_API_KEY=pefw_...
+npm test     # 281 tests, no install step — node:test, zero dependencies
 ```
 
-and, in your OpenClaw config, the one host setting it needs:
+The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
 
-```json
-{ "plugins": { "entries": { "percepteye-agent-flywheel": {
-    "hooks": { "allowConversationAccess": true } } } } }
-```
+---
 
-**Why that setting is required, and why nothing is claimed without it.** The
-agent's *answer* arrives on the `agent_end` hook, which OpenClaw classifies as
-a conversation hook and drops for any non-bundled plugin unless you opt in.
-Without it the plugin could claim work and never report it — and a claimed
-rollout is a lease nobody else can take, so the queue would look busy while
-nothing progressed. It therefore refuses to claim at all and prints the setting
-to add. Delivery itself needs no opt-in: next-turn injection is allowed by
-default.
-
-**In training mode the plugin starts the turns itself**, one rollout at a time,
-each in its own `percepteye-rollout-*` session — never a session you are using.
-So a training install works the flywheel on its own; you do not have to poke it.
-
-There is no separate switch for this: `PERCEPTEYE_AGENT_MODE=production` is how
-you stop it, and it stops more than the turns — the whole rollout driver is
-never constructed.
-
-**It degrades rather than failing.** OpenClaw restricts its documented
-`scheduleSessionTurn` API to plugins bundled with the host, while handing the
-underlying cron service to every plugin regardless of origin — which is what
-makes this possible, and which could be closed in a patch release. If it is,
-the plugin says so once and falls back to delivering tasks into the next turn
-you start. Rollouts keep working either way; only the "who starts the turn"
-half changes. That fallback is also exactly what the Python SDK's CLI-hook lane
-does, so the two stay at parity in the worst case.
-
-None of this happens in `production` mode, in any configuration: the rollout
-driver is never constructed there.
-
-### Production capture is opt-in
-
-In `production` mode the plugin records the turns your agent is already
-serving — the end user's message, the tool calls, and the agent's answer — as
-one directory per turn, in the same on-disk format the Python SDK writes:
-
-```
-<capture root>/<runId>/
-    turns.jsonl        {"kind":"task"|"answer", "text", "turn_id", "conversation_id"}
-    conversation_id
-    tool_calls.jsonl
-```
-
-**Uploading is off until an operator turns it on, per agent.** That is a
-deliberate exception to this project's default-on rule: a production turn
-carries *your end users'* own messages, so a default that starts sending them
-is a disclosure nobody made. The plugin asks the control plane directly —
-`GET /agents/{agent_id}/capture`, a plain read — so it never learns its
-permission by uploading and finding out. Once enabled, turns go up every 32 and again at gateway shutdown; turns
-with no answer are held back until shutdown, because an answer may still be
-coming.
-
-**Two things affect how complete a captured turn is:**
-
-- The **answer** arrives on `agent_end`, a conversation hook. Without
-  `allowConversationAccess=true` the host drops it and turns are captured with
-  their tool calls but no `final_text`. They are still stored and are graded
-  advisory with that reason — nothing that needs a completion can use them. The
-  plugin says so once at startup rather than leaving you to wonder.
-- The **user's message** arrives on `message_received`, which OpenClaw emits on
-  the inbound channel path. An agent served over a channel gets it; a local
-  terminal session does not, and the turn is uploaded without `input_text`
-  rather than having one invented from the model's prompt.
-
-Recording is unaffected by all of this: it never leaves the machine, and works
-with no account at all.
-
-## What it writes
-
-One JSON object per executed tool call, appended to
-`$PERCEPTEYE_TRAJECTORY_DIR/tool_calls.jsonl`:
-
-```json
-{"name":"exec","arguments":{"command":"exit 3"},"outcome":"failed","status_code":null,"error":"(Command exited with code 3)","error_class":"ToolError","latency_ms":155,"agent_name":"main","tool_call_id":"call_percepteye_1"}
-```
-
-That line is real output from a live OpenClaw run, and it is the same format
-the Python SDK writes and reads. Two implementations, one on-disk format —
-which is what lets a Python parent read a Node agent's outcomes, and what the
-shared contract schema exists to keep true.
-
-## Why `unknown` is a real answer
-
-`unknown` means the call executed and the host did not tell us whether it
-worked. It is never rounded up to `ok`, because a tool call scored as a success
-when nobody said so is training data that teaches the model a failure was fine.
-
-The distinction is not academic here. In a real run OpenClaw reports
-`details.status: "completed"` for a command that exited **3** — `completed`
-means the process finished, not that it worked. A classifier keying on that
-field would grade every failed command as a success. So this plugin reads the
-exit code, and where it cannot read one it says `unknown`:
-
-| what we see | outcome |
-|---|---|
-| host sets `error` | `failed` |
-| `exec`/`bash` with exit 0 | `ok` |
-| `exec`/`bash` with non-zero exit | `failed` |
-| `exec`/`bash`, exit code unreadable | `unknown` |
-| `read`, `write`, `edit`, `ls`, `grep`, `find` with no error | `ok` |
-| anything else — MCP tools, third-party plugin tools | `unknown` |
-
-The last row is the important one. An MCP server that returns `{"error": ...}`
-as ordinary content looks identical to success from here, so the honest answer
-is that we did not observe the verdict. Tools move out of that row when a
-fixture proves how they report failure — promotion is earned, never assumed.
-
-## Which hook, and why
-
-### OpenClaw
-
-OpenClaw exposes three places to see a tool result. Only one is both complete
-and structurally incapable of changing the run:
-
-| surface | can it alter the result? | |
-|---|---|---|
-| `registerAgentToolResultMiddleware` | **yes** — its return value replaces what the model reads | rejected |
-| `registerAgentEventSubscription` | no, but the payload is split across two events and exec results are capped before dispatch | rejected |
-| `api.on("after_tool_call", …)` | no — returns `void` | **used** |
-
-`after_tool_call` carries the whole call in one event — `params`, `result`,
-`error`, `durationMs`, `toolCallId`, plus agent and session identity — so the
-safer hook is also the more complete one. It costs nothing to be unable to
-break your agent.
-
-The rule behind it: capturing evidence must never be able to change the
-behaviour being measured. A collector that can corrupt the run it is measuring
-is worse than no collector.
-
-`openclaw plugins doctor` reports this plugin as *hook-only*, which is correct
-— an observer claims no capability seam, and the manifest declares no
-`contracts` because there is none to declare.
-
-### DeepSeek Harness
-
-dsh's tool pipeline is mostly waterfalls: `tools/execute` wraps dispatch,
-`tools/post` can accept, replace or **block** a result, and
-`tools/code-dispatch-log` rewrites what gets logged. A listener on any of them
-can change what the model sees.
-
-`tools/result` is declared `@mode emit` and typed to return `undefined`, and
-the registry **deep-freezes** both the execution and the result before
-publishing them — with an invariant that fails the harness if it ever publishes
-something unfrozen. So this plugin cannot alter a tool result even by accident:
-there is no return channel, and the object it receives is immutable.
-
-dsh's exec tools also declare a real output schema — `kind`, `exitCode`,
-`signal`, `timedOut`, `aborted` — which lets three cases be told apart that a
-cruder reading merges:
-
-| what dsh reports | outcome |
-|---|---|
-| `isError: true` | `failed` (with its own error class) |
-| foreground, exit 0 | `ok` |
-| foreground, non-zero exit | `failed` |
-| killed by a signal, or timed out | `failed` |
-| **`kind: "background"`** | **`unknown`** — launched, not finished |
-| **`aborted: true`** | **`unknown`** — cancelled, which is not the agent's mistake |
-| exit unreadable | `unknown` |
-
-A backgrounded command has no exit code because nothing has exited; grading it
-`ok` would claim a result for work still running. An aborted one never got to
-say what it would have done.
-
-The two entries are separate modules on purpose. Cordis normalises a plugin
-with `exports.default ?? exports`, so a `default` export would be handed to it
-*instead of* `apply` — the OpenClaw entry needs a default and the dsh entry
-must not have one.
-
-## Dependencies
-
-None — no third-party package, which the `no-dependencies` CI job
-enforces. Node builtins only: `node:fs`, `node:path`, `node:crypto` (the
-cross-SDK idempotency digest) and `node:os` (home-directory resolution, which
-is where production capture writes). This runs inside someone else's agent
-process, and every dependency added here is a version conflict imposed on a
-customer who did not ask for it.
-
-## Tests
-
-```bash
-npm test
-```
-
-The suite includes payloads captured verbatim from a live OpenClaw run
-(`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those
-fail — and someone re-reads the payload, rather than discovering it months
-later from bad training data.
-
-## License
-
-MIT — see [LICENSE](LICENSE). Same licence as the Python SDK.
+MIT — see [LICENSE](LICENSE) · security reports: **security@percepteye.ai** · issues and PRs welcome at [agent-flywheel-node](https://github.com/percepteye-ai/agent-flywheel-node/issues).
