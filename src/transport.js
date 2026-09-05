@@ -10,23 +10,49 @@ import { createHash } from "node:crypto";
 import { rolloutOutputToWire, rolloutRequestFromWire } from "./wire.js";
 
 /**
- * JSON with object keys sorted, at every depth.
+ * `json.dumps(value, sort_keys=True)`, in JavaScript.
  *
- * `json.dumps(..., sort_keys=True)` is what the Python end hashes, and
- * `JSON.stringify` preserves insertion order instead. Two SDKs that hashed
- * the same turns into different keys would each defeat the other's batch
- * de-duplication -- which matters exactly once, for the customer who
- * migrates between harnesses with turns still on disk.
+ * THE IDEMPOTENCY KEY IS A CROSS-SDK CONTRACT, and this function is the whole
+ * of it. Both packages hash a batch of turns and send the digest as that
+ * batch's `Idempotency-Key`; a customer who migrates harnesses with turns
+ * still on disk gets each SDK defeating the other's de-duplication if the two
+ * hash the same payload differently.
+ *
+ * `JSON.stringify` differs from Python's default in THREE ways, and this
+ * shipped claiming a parity it did not have until a test in the Python package
+ * (`test_report_turns_wire.py`) hashed one real batch through both ends and
+ * compared the digests:
+ *
+ *   1. KEY ORDER  -- Python sorts; JS preserves insertion order.
+ *   2. SEPARATORS -- Python's defaults are ", " and ": ", WITH the spaces.
+ *   3. NON-ASCII  -- Python's `ensure_ascii=True` escapes every non-ASCII
+ *      codepoint; JS emits it literally. This is the one that bites in
+ *      practice, because what is being hashed is end users' own messages.
  */
 function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(", ")}]`;
   if (value && typeof value === "object") {
     const body = Object.keys(value).sort()
-      .map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`)
-      .join(",");
+      .map((k) => `${pyStr(k)}: ${stableStringify(value[k])}`)
+      .join(", ");
     return `{${body}}`;
   }
-  return JSON.stringify(value === undefined ? null : value);
+  if (typeof value === "string") return pyStr(value);
+  if (value === undefined) return "null";
+  return JSON.stringify(value);
+}
+
+/** Everything `ensure_ascii=True` escapes and `JSON.stringify` does not. */
+const NON_ASCII = new RegExp("[\\u007f-\\uffff]", "g");
+
+/** One string, escaped the way `json.dumps(ensure_ascii=True)` escapes it. */
+function pyStr(s) {
+  // JSON.stringify already escapes quotes, backslashes and control characters
+  // exactly as Python does; only the non-ASCII codepoints must be folded down.
+  return JSON.stringify(s).replace(
+    NON_ASCII,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));

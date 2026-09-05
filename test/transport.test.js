@@ -109,3 +109,54 @@ describe("registration", () => {
     assert.throws(() => new AttachTransport({}, {}));
   });
 });
+
+describe("the turn-upload wire", () => {
+  it("posts the intake's route and body", async () => {
+    const calls = [];
+    const tx = new AttachTransport(
+      { request: (m, p, o) => { calls.push({ m, p, ...o }); } },
+      { agentId: "a1" });
+    await tx.reportTurns("a1", [{ turn_id: "t1", final_text: "x" }]);
+    assert.equal(calls[0].m, "POST");
+    assert.equal(calls[0].p, "/turns");
+    assert.deepEqual(Object.keys(calls[0].jsonBody).sort(), ["agent_id", "turns"]);
+  });
+
+  it("derives a key that is stable per batch and differs across batches", async () => {
+    const key = async (turns) => {
+      const calls = [];
+      await new AttachTransport({ request: (m, p, o) => calls.push(o) },
+                                { agentId: "a1" }).reportTurns("a1", turns);
+      return calls[0].idempotencyKey;
+    };
+    const a = await key([{ turn_id: "t1", final_text: "x" }]);
+    assert.equal(a, await key([{ turn_id: "t1", final_text: "x" }]));
+    assert.notEqual(a, await key([{ turn_id: "t1", final_text: "y" }]));
+    assert.match(a, /^turns-a1-[0-9a-f]{32}$/);
+  });
+
+  it("hashes key ORDER, SEPARATORS and NON-ASCII the way Python does", async () => {
+    // The three ways JSON.stringify differs from json.dumps. Each is asserted
+    // here so the Node side alone goes red on a regression; the Python package
+    // additionally hashes one real batch through BOTH ends and compares, which
+    // is what caught all three after this shipped claiming parity it lacked.
+    const key = async (turns) => {
+      const calls = [];
+      await new AttachTransport({ request: (m, p, o) => calls.push(o) },
+                                { agentId: "a1" }).reportTurns("a1", turns);
+      return calls[0].idempotencyKey;
+    };
+    // Key order must not matter: Python sorts.
+    assert.equal(await key([{ b: 1, a: 2 }]), await key([{ a: 2, b: 1 }]));
+    // Non-ASCII must fold to \uXXXX, so these differ from their escaped forms
+    // only if the folding is absent. Assert against a KNOWN Python digest.
+    const nonAscii = await key([{ turn_id: "t1", final_text: "mañana — 📦" }]);
+    assert.equal(nonAscii, PY_NON_ASCII_KEY,
+      "the non-ASCII digest no longer matches json.dumps(ensure_ascii=True)");
+  });
+});
+
+//: Produced by the Python end, verbatim:
+//:   AttachTransport(c, "a1").report_turns(
+//:       "a1", [{"turn_id": "t1", "final_text": "mañana — \U0001f4e6"}])
+const PY_NON_ASCII_KEY = "turns-a1-a496e0f0d4c048270af7fa9b8de992ed";
