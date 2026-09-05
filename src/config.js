@@ -16,6 +16,47 @@
  */
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 
+/**
+ * The settings this plugin accepts, declared ONCE.
+ *
+ * `openclaw.plugin.json` carries a copy because that is the file the host
+ * reads before any of this code loads. The copy is not a second answer: a test
+ * asserts the two are identical, which is the only thing that keeps them so --
+ * and they had already diverged. `index.js` declared
+ * `{additionalProperties: false, properties: {}}`, which does not merely fail
+ * to read the settings, it REJECTS them: a customer following the manifest and
+ * setting `apiKey` would have had it refused by the schema the module exports.
+ */
+export const CONFIG_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    apiKey: {
+      type: "string",
+      minLength: 1,
+      description:
+        "PerceptEye flywheel key (pefw_...). Without it the plugin records " +
+        "locally and contacts nothing.",
+    },
+    agentId: {
+      type: "string",
+      minLength: 1,
+      default: "openclaw",
+      description: "The agent name this install reports as.",
+    },
+    controlPlaneUrl: {
+      type: "string",
+      format: "uri",
+      description: "Override the control-plane base URL.",
+    },
+    capture: {
+      type: ["string", "boolean"],
+      default: true,
+      description: "Set false/0/off to disable local capture entirely.",
+    },
+  },
+};
+
 const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
 
 const firstString = (...values) => {

@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Both ends of OpenClaw's supported engine range. A plugin runs inside
+    # somebody else's process on whatever Node they already have, so testing
+    # one version tests the version WE happen to run, not the one a customer
+    # does.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["22", "24"]
+    # A backstop for a hang OUTSIDE a test, which the per-test timeout cannot
+    # catch. In the repo this was split from, this job once sat for six minutes
+    # and reported nothing until it was cancelled by hand.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No `npm ci`: there is no lockfile because there are no dependencies,
+      # and `npm install` on a dependency-free package would only prove npm
+      # works. The suite is node:test, which needs nothing installed.
+      - run: npm test
+
+  no-dependencies:
+    # This plugin runs inside someone else's agent process. A dependency here
+    # is a version conflict imposed on a customer who did not ask for one --
+    # and peerDependencies count, because npm 7+ installs them unless they are
+    # explicitly optional, and an optional peer on ONE of the two harnesses
+    # this package supports is wrong for users of the other.
+    #
+    # This assertion was RED in the repo this was split from, which is how the
+    # package reached a publish window with its own suite not running.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the plugin has no dependencies
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            for (const key of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+              if (pkg[key] && Object.keys(pkg[key]).length) {
+                console.error(`${key} must stay empty: ${JSON.stringify(pkg[key])}`);
+                process.exit(1);
+              }
+            }
+            console.log("no dependencies, as required");
+          '
+
+  publishable:
+    # What `npm publish` would actually ship, checked BEFORE a release rather
+    # than discovered from a published tarball nobody can unpublish.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: the tarball carries what it claims
+        run: |
+          npm pack --silent >/dev/null
+          tar -tzf percepteye-agent-flywheel-*.tgz | sed 's|^package/||' | sort > /tmp/shipped.txt
+          echo "--- shipped ---"; cat /tmp/shipped.txt
+          # LICENSE is the one npm will NOT add for you from a parent
+          # directory, and package.json declares MIT. A tarball asserting a
+          # licence it does not carry is the defect this checks for.
+          grep -qx "LICENSE" /tmp/shipped.txt \
+            || { echo "LICENSE missing from the tarball"; exit 1; }
+          grep -qx "README.md" /tmp/shipped.txt \
+            || { echo "README.md missing from the tarball"; exit 1; }
+          grep -qx "openclaw.plugin.json" /tmp/shipped.txt \
+            || { echo "the OpenClaw manifest is missing"; exit 1; }
+          grep -qx "cordis.patch.yml" /tmp/shipped.txt \
+            || { echo "the DeepSeek Harness patch is missing"; exit 1; }
+          grep -qx "schema/flywheel-1.json" /tmp/shipped.txt \
+            || { echo "the contract schema is missing"; exit 1; }
+          # Tests are not shipped: they are the largest part of the repo and
+          # nothing installs them.
+          if grep -q "^test/" /tmp/shipped.txt; then
+            echo "test/ must not ship"; exit 1
+          fi
+      - name: the entry points the manifests name actually exist
+        # openclaw.plugin.json and cordis.patch.yml each name a file the HOST
+        # will load. A manifest pointing at a path that is not in `files` is a
+        # plugin that installs and cannot start, and npm will not catch it.
+        run: |
+          node -e '
+            const { readFileSync, existsSync } = require("node:fs");
+            const pkg = require("./package.json");
+            const targets = new Set();
+            for (const p of Object.values(pkg.exports ?? {})) targets.add(p);
+            for (const p of pkg.openclaw?.extensions ?? []) targets.add(p);
+            const patch = pkg.dsh?.bundle?.patch;
+            if (patch) targets.add(patch);
+            let bad = 0;
+            for (const t of targets) {
+              if (!existsSync(t)) { console.error(`missing entry point: ${t}`); bad = 1; }
+            }
+            process.exit(bad);
+          '

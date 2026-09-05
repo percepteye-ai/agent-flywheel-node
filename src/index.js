@@ -35,15 +35,43 @@
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
+import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
 
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
 
-export function register(api) {
+export function register(api, pluginConfig = {}, env = process.env) {
   if (typeof api?.on !== "function") return null;
 
   const logger = api.logger ?? api.runtime?.logger ?? null;
+
+  // THE KILL SWITCH, honoured. `openclaw.plugin.json` promises "Set
+  // false/0/off to disable local capture entirely", and `resolveConfig`
+  // computed `captureEnabled` for exactly that -- but nothing read it, and
+  // `trajectory.js` records on the trajectory dir alone. A customer who set
+  // PERCEPTEYE_CAPTURE=0 kept being recorded, which is the worst kind of
+  // defect: a promise about somebody's data that the code does not keep.
+  //
+  // `pluginConfig` is a SECOND parameter with a default rather than a
+  // required one, so this works whether or not the host passes config to
+  // register(). Where it does, config wins; where it does not, the
+  // environment still switches capture off. A fix that only worked once we
+  // learned the host's calling convention would leave the promise broken in
+  // the meantime.
+  // `env` is a parameter, not a read of the global, so the gate is testable
+  // without mutating process.env under a parallel test runner -- and it
+  // matches resolveConfig's own signature rather than inventing a second
+  // convention for the same thing.
+  const config = resolveConfig(pluginConfig, env);
+  if (!config.captureEnabled) {
+    logger?.info?.(
+      `[${PLUGIN_ID}] capture is disabled by configuration; recording nothing. ` +
+      `Unset PERCEPTEYE_CAPTURE (or plugins.entries.${PLUGIN_ID}.config.capture) ` +
+      `to re-enable.`,
+    );
+    return null;
+  }
   const writer = createWriter({
     onError: (err) => logger?.warn?.(
       `[${PLUGIN_ID}] trajectory write failed; tool outcomes are not being ` +
@@ -97,6 +125,9 @@ export default {
   description:
     "Records tool-call outcomes (ok/failed/unknown) into the active " +
     `rollout's trajectory. Inert unless ${TRAJECTORY_DIR_ENV} is set.`,
-  configSchema: { type: "object", additionalProperties: false, properties: {} },
+  // THE SAME OBJECT the manifest declares, not a second one. This used to be
+  // `{additionalProperties: false, properties: {}}` -- a schema that rejects
+  // every setting openclaw.plugin.json tells a customer to write.
+  configSchema: CONFIG_SCHEMA,
   register,
 };
