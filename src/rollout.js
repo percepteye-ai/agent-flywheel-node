@@ -72,10 +72,13 @@
  * the exact setting, instead of a queue that quietly stops moving.
  */
 import { ConfigurationError } from "./errors.js";
+import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 
 export const SESSION_START = "session_start";
 export const SESSION_END = "session_end";
 export const AGENT_END = "agent_end";
+export const GATEWAY_START = "gateway_start";
+export const GATEWAY_STOP = "gateway_stop";
 
 /** The host's own ceilings, so an oversized task is refused, not dropped. */
 export const MAX_INJECTION_BYTES = 32 * 1024;
@@ -189,6 +192,11 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
         `lease will lapse on its own: ${err?.message ?? err}`,
       );
     }
+  }
+
+  /** Record a rollout as running in `sessionKey`, so `onAgentEnd` reports it. */
+  function track(sessionKey, rollout) {
+    inFlight.set(sessionKey, rollout);
   }
 
   async function onSessionStart(event) {
@@ -343,7 +351,11 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
     return rollout;
   }
 
-  return { onSessionStart, onAgentEnd, onSessionEnd, inFlight };
+  // `track` and `giveBack` are what the UNATTENDED runner needs: it does its
+  // own claiming and turn-starting, but reporting and typed abandon must stay
+  // in one place, or an unattended rollout and an attended one would end two
+  // different ways.
+  return { onSessionStart, onAgentEnd, onSessionEnd, inFlight, track, giveBack };
 }
 
 /** The last assistant message's text, or "" when there is none. */
@@ -407,5 +419,46 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));
 
+  // ── THE UNATTENDED LANE, ON BY DEFAULT IN TRAINING MODE ───────────────
+  //
+  // Reached only from training mode, because that is the only mode in which
+  // this function is called at all. Note what is NOT done here: the hooks
+  // above stay subscribed either way, so if the cron seam is unavailable the
+  // plugin keeps claiming and delivering through injection rather than losing
+  // rollouts entirely. Unattended is an ADDITION to that lane, not a
+  // replacement for it -- which is what makes the kill switch cheap and the
+  // degradation path safe.
+  let unattended = null;
+  if (config.unattended) {
+    // `getCron` lives on the gateway hook CONTEXT and nowhere else, so it has
+    // to be captured when the hook fires and resolved lazily afterwards -- the
+    // service may not be up at `gateway_start`, which is why this stores the
+    // context rather than the service. `cron_changed` carries the same
+    // context and is captured too, so a cron that arrives later is still
+    // reachable.
+    let gatewayCtx = null;
+    unattended = createUnattendedRunner({
+      transport,
+      driver,
+      startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
+      logger,
+    });
+    const capture = (_event, ctx) => {
+      if (ctx?.getCron) gatewayCtx = ctx;
+      unattended.start();
+    };
+    api.on(GATEWAY_START, safe(capture));
+    api.on("cron_changed", safe(capture));
+    api.on(GATEWAY_STOP, safe(() => unattended.stop()));
+    logger?.info?.(
+      `[${pluginId}] unattended rollouts are ON: this plugin starts its own ` +
+      `turns in dedicated 'percepteye-rollout-*' sessions, one at a time, in ` +
+      `training mode only. Set config.unattended=false (or ` +
+      `PERCEPTEYE_UNATTENDED=0) to keep claiming rollouts but only deliver ` +
+      `them into turns you start.`,
+    );
+  }
+
+  driver.unattended = unattended;
   return driver;
 }

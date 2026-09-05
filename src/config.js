@@ -56,6 +56,15 @@ export const CONFIG_SCHEMA = {
       default: true,
       description: "Set false/0/off to disable local capture entirely.",
     },
+    unattended: {
+      type: ["string", "boolean"],
+      default: true,
+      description:
+        "In training mode, the plugin starts rollout turns itself rather than " +
+        "waiting for you to start one. Has NO effect in production mode. Set " +
+        "false/0/off to keep claiming rollouts but only deliver them into " +
+        "turns you start.",
+    },
     mode: {
       type: "string",
       enum: [
@@ -102,6 +111,30 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
       env.PERCEPTEYE_CONTROL_PLANE_URL,
       env.CONTROL_PLANE_ENV_URL,
     ) ?? DEFAULT_CONTROL_PLANE,
+    // ON unless DELIBERATELY disabled, exactly like `capture`, and for the
+    // same reason a typo must not silently switch it off.
+    //
+    // THIS WAS OPT-IN FIRST, AND THAT WAS WRONG. The argument for opt-in was
+    // that starting turns reaches past a restriction the host states for its
+    // own scheduling API. But it treated "the plugin runs the rollout" as a
+    // capability beyond what the operator asked for, and it is not:
+    // `PERCEPTEYE_AGENT_MODE=training` already means "this install claims
+    // rollouts and runs them", and in that mode the plugin ALREADY claims work
+    // and puts tasks into the agent's context. Starting the turn is how that
+    // promise is kept, not a further intrusion -- and requiring a second
+    // switch just meant the flywheel sat idle waiting for somebody to poke it.
+    //
+    // The genuine risk -- that the host seam is closed in a patch release --
+    // is handled by DEGRADING to task delivery, which is automatic and needs
+    // no setting. Dormant-by-default never made the seam more stable; it only
+    // meant nobody got the capability.
+    //
+    // It has no effect in production mode, structurally: the rollout driver is
+    // never constructed there, so this value is never read.
+    unattended: !["0", "false", "no", "off"].includes(
+      String(pluginConfig.unattended ?? env.PERCEPTEYE_UNATTENDED ?? "")
+        .trim().toLowerCase(),
+    ),
     // Capture is on unless DELIBERATELY disabled. A typo must not silently
     // switch it off and leave the operator believing it is on.
     captureEnabled: !["0", "false", "no", "off"].includes(

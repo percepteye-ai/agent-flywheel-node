@@ -38,7 +38,8 @@ about your data that the code does not keep is worse than a narrower one:
 | Records tool outcomes locally | yes | yes |
 | Alters a tool result | **never** | **never** |
 | Claims rollouts from the control plane | **no** | yes |
-| Puts a task into your agent's context | **no** | yes |
+| Puts a task into your agent’s context | **no** | yes |
+| Starts turns by itself | **no** | yes (`PERCEPTEYE_UNATTENDED=0` to stop) |
 | Uploads production turns | [not yet — see below](#production-capture-is-opt-in) | n/a |
 
 In `production` the rollout hooks **are not registered at all** — the guarantee
@@ -114,20 +115,26 @@ nothing progressed. It therefore refuses to claim at all and prints the setting
 to add. Delivery itself needs no opt-in: next-turn injection is allowed by
 default.
 
-**Today the plugin does not start the turn — you or your harness do.** The task
-is placed in the *next* turn your agent takes. The Python SDK's CLI-hook lane
-has the same shape (there the task is written into the working directory), so
-the two are at parity; this lane simply delivers into the agent's real context,
-exactly once, and can tell whether delivery succeeded.
+**In training mode the plugin starts the turns itself**, one rollout at a time,
+each in its own `percepteye-rollout-*` session — never a session you are using.
+So a training install works the flywheel on its own; you do not have to poke it.
 
-That is a **choice, not a limit**. OpenClaw restricts its documented
-`scheduleSessionTurn` API to plugins bundled with the host, but the underlying
-cron service is handed to every plugin regardless of origin, and a job carrying
-an `agentTurn` payload does start a turn. Reaching past a restriction the host
-states explicitly, using a seam it leaves open elsewhere, is not something this
-package does quietly inside your agent — it could be closed in any patch
-release. If you want unattended rollouts, that is the mechanism, and it should
-be a decision you make rather than a default you inherit.
+```bash
+# to keep claiming rollouts but only deliver them into turns YOU start:
+export PERCEPTEYE_UNATTENDED=0
+```
+
+**It degrades rather than failing.** OpenClaw restricts its documented
+`scheduleSessionTurn` API to plugins bundled with the host, while handing the
+underlying cron service to every plugin regardless of origin — which is what
+makes this possible, and which could be closed in a patch release. If it is,
+the plugin says so once and falls back to delivering tasks into the next turn
+you start. Rollouts keep working either way; only the "who starts the turn"
+half changes. That fallback is also exactly what the Python SDK's CLI-hook lane
+does, so the two stay at parity in the worst case.
+
+None of this happens in `production` mode, in any configuration: the rollout
+driver is never constructed there.
 
 ### Production capture is opt-in
 
