@@ -21,6 +21,12 @@ the Python `fw.apply_current_policy(...)`, because `policyCurrent()` on this
 package's transport **has no caller**: the plugin does not fetch a trained
 policy, so drawing that call would invent a capability.
 
+`flywheel-loop` is drawn on a WHITE ground (`THEME=light`, the default in
+`render_flywheel_loop.py`). The dark original looked handsome in isolation and
+was hard to read inline in a README — pale text on near-black, at whatever size
+the page gives it, beside white page chrome. Every accent is darkened rather
+than inverted, because a colour tuned to glow on #0d1117 washes out on white.
+
 Regenerate after touching either renderer. These are documentation only —
 `files` in package.json is a whitelist and excludes `docs/`, so none of this
 reaches the npm tarball.
