@@ -22,10 +22,33 @@ One plugin. Zero dependencies. Zero lines changed in your agent.
 Records what your agent's tools actually did — `ok`, `failed` or **`unknown`** —
 into the trajectory the PerceptEye flywheel trains on.
 
-**Observes only.** It cannot alter, block, delay or replace a tool result — and
-that is a property of the hooks it uses, not a promise about the code. See
+**It never alters a tool result.** In no mode can this plugin change, block,
+delay or replace what your agent's tools return — that is a property of the
+hook it uses, not a promise about the code. See
 [Which hook, and why](#which-hook-and-why) for the surfaces that *could* have
 changed your run, and why each was rejected.
+
+**Beyond that, what it does depends on one setting — `PERCEPTEYE_AGENT_MODE`.**
+The guarantee is scoped rather than blanket, because a blanket "observes only"
+stopped being true the moment the plugin could claim rollouts, and a promise
+about your data that the code does not keep is worse than a narrower one:
+
+| | `production` | `training` (default) |
+|---|---|---|
+| Records tool outcomes locally | yes | yes |
+| Alters a tool result | **never** | **never** |
+| Claims rollouts from the control plane | **no** | yes |
+| Puts a task into your agent's context | **no** | yes |
+| Uploads production turns | [not yet — see below](#production-capture-is-opt-in) | n/a |
+
+In `production` the rollout hooks **are not registered at all** — the guarantee
+is the absence of the subscription, not a branch inside a handler that a later
+edit could invert. `PERCEPTEYE_AGENT_MODE=production` is what you set on the
+process that serves your users.
+
+Rollouts are the **OpenClaw** lane. DeepSeek Harness exposes no seam for
+handing a task to a running agent, so on dsh this plugin records outcomes and
+nothing else, in every mode.
 
 ## Install
 
@@ -63,6 +86,59 @@ The two are kept honest against each other by a shared contract schema
 ([`schema/flywheel-1.json`](schema/flywheel-1.json)) and a test that asserts
 this package's wire types match it — because a comment saying "keep these in
 sync" is not a mechanism.
+
+## Rollouts, in training mode
+
+A rollout is a graded task the control plane hands out. In `training` mode this
+plugin claims one, delivers it into your agent's context, and reports what the
+agent did — which is what produces the trajectories the model is fine-tuned on.
+
+```bash
+export PERCEPTEYE_AGENT_MODE=training     # the default
+export PERCEPTEYE_API_KEY=pefw_...
+```
+
+and, in your OpenClaw config, the one host setting it needs:
+
+```json
+{ "plugins": { "entries": { "percepteye-agent-flywheel": {
+    "hooks": { "allowConversationAccess": true } } } } }
+```
+
+**Why that setting is required, and why nothing is claimed without it.** The
+agent's *answer* arrives on the `agent_end` hook, which OpenClaw classifies as
+a conversation hook and drops for any non-bundled plugin unless you opt in.
+Without it the plugin could claim work and never report it — and a claimed
+rollout is a lease nobody else can take, so the queue would look busy while
+nothing progressed. It therefore refuses to claim at all and prints the setting
+to add. Delivery itself needs no opt-in: next-turn injection is allowed by
+default.
+
+**What this plugin cannot do: start a turn.** OpenClaw restricts
+`scheduleSessionTurn` to plugins bundled with the host — for anything installed
+from npm it is a silent no-op. So the task is placed in the *next* turn your
+agent takes; you or your harness still start it. The Python SDK's CLI-hook lane
+has the same shape (there the task is written into the working directory), so
+the two are at parity — this lane simply delivers into the agent's real context,
+exactly once, and can tell whether delivery succeeded.
+
+### Production capture is opt-in
+
+**This package does not upload production turns today.** In `production` mode
+it records tool outcomes locally and sends nothing. The Python SDK's `attach()`
+does upload them, and that is the one capability where the two are not yet at
+parity; it is the next piece of work here.
+
+Worth knowing before it lands, because it governs whether anything will arrive
+when it does: uploading production turns is **off until an operator turns it on,
+per agent**. That is a deliberate exception to this project's default-on rule —
+a production turn carries *your end users'* own messages, so a default that
+starts sending them is a disclosure nobody made. The control plane answers the
+question when an agent registers, so a client never learns its permission by
+uploading and finding out.
+
+Local recording is unaffected by any of this. It never leaves the machine, and
+it works with no account at all.
 
 ## What it writes
 

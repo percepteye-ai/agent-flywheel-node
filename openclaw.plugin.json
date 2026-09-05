@@ -1,7 +1,7 @@
 {
   "id": "percepteye-agent-flywheel",
   "name": "PerceptEye Agent Flywheel",
-  "description": "Close the loop on your OpenClaw agent: record real tool-call outcomes, claim graded rollouts, and report them back \u2014 so the model that runs your agent gets better at YOUR work. Observes only; never alters a tool result.",
+  "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for an observe-only install.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
@@ -30,6 +30,23 @@
         ],
         "default": true,
         "description": "Set false/0/off to disable local capture entirely."
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "training",
+          "train",
+          "rollout",
+          "rollouts",
+          "fine-tuning",
+          "finetuning",
+          "improving",
+          "production",
+          "prod",
+          "serving"
+        ],
+        "default": "training",
+        "description": "training: this install claims rollouts and drives turns. production: observe-only -- the rollout hooks are never registered. Overrides PERCEPTEYE_AGENT_MODE."
       }
     }
   },

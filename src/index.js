@@ -36,10 +36,16 @@ import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
 import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
+import { ControlPlaneClient } from "./http.js";
+import { AttachTransport } from "./transport.js";
+import { PRODUCTION, TRAINING } from "./mode.js";
+import { ConfigurationError } from "./errors.js";
+import { registerRolloutDriver } from "./rollout.js";
 
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
+
 
 export function register(api, pluginConfig = {}, env = process.env) {
   if (typeof api?.on !== "function") return null;
@@ -75,10 +81,35 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // config: half the promise, and the half the manifest documents first. The
   // explicit parameter is kept because it is what makes this gate testable
   // without constructing a whole host api.
-  const config = resolveConfig(
-    Object.keys(pluginConfig).length ? pluginConfig : (api.pluginConfig ?? {}),
-    env,
-  );
+  const supplied = Object.keys(pluginConfig).length
+    ? pluginConfig
+    : (api.pluginConfig ?? {});
+  let config;
+  try {
+    config = resolveConfig(supplied, env);
+  } catch (err) {
+    if (!(err instanceof ConfigurationError)) throw err;
+    // AN UNREADABLE MODE DEGRADES TO OBSERVE-ONLY, LOUDLY. It does not throw
+    // and it does not fall back to `training`, and both of those matter.
+    //
+    // Throwing is what the Python SDK does, and it is right THERE: `serve()`
+    // is a process entry point, so refusing to start is the whole remedy. Here
+    // the same throw would fail the plugin load and take LOCAL CAPTURE down
+    // with it -- the one feature that works with no account, no key and no
+    // control plane -- over a typo in a setting it does not depend on.
+    //
+    // Falling back to `training` would be worse than either: someone typing
+    // `PERCEPTEYE_AGENT_MODE=prodction` is trying to STOP contributing, and a
+    // default that resumes claiming rollouts on their credentials is the exact
+    // failure the closed alias set exists to prevent. Production is the safe
+    // side of a mode we could not read: the worst case is that this install
+    // does less than intended, and says so.
+    config = resolveConfig({ ...supplied, mode: PRODUCTION }, env);
+    logger?.warn?.(
+      `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode ` +
+      `(observe-only) until this is corrected; no rollouts will be claimed.`,
+    );
+  }
   if (!config.captureEnabled) {
     logger?.info?.(
       `[${PLUGIN_ID}] capture is disabled by configuration; recording nothing. ` +
@@ -107,6 +138,53 @@ export function register(api, pluginConfig = {}, env = process.env) {
     }
   });
 
+  // ── THE MODE SPLIT, STRUCTURALLY ──────────────────────────────────────
+  //
+  // In production mode the rollout driver is NOT CONSTRUCTED and its three
+  // hooks are NOT SUBSCRIBED. That is what makes "observe-only in production"
+  // a property of this file rather than a promise each handler has to keep:
+  // there is no code path from a production install to a claim, an injection
+  // or a report, because the module that could do those things is never
+  // reached. A `if (mode === "training")` inside each handler would be the
+  // same behaviour with a worse failure mode -- one missed call site is a
+  // silent breach instead of a hook that simply is not there.
+  //
+  // Local capture above is UNAFFECTED by mode. It never leaves the machine,
+  // and it is the plugin's day-one value with no account at all.
+  let rollouts = null;
+  if (config.mode === TRAINING) {
+    // WRAPPED, because the host requires `register` to be SYNCHRONOUS and
+    // treats a throw here as a failed plugin load (loader-D8d2EvVh.js:762).
+    // `new ControlPlaneClient` refuses a missing key or base URL by design, so
+    // a misconfigured control plane would otherwise take the RECORDER down
+    // with it -- losing the local capture that works without any of this.
+    try {
+      rollouts = registerRolloutDriver(api, {
+        config,
+        pluginId: PLUGIN_ID,
+        logger,
+        transport: config.apiKey
+          ? new AttachTransport(
+            new ControlPlaneClient(config.controlPlaneUrl, config.apiKey),
+            { agentId: config.agentId },
+          )
+          : null,
+      });
+    } catch (err) {
+      logger?.warn?.(
+        `[${PLUGIN_ID}] rollouts are disabled for this run: ` +
+        `${err?.message ?? err}. Local capture is unaffected.`,
+      );
+    }
+  } else {
+    logger?.info?.(
+      `[${PLUGIN_ID}] mode=${config.mode} (from ${config.modeSource}): ` +
+      `observe-only. No rollout is claimed, no turn is started, and no prompt ` +
+      `is injected -- those hooks are not registered at all. Tool outcomes are ` +
+      `still recorded locally.`,
+    );
+  }
+
   // The describer answers a different question from the recorder: not "what
   // did this call do" but "what IS this agent". See describe.js -- it is the
   // only way a CLI agent can reach `introspection_state = described`, because
@@ -131,7 +209,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
 
-  return { recorder, writer, describer };
+  return { recorder, writer, describer, rollouts, mode: config.mode };
 }
 
 export default {

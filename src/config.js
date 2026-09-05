@@ -14,6 +14,8 @@
  * secret-ref machinery, while a gateway process reads its environment once at
  * launch and cannot be re-keyed without a restart.
  */
+import { resolveModeSource } from "./mode.js";
+
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 
 /**
@@ -54,6 +56,18 @@ export const CONFIG_SCHEMA = {
       default: true,
       description: "Set false/0/off to disable local capture entirely.",
     },
+    mode: {
+      type: "string",
+      enum: [
+        "training", "train", "rollout", "rollouts", "fine-tuning",
+        "finetuning", "improving", "production", "prod", "serving",
+      ],
+      default: "training",
+      description:
+        "training: this install claims rollouts and drives turns. " +
+        "production: observe-only -- the rollout hooks are never registered. " +
+        "Overrides PERCEPTEYE_AGENT_MODE.",
+    },
   },
 };
 
@@ -72,8 +86,14 @@ const firstString = (...values) => {
  */
 export function resolveConfig(pluginConfig = {}, env = process.env) {
   const apiKey = firstString(pluginConfig.apiKey, env.PERCEPTEYE_API_KEY);
+  // THROWS on an unrecognised mode, and is meant to. A typo here decides
+  // whether this process claims rollouts on the customer's credentials, and
+  // there is no value to fall back to that is right in both directions.
+  const { mode, source: modeSource } = resolveModeSource(pluginConfig.mode, env);
   return {
     apiKey,
+    mode,
+    modeSource,
     agentId: firstString(
       pluginConfig.agentId, env.PERCEPTEYE_AGENT_ID,
     ) ?? "openclaw",

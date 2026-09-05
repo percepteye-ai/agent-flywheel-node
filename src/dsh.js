@@ -21,6 +21,14 @@
  * capturing evidence must never be able to change the behaviour being
  * measured. dsh simply enforces it harder.
  *
+ * THIS LANE HAS NO ROLLOUT DRIVER, in any mode. The OpenClaw lane can claim a
+ * rollout and deliver its task into the agent's next turn (see `rollout.js`,
+ * training mode only); Cordis exposes no equivalent seam, so on dsh this
+ * plugin observes and nothing else regardless of `PERCEPTEYE_AGENT_MODE`. Said
+ * here because the README's mode table describes the package, and a reader who
+ * takes it to mean "dsh claims rollouts too" would wait for trajectories that
+ * are never going to arrive.
+ *
  * Zero dependencies. `ctx` is supplied by the harness; nothing is imported
  * from it, so this module loads even when dsh is absent — which is what lets
  * one package serve two harnesses.
