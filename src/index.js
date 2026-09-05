@@ -63,7 +63,22 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // without mutating process.env under a parallel test runner -- and it
   // matches resolveConfig's own signature rather than inventing a second
   // convention for the same thing.
-  const config = resolveConfig(pluginConfig, env);
+  // WHERE THE HOST ACTUALLY PUTS CONFIG: `api.pluginConfig`
+  // (OpenClaw 2026.7.1-2, dist/types-DaHgOqFX.d.ts:12076 declares
+  // `pluginConfig?: Record<string, unknown>` on the plugin api). The loader
+  // validates `plugins.entries.<id>.config` against the MANIFEST's
+  // configSchema and hands the result over on the api object -- it does NOT
+  // pass it as a second argument to register().
+  //
+  // Reading only an argument therefore honoured PERCEPTEYE_CAPTURE from the
+  // environment and IGNORED `capture: false` in the customer's OpenClaw
+  // config: half the promise, and the half the manifest documents first. The
+  // explicit parameter is kept because it is what makes this gate testable
+  // without constructing a whole host api.
+  const config = resolveConfig(
+    Object.keys(pluginConfig).length ? pluginConfig : (api.pluginConfig ?? {}),
+    env,
+  );
   if (!config.captureEnabled) {
     logger?.info?.(
       `[${PLUGIN_ID}] capture is disabled by configuration; recording nothing. ` +

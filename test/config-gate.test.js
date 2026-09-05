@@ -85,3 +85,69 @@ test("the schema accepts the settings the manifest tells customers to set", () =
 test("the plugin id is one value, not two", () => {
   assert.equal(plugin.id, PLUGIN_ID);
 });
+
+
+test("config from the HOST turns capture off", () => {
+  // OpenClaw hands validated `plugins.entries.<id>.config` over on
+  // `api.pluginConfig` (dist/types-DaHgOqFX.d.ts:12076), not as a second
+  // argument to register(). Reading only the argument honoured the
+  // environment variable and ignored the customer's OpenClaw config — the
+  // half the manifest documents most prominently.
+  const api = fakeApi();
+  api.pluginConfig = { capture: false };
+  assert.equal(register(api), null, "api.pluginConfig must be read");
+  assert.equal(api.hooks.length, 0);
+});
+
+test("host config carrying an api key does not disable capture", () => {
+  const api = fakeApi();
+  api.pluginConfig = { apiKey: "pefw_x", agentId: "coder" };
+  assert.notEqual(register(api), null);
+  assert.ok(api.hooks.length >= 1);
+});
+
+test("an explicit argument still wins, so the gate stays testable", () => {
+  const api = fakeApi();
+  api.pluginConfig = { capture: true };
+  assert.equal(register(api, { capture: false }), null);
+});
+
+
+test("the transport calls no route the control plane does not serve", async () => {
+  // The flywheel sub-app's complete route set, read from
+  // MissionControl/mission_control/api/flywheel.py (@app decorators) plus the
+  // policy router it mounts (api/policy_current.py:453,493). Vendored as a
+  // list because this package must not import the control plane — the same
+  // reason schema/flywheel-1.json is a copy — and asserted here so a new
+  // transport method calling a route that does not exist is caught at test
+  // time rather than as a 404 in a customer's process.
+  //
+  // `POST /rollouts/{id}/artifacts` was such a method. It shipped, it was
+  // tested against a stub, and the route has never existed.
+  const SERVED = new Set([
+    "GET /health",
+    "POST /agents",
+    "POST /rollouts/claim",
+    "POST /rollouts/{id}/heartbeat",
+    "POST /rollouts/{id}/result",
+    "POST /rollouts/{id}/abandon",
+    "POST /turns",
+    "GET /rollouts/{id}",
+    "GET /rollouts",
+    "GET /policy/current",
+    "GET /prompt/current",
+  ]);
+
+  const src = readFileSync(new URL("../src/transport.js", import.meta.url), "utf8");
+  // Every `request("METHOD", "<path>"` the transport makes, with template
+  // interpolations normalised back to the server's own path parameter.
+  const calls = [...src.matchAll(/request\(\s*"(GET|POST)",\s*[`"]([^`"]+)[`"]/g)]
+    .map(([, method, path]) => `${method} ${path.replace(/\$\{[^}]+\}/g, "{id}")}`);
+
+  assert.ok(calls.length >= 8, `expected the transport's calls, found ${calls.length}`);
+  const unserved = calls.filter((c) => !SERVED.has(c));
+  assert.deepEqual(
+    unserved, [],
+    `transport calls routes the control plane does not serve: ${unserved.join(", ")}`,
+  );
+});

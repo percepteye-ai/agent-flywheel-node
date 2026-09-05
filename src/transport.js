@@ -130,10 +130,4 @@ export class AttachTransport {
     });
   }
 
-  artifacts(rollout, payload) {
-    return this._c.request("POST", `/rollouts/${rollout.rolloutId}/artifacts`, {
-      jsonBody: payload,
-      idempotencyKey: `artifacts-${rollout.rolloutId}`,
-    });
-  }
 }
