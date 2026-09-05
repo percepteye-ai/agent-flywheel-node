@@ -114,13 +114,20 @@ nothing progressed. It therefore refuses to claim at all and prints the setting
 to add. Delivery itself needs no opt-in: next-turn injection is allowed by
 default.
 
-**What this plugin cannot do: start a turn.** OpenClaw restricts
-`scheduleSessionTurn` to plugins bundled with the host — for anything installed
-from npm it is a silent no-op. So the task is placed in the *next* turn your
-agent takes; you or your harness still start it. The Python SDK's CLI-hook lane
+**Today the plugin does not start the turn — you or your harness do.** The task
+is placed in the *next* turn your agent takes. The Python SDK's CLI-hook lane
 has the same shape (there the task is written into the working directory), so
-the two are at parity — this lane simply delivers into the agent's real context,
+the two are at parity; this lane simply delivers into the agent's real context,
 exactly once, and can tell whether delivery succeeded.
+
+That is a **choice, not a limit**. OpenClaw restricts its documented
+`scheduleSessionTurn` API to plugins bundled with the host, but the underlying
+cron service is handed to every plugin regardless of origin, and a job carrying
+an `agentTurn` payload does start a turn. Reaching past a restriction the host
+states explicitly, using a seam it leaves open elsewhere, is not something this
+package does quietly inside your agent — it could be closed in any patch
+release. If you want unattended rollouts, that is the mechanism, and it should
+be a decision you make rather than a default you inherit.
 
 ### Production capture is opt-in
 

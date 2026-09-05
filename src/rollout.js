@@ -22,18 +22,37 @@
  *   injections per session (:1368, :1370); over either, the host returns
  *   `enqueued:false` SILENTLY, which is why the size is checked here.
  *
- * `scheduleSessionTurn`       NOT AVAILABLE, and this is the constraint that
- *   shapes the whole design. `schedulePluginSessionTurn` (:1186) opens with
- *   `if (params.origin !== "bundled") return;` -- a silent no-op for any
- *   npm-installed plugin, returning `undefined`, which is indistinguishable
- *   from "cron service unavailable". So THIS PLUGIN CANNOT START A TURN. It
- *   can only place a task in the next turn the operator or harness starts.
+ * `scheduleSessionTurn`       NOT AVAILABLE. `schedulePluginSessionTurn`
+ *   (:1186) opens with `if (params.origin !== "bundled") return;` -- a silent
+ *   no-op for any npm-installed plugin, returning `undefined`, which is
+ *   indistinguishable from "cron service unavailable".
  *
- *   That is the same constraint the Python SDK's CLI-hook lane runs under --
- *   there a SessionStart hook writes the task into the working directory and
- *   the harness starts the turn. This lane is strictly better: the task lands
- *   in the agent's actual context, exactly once, with a delivery verdict.
- *   Neither lane starts a turn by itself, so the parity statement is honest.
+ *   BUT THAT GATE IS ON THE WRAPPER, NOT ON THE CAPABILITY, and an earlier
+ *   version of this comment drew the wrong conclusion from it -- that this
+ *   plugin cannot start a turn at all. It can. `gateway_start` and
+ *   `cron_changed` hand every plugin, whatever its origin, the RAW host cron
+ *   service as `ctx.getCron()` (server-startup-post-attach-B3O9knW5.js:765,
+ *   server-cron-Cwg2hJro.js:4384), `registerTypedHook` gates only conversation
+ *   hooks by origin and prompt-injection hooks by policy -- neither covers
+ *   `gateway_start` -- and `server-cron` contains no origin check anywhere. A
+ *   job with `payload.kind: "agentTurn"` and `sessionTarget: "session:<key>"`
+ *   reaches `runIsolatedAgentJob` (:2433) and then `runCronIsolatedAgentTurn`
+ *   (:4484), which runs the agent.
+ *
+ *   THIS LANE DELIBERATELY DOES NOT USE THAT PATH, which is a product
+ *   decision and not a technical limit. Reaching past a restriction the host
+ *   states explicitly ("Bundled-only") by way of a service it hands out
+ *   elsewhere is depending on what looks like an inconsistency in someone
+ *   else's permission model: it can be closed in a patch release, and it is
+ *   not a thing to do silently inside a customer's agent. If unattended
+ *   rollouts are wanted, that is the mechanism -- taken as a decision, with
+ *   the operator told what it does.
+ *
+ *   So today the task is placed in the NEXT turn the operator or harness
+ *   starts. The Python SDK's CLI-hook lane has the same shape -- there a
+ *   SessionStart hook writes the task into the working directory -- so the
+ *   parity statement holds; this lane simply delivers into the agent's real
+ *   context, exactly once, with a delivery verdict.
  *
  * `agent_end`                 CONVERSATION-GATED. It is in
  *   `CONVERSATION_HOOK_NAMES`, and a non-bundled plugin's registration is
