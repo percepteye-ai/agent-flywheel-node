@@ -1,10 +1,33 @@
-# percepteye-agent-flywheel — OpenClaw and DeepSeek Harness plugin
+<div align="center">
 
-Records what your agent's tools actually did, as `ok`, `failed` or
-**`unknown`**, into the trajectory the PerceptEye flywheel trains on.
+# 🎡 percepteye-agent-flywheel — Node
 
-**Observes only.** It cannot alter, block, delay or replace a tool result —
-that is a property of the hooks it uses, not a promise about the code.
+### **Self-improving agents through continual learning, for OpenClaw and DeepSeek Harness.**
+
+**Your agent keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
+One plugin. Zero dependencies. Zero lines changed in your agent.
+
+[![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
+[![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
+[![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#dependencies)
+[![tests](https://img.shields.io/badge/tests-152-22c55e?style=for-the-badge)](#tests)
+[![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
+
+**[Install](#install)** · [What it writes](#what-it-writes) · [Why `unknown` is real](#why-unknown-is-a-real-answer) · [Which hook, and why](#which-hook-and-why) · [Python or Node?](#python-or-node)
+
+</div>
+
+---
+
+Records what your agent's tools actually did — `ok`, `failed` or **`unknown`** —
+into the trajectory the PerceptEye flywheel trains on.
+
+**Observes only.** It cannot alter, block, delay or replace a tool result — and
+that is a property of the hooks it uses, not a promise about the code. See
+[Which hook, and why](#which-hook-and-why) for the surfaces that *could* have
+changed your run, and why each was rejected.
+
+## Install
 
 One package, two harnesses:
 
@@ -23,6 +46,24 @@ With the variable unset the plugin does nothing at all — no file, no writes, n
 overhead. That is what lets you leave it installed permanently and have it
 record only while a rollout is running.
 
+## Python or Node?
+
+**Pick one.** These are two implementations of the same flywheel for two
+different homes, and a customer installs whichever matches the harness their
+agent already runs in — never both.
+
+| | this package | [`percepteye-agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) (PyPI) |
+|---|---|---|
+| **you have** | an OpenClaw or DeepSeek Harness agent | a Python agent, or a CLI agent you launch yourself |
+| **you install** | a harness plugin | a pip package |
+| **you change** | nothing — the harness loads it | nothing — one import, one call |
+| **runtime deps** | none | one (`httpx`) |
+
+The two are kept honest against each other by a shared contract schema
+([`schema/flywheel-1.json`](schema/flywheel-1.json)) and a test that asserts
+this package's wire types match it — because a comment saying "keep these in
+sync" is not a mechanism.
+
 ## What it writes
 
 One JSON object per executed tool call, appended to
@@ -33,7 +74,9 @@ One JSON object per executed tool call, appended to
 ```
 
 That line is real output from a live OpenClaw run, and it is the same format
-the Python SDK writes and reads — the file *is* the interface between them.
+the Python SDK writes and reads. Two implementations, one on-disk format —
+which is what lets a Python parent read a Node agent's outcomes, and what the
+shared contract schema exists to keep true.
 
 ## Why `unknown` is a real answer
 
@@ -142,4 +185,4 @@ later from bad training data.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Same licence as the Python SDK.
