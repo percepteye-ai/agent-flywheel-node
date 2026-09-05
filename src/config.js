@@ -41,7 +41,7 @@ export const PLUGIN_ID = "percepteye-agent-flywheel";
  * outranked PERCEPTEYE_AGENT_ID -- so a gateway serving real end users, with
  * PERCEPTEYE_AGENT_MODE=production set exactly as the README instructs, claimed
  * rollouts and started unattended turns anyway, and the operator got no signal
- * because the observe-only log is on the branch that was never taken.
+ * because the production-mode log is on the branch that was never taken.
  *
  * `resolveConfig` below is the ONE place a default is decided. A schema default
  * is a second answer to a question already answered there, and this host turns
@@ -76,6 +76,21 @@ export const CONFIG_SCHEMA = {
         "Set false/0/off to disable local capture entirely. Unset means " +
         "PERCEPTEYE_CAPTURE, then on.",
     },
+    applyPrompt: {
+      type: ["string", "boolean"],
+      description:
+        "Set false/0/off to stop applying the control plane's approved " +
+        "system prompt in production mode. Unset means " +
+        "PERCEPTEYE_APPLY_PROMPT, then on.",
+    },
+    applyModel: {
+      type: ["string", "boolean"],
+      description:
+        "Set false/0/off to stop pointing this agent at the control " +
+        "plane's approved model in production mode. Unset means " +
+        "PERCEPTEYE_APPLY_MODEL, then on. Needs " +
+        "hooks.allowConversationAccess=true to take effect at all.",
+    },
     mode: {
       type: "string",
       enum: [
@@ -84,14 +99,23 @@ export const CONFIG_SCHEMA = {
       ],
       description:
         "training: this install claims rollouts and drives turns. " +
-        "production: observe-only -- the rollout hooks are never registered. " +
-        "Unset means PERCEPTEYE_AGENT_MODE, then training; a value here " +
-        "overrides the environment.",
+        "production: claims no rollout and starts no turn -- those hooks are " +
+        "never registered -- but captures the turns you serve and applies " +
+        "the system prompt your control plane approved. Unset means " +
+        "PERCEPTEYE_AGENT_MODE, then training; a value here overrides the " +
+        "environment.",
     },
   },
 };
 
 const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
+
+/** The spellings that mean OFF. One list, because one typo rule applies. */
+const OFF = ["0", "false", "no", "off"];
+
+/** `pluginConfig.<key> ?? env.<ENV>`, ON unless DELIBERATELY switched off. */
+const enabledUnlessOff = (configured, fromEnv) =>
+  !OFF.includes(String(configured ?? fromEnv ?? "").trim().toLowerCase());
 
 const firstString = (...values) => {
   for (const v of values) {
@@ -124,8 +148,23 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     ) ?? DEFAULT_CONTROL_PLANE,
     // Capture is on unless DELIBERATELY disabled. A typo must not silently
     // switch it off and leave the operator believing it is on.
-    captureEnabled: !["0", "false", "no", "off"].includes(
-      String(pluginConfig.capture ?? env.PERCEPTEYE_CAPTURE ?? "").trim().toLowerCase(),
+    captureEnabled: enabledUnlessOff(
+      pluginConfig.capture, env.PERCEPTEYE_CAPTURE,
+    ),
+    // The same rule for the same reason, and the same list of off-spellings --
+    // a customer who learned `capture=off` must not discover that
+    // `applyPrompt=off` was a typo that left the prompt being applied.
+    // Default ON: a capability that ships dormant is a capability nobody gets.
+    applyPromptEnabled: enabledUnlessOff(
+      pluginConfig.applyPrompt, env.PERCEPTEYE_APPLY_PROMPT,
+    ),
+    // The model half's own switch, mirroring the prompt one exactly -- same
+    // off-spellings, same precedence, same default. The two halves of a
+    // certified pair are separately refusable because they fail separately:
+    // an operator may want the approved prompt on their own provider, or the
+    // trained checkpoint under a prompt they wrote themselves.
+    applyModelEnabled: enabledUnlessOff(
+      pluginConfig.applyModel, env.PERCEPTEYE_APPLY_MODEL,
     ),
     contributing: Boolean(apiKey),
   };

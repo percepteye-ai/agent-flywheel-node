@@ -10,6 +10,9 @@
  * The user-agent copy is now DERIVED (src/http.js reads package.json), which
  * is the mechanism. The manifest's copy cannot be -- the host parses it as
  * static JSON before any code runs -- so this test is its mechanism.
+ *
+ * The DESCRIPTION is the same situation one field over, and it had already
+ * drifted, so it is held here too.
  */
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
@@ -41,6 +44,21 @@ describe("the package version has one source", () => {
   it("is what every request tells the control plane", () => {
     assert.equal(SDK_VERSION, pkg.version);
     assert.equal(SDK_UA, `percepteye-agent-flywheel-node/${pkg.version}`);
+  });
+
+  it("the two hand-typed descriptions are the SAME description", () => {
+    // The same defect one field over, and it had already opened: the manifest
+    // said production mode "does capture the turns you serve and apply your
+    // approved system prompt" while package.json still said "an observe-only
+    // install", which stopped being true two features ago. npm shows one and
+    // `openclaw plugins list` shows the other, so a customer reads whichever
+    // copy nobody remembered to edit. Nothing held them equal; this does.
+    assert.equal(
+      manifest.description,
+      pkg.description,
+      "openclaw.plugin.json.description must equal package.json.description " +
+      "-- they are two copies of one sentence and they had already diverged",
+    );
   });
 
   it("is derived, not retyped, in the user agent", () => {

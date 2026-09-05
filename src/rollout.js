@@ -110,8 +110,8 @@ export function driveVerdict(config, api, pluginId) {
     return {
       canDrive: false,
       reason:
-        `mode is '${config?.mode}', so this install observes only and claims ` +
-        `no rollouts. Set PERCEPTEYE_AGENT_MODE=training to contribute.`,
+        `mode is '${config?.mode}', so this install claims no rollouts. ` +
+        `Set PERCEPTEYE_AGENT_MODE=training to contribute.`,
     };
   }
   if (!config?.apiKey) {

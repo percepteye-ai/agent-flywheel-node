@@ -135,6 +135,12 @@ export class AttachTransport {
    * FAILS OPEN, deliberately. A control plane that cannot answer must not stop
    * an agent from running, so an empty answer means "keep doing what you were
    * doing" -- exactly the behaviour before this endpoint existed.
+   *
+   * ⚠ `policy.prompt` IS NOT PROMPT TEXT. It is the control plane's own
+   * prompt-PIN identity snapshot (`{pins, digest, captured_at}`), unrelated to
+   * the customer's optimized prompt; the text comes from `promptCurrent`
+   * below. CONSUMER: `policy.js`, which reads `endpoint`, `arm` and
+   * `serving_generation` and reports what it cannot apply.
    */
   async policyCurrent() {
     try {
@@ -148,7 +154,14 @@ export class AttachTransport {
    * The approved optimized system prompt, or `{}`.
    *
    * Same fail-open contract, and for a sharper reason: a control plane that
-   * cannot answer must never BLANK a running agent's instructions.
+   * cannot answer must never BLANK a running agent's instructions. `{}` means
+   * KEEP THE PROMPT YOU HAVE; it never means "use no prompt".
+   *
+   * CONSUMER: `policy.js:createPolicySource.resolve`, which decides whether
+   * the answer may be applied and returns it to the host from
+   * `before_prompt_build`. Both this method and `policyCurrent` above shipped
+   * with NO consumer at all -- two reads whose answers were thrown away, which
+   * is the same defect as a route nobody serves, pointed the other way.
    */
   async promptCurrent() {
     try {

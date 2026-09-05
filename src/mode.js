@@ -20,24 +20,43 @@
  * So each question is asked separately and neither answer is derived from the
  * other.
  *
- * WHAT "OBSERVE-ONLY" MEANS NOW, precisely. It was previously stated flatly,
- * which was a promise this package could not keep once it grew a rollout
- * driver -- and an untrue promise about somebody's data is worse than a
- * narrower true one. Scoped, it is stronger, because it says WHEN it applies:
+ * WHAT PRODUCTION MODE PROMISES, precisely. This was once "OBSERVE-ONLY,
+ * absolutely", which was already a promise this package could not keep once it
+ * grew a rollout driver, and stopped being true a second time when production
+ * mode began applying the control plane's approved system prompt. An untrue
+ * promise about somebody's agent is worse than a narrower true one, so here is
+ * the narrow one, which holds:
  *
- *   production mode -- OBSERVE-ONLY, absolutely. Nothing here starts a turn,
- *                      queues an injection, or alters a tool result. The
- *                      rollout hooks are NOT REGISTERED, so the guarantee is
+ *   production mode -- CLAIMS NO WORK AND STARTS NO TURN. It does not claim a
+ *                      rollout, does not start or schedule a turn, does not
+ *                      queue an injection, and does not alter a tool result.
+ *                      The rollout hooks are NOT REGISTERED, so that much is
  *                      the absence of a subscription rather than a branch
  *                      inside a handler that a later edit could invert.
+ *                      It DOES capture the turns the agent serves, and it DOES
+ *                      apply what the control plane has approved -- replacing
+ *                      the agent's system prompt, and pointing it at the model
+ *                      that prompt was certified with. That is the last mile
+ *                      of the loop, off with PERCEPTEYE_APPLY_PROMPT=0 and
+ *                      PERCEPTEYE_APPLY_MODEL=0 respectively. See `policy.js`;
+ *                      those are deliberate changes to what the agent does and
+ *                      the only things in this mode that are not observation.
+ *                      Both are scoped to THIS agent's own served turns --
+ *                      never a subagent's, never a cron turn's, never another
+ *                      agent's in the same process (`scope.js`).
  *   training mode   -- the plugin drives: it claims a rollout, starts a turn
- *                      carrying the task, and contributes the trajectory.
+ *                      carrying the task, and contributes the trajectory. It
+ *                      applies NEITHER half: a rollout is evidence about the
+ *                      agent as configured, and changing its prompt or its
+ *                      model under one moves the behaviour with no weight
+ *                      change behind it.
  *
  * That distinction is structural on purpose. `registerRolloutDriver` is called
  * from ONE place, under one predicate, and in production mode it is never
- * reached -- as against a `if (mode === "training")` inside each handler,
- * where a missed call site is a silent breach of the promise rather than a
- * hook that is simply not there.
+ * reached -- and `registerServingPolicy` is called from the other branch of
+ * that same predicate, so neither can leak into the other's mode. As against a
+ * `if (mode === "training")` inside each handler, where a missed call site is a
+ * silent breach of the promise rather than a hook that is simply not there.
  *
  * The vocabulary is the PYTHON SDK's, verbatim (`percepteye_agent_flywheel`'s
  * `_MODE_ALIASES`). A customer switching harnesses must not have to learn a

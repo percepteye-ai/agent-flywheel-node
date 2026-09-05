@@ -390,7 +390,9 @@ export const GATEWAY_STOP = "gateway_stop";
 /**
  * Subscribe production turn capture. Called only in production mode.
  *
- * Returns `{turns, uploader, root}`, or `null` when nothing was wired.
+ * Returns `{turns, uploader, root, transport, started}`, or `null` when
+ * nothing was wired. `transport` is null without an API key; `started` is the
+ * registration chain, or null when there was nothing to register.
  *
  * CAPTURE RUNS WITHOUT A KEY; only UPLOADING needs one. That is the ordinary
  * first install -- local recording, no account, no traffic -- which is why the
@@ -411,6 +413,12 @@ export function registerTurnCapture(api, {
 
   let uploader = null;
   let transport = null;
+  // The startup chain, EXPOSED rather than fire-and-forget. `policy.js` reads
+  // the control plane too, and its read is sequenced behind this one for the
+  // same reason `announce` is sequenced behind `enrol`: three calls racing at
+  // plugin load is three chances to be rate-limited on a cold start, and the
+  // policy answer is not needed until the first turn arrives.
+  let started = null;
 
   // THE TURN OPENS, and this is the UNGATED half -- the only hook of the three
   // the host is guaranteed to deliver. It carries the cadence for that reason:
@@ -476,7 +484,7 @@ export function registerTurnCapture(api, {
     //
     // NOT AWAITED: `register()` must return to the host synchronously, and a
     // control plane that is slow or down must not delay a plugin load.
-    enrol({ transport, config, pluginId, logger })
+    started = enrol({ transport, config, pluginId, logger })
       .then(() => announce({ transport, uploader, config, pluginId, logger, env }));
   } else {
     logger?.info?.(
@@ -496,7 +504,9 @@ export function registerTurnCapture(api, {
       `nothing that needs a completion can use them.`);
   }
 
-  return { turns, uploader, root };
+  // `transport` is handed out so the serving-policy read reuses THIS client
+  // rather than constructing a second one against the same base URL and key.
+  return { turns, uploader, root, transport, started };
 }
 
 /** The real control-plane transport. Replaced in tests, never in production. */

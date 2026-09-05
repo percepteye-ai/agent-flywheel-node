@@ -1,9 +1,9 @@
 /**
  * TRAINING MODE DRIVES; PRODUCTION MODE DOES NOT EXIST HERE.
  *
- * The first suite is the load-bearing one. "Observe-only in production" is
- * claimed in the README, in the manifest and in this package's name, and the
- * only thing that makes it true is that `register()` never reaches
+ * The first suite is the load-bearing one. "Production claims no work and
+ * starts no turn" is promised in the README and in the manifest, and the only
+ * thing that makes it true is that `register()` never reaches
  * `registerRolloutDriver`. So the test asserts the ABSENCE OF THE
  * SUBSCRIPTIONS -- not that a handler declined to act, which is what a runtime
  * `if` would give and which a later edit could invert without any test going
@@ -22,7 +22,7 @@ import {
 // to come out: production turn capture subscribes it too, to record the
 // agent's answer, so its presence no longer discriminates between the two
 // lanes. Narrowing the list does NOT weaken the claim -- "the driver is never
-// constructed in production" is asserted directly by the observe-only branch
+// constructed in production" is asserted directly by the production-branch
 // test below, which is the assertion that actually caught a deleted split.
 const ROLLOUT_HOOKS = ["session_start", "session_end", "gateway_start"];
 
@@ -78,7 +78,7 @@ describe("the mode split is structural", () => {
     for (const hook of ROLLOUT_HOOKS) {
       assert.ok(
         !names.includes(hook),
-        `production mode subscribed '${hook}'. Observe-only must be the ` +
+        `production mode subscribed '${hook}'. Claiming no work must be the ` +
         `ABSENCE of the subscription, not a branch inside the handler.`,
       );
     }
@@ -93,21 +93,28 @@ describe("the mode split is structural", () => {
     // the property it claimed to protect.
     //
     // So this asserts WHICH BRANCH RAN, which is the structural claim itself.
-    // The observe-only line is emitted only by the production path; under a
-    // deleted split it is absent even though the hook list still looks right.
+    // The line below is emitted only by the production path; under a deleted
+    // split it is absent even though the hook list still looks right.
+    //
+    // The marker used to be the phrase "observe-only", and it moved when
+    // production mode stopped being observe-only: it now applies the approved
+    // system prompt. What the branch still guarantees -- and what this asserts
+    // -- is the half that did not change: no rollout is claimed and no turn is
+    // started. A marker kept for its familiarity would have gone on passing
+    // while naming a promise the package no longer makes.
     const api = fakeApi();
     register(api, {}, ENV("production"));
     assert.ok(
-      api.logs.some((l) => l.includes("observe-only")),
-      "production mode did not take the observe-only path; the mode split " +
+      api.logs.some((l) => l.includes("claims no rollout and starts no turn")),
+      "production mode did not take its own path; the mode split " +
       "has been replaced by a runtime check inside the driver, which is a " +
       "promise a later edit can silently invert",
     );
   });
 
   it("still records tool outcomes in production mode", () => {
-    // Observe-only is not off. The recorder is the whole point of a
-    // production install.
+    // Claiming no rollouts is not the same as doing nothing. The recorder is
+    // the whole point of a production install.
     const api = fakeApi();
     const out = register(api, {}, ENV("production"));
     assert.equal(api.hooks.map((h) => h.name).includes("after_tool_call"), true);
@@ -125,7 +132,7 @@ describe("the mode split is structural", () => {
     assert.notEqual(out.rollouts, null);
   });
 
-  it("degrades an UNREADABLE mode to observe-only, never to training", () => {
+  it("degrades an UNREADABLE mode to production, never to training", () => {
     // A typo is somebody trying to stop contributing. Defaulting to training
     // would resume claiming rollouts on their credentials.
     const api = fakeApi();
@@ -149,7 +156,7 @@ describe("driveVerdict names ONE cause", () => {
   it("refuses in production mode", () => {
     const v = driveVerdict({ mode: "production", apiKey: "k" }, api, PLUGIN_ID);
     assert.equal(v.canDrive, false);
-    assert.match(v.reason, /observes only/);
+    assert.match(v.reason, /claims no rollouts/);
   });
 
   it("refuses with no key, and says which setting", () => {

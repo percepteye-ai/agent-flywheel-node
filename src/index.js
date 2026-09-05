@@ -49,6 +49,26 @@
  *
  * The off switch is `capture: false` / PERCEPTEYE_CAPTURE=0, which returns from
  * `register` before any hook is subscribed, in either mode.
+ *
+ * WHAT PRODUCTION MODE ALSO DOES, and it is not observation. It applies BOTH
+ * halves of what the control plane has APPROVED for this agent:
+ *
+ *   the system prompt  `{systemPrompt}` returned from `before_prompt_build`,
+ *                      a full replacement of the prompt the host assembled.
+ *   the model          `{providerOverride, modelOverride}` returned from
+ *                      `before_model_resolve`, plus a registered provider
+ *                      whose `normalizeTransport` supplies the base URL. That
+ *                      hook is CONVERSATION-gated, so it needs the same
+ *                      `allowConversationAccess=true` opt-in that capturing
+ *                      the agent's answer needs.
+ *
+ * They are a certified PAIR, which is why they are applied together and why
+ * applying one alone is reported as such. That is the last mile of the loop
+ * this package exists to close, and the only thing here that changes what the
+ * agent does rather than recording it. `policy.js` holds both decisions, the
+ * pair check, the per-agent scope, and the two off switches --
+ * `applyPrompt: false` / PERCEPTEYE_APPLY_PROMPT=0 and `applyModel: false` /
+ * PERCEPTEYE_APPLY_MODEL=0.
  */
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
@@ -59,6 +79,8 @@ import { AttachTransport } from "./transport.js";
 import { PRODUCTION, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
+import { registerServingPolicy } from "./policy.js";
+import { conversationAccessGranted } from "./host.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
 } from "./capture.js";
@@ -110,7 +132,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     config = resolveConfig(supplied, env);
   } catch (err) {
     if (!(err instanceof ConfigurationError)) throw err;
-    // AN UNREADABLE MODE DEGRADES TO OBSERVE-ONLY, LOUDLY. It does not throw
+    // AN UNREADABLE MODE DEGRADES TO PRODUCTION, LOUDLY. It does not throw
     // and it does not fall back to `training`, and both of those matter.
     //
     // Throwing is what the Python SDK does, and it is right THERE: `serve()`
@@ -127,8 +149,10 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // does less than intended, and says so.
     config = resolveConfig({ ...supplied, mode: PRODUCTION }, env);
     logger?.warn?.(
-      `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode ` +
-      `(observe-only) until this is corrected; no rollouts will be claimed.`,
+      `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode until ` +
+      `this is corrected; no rollouts will be claimed. Note that production ` +
+      `mode is not inert: it captures served turns and applies the approved ` +
+      `system prompt (PERCEPTEYE_CAPTURE=0 / PERCEPTEYE_APPLY_PROMPT=0).`,
     );
   }
   if (!config.captureEnabled) {
@@ -176,8 +200,8 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // ── THE MODE SPLIT, STRUCTURALLY ──────────────────────────────────────
   //
   // In production mode the rollout driver is NOT CONSTRUCTED and its three
-  // hooks are NOT SUBSCRIBED. That is what makes "observe-only in production"
-  // a property of this file rather than a promise each handler has to keep:
+  // hooks are NOT SUBSCRIBED. That is what makes "claims no work, starts no
+  // turn" a property of this file rather than a promise each handler keeps:
   // there is no code path from a production install to a claim, an injection
   // or a report, because the module that could do those things is never
   // reached. A `if (mode === "training")` inside each handler would be the
@@ -188,6 +212,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // and it is the plugin's day-one value with no account at all.
   let rollouts = null;
   let capture = null;
+  let serving = null;
   if (config.mode === TRAINING) {
     // WRAPPED, because the host requires `register` to be SYNCHRONOUS and
     // treats a throw here as a failed plugin load (loader-D8d2EvVh.js:762).
@@ -213,14 +238,55 @@ export function register(api, pluginConfig = {}, env = process.env) {
       );
     }
   } else {
+    // WHAT PRODUCTION MODE PROMISES, said exactly, and CONDITIONAL ON WHAT
+    // WILL ACTUALLY HAPPEN. This used to end "and no prompt is injected --
+    // those hooks are not registered at all", which stopped being true the
+    // moment `registerServingPolicy` below started subscribing
+    // `before_prompt_build`. Then it promised the opposite unconditionally --
+    // "It DOES ... apply the system prompt your control plane has approved" --
+    // and on a keyless install, which is the ordinary first install, that was
+    // false in the other direction: with no key there is no transport,
+    // `registerServingPolicy` subscribes nothing, and the operator was told
+    // otherwise by the line immediately before the silence.
+    //
+    // So the three facts that decide it are read HERE, before the claim is
+    // made. `registerServingPolicy` says WHY for each half; this line says
+    // only what happens.
+    const conversationAccess = conversationAccessGranted(api, PLUGIN_ID);
+    const willApplyPrompt = config.contributing && config.applyPromptEnabled;
+    const willApplyModel = config.contributing && config.applyModelEnabled
+      && conversationAccess;
+    const applying = [
+      willApplyPrompt ? "the system prompt" : null,
+      willApplyModel ? "the model" : null,
+    ].filter(Boolean);
     logger?.info?.(
-      `[${PLUGIN_ID}] mode=${config.mode} (from ${config.modeSource}): ` +
-      `observe-only. No rollout is claimed, no turn is started, and no prompt ` +
-      `is injected -- those hooks are not registered at all. Tool outcomes are ` +
-      `still recorded locally.`,
+      `[${PLUGIN_ID}] mode=${config.mode} (from ${config.modeSource}): this ` +
+      `install claims no rollout and starts no turn -- those hooks are not ` +
+      `registered at all. It DOES capture the turns you serve. ` +
+      (applying.length
+        ? `It also applies ${applying.join(" and ")} your control plane has ` +
+          "approved."
+        : "It applies NOTHING your control plane has approved; the next line " +
+          "says why.") +
+      ` Tool outcomes are still recorded locally.`,
     );
     capture = registerTurnCapture(api, {
       config, turns, pluginId: PLUGIN_ID, logger, env,
+    });
+    // THE LAST MILE. `capture` owns the one control-plane client, so this
+    // reuses it rather than building a second against the same key -- and
+    // waits on the registration chain rather than racing it.
+    serving = registerServingPolicy(api, {
+      config,
+      pluginId: PLUGIN_ID,
+      logger,
+      transport: capture?.transport ?? null,
+      after: capture?.started ?? null,
+      // The host's own config, for the agent scope, and the host's own answer
+      // about whether it will deliver `before_model_resolve` at all.
+      hostConfig: api?.config,
+      conversationAccess,
     });
   }
 
@@ -248,7 +314,9 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
 
-  return { recorder, writer, describer, rollouts, capture, mode: config.mode };
+  return {
+    recorder, writer, describer, rollouts, capture, serving, mode: config.mode,
+  };
 }
 
 export default {
@@ -267,8 +335,13 @@ export default {
     "calls and the agent's answer -- is captured under " +
     "PERCEPTEYE_CAPTURE_DIR (default ~/.percepteye/captured) even when " +
     `${TRAJECTORY_DIR_ENV} is unset, and uploaded only with a key and the ` +
-    "control plane's per-agent consent. Set capture=false (or " +
-    "PERCEPTEYE_CAPTURE=0) to record nothing.",
+    "control plane's per-agent consent; production mode also APPLIES what " +
+    "your control plane has approved for this agent -- the system prompt, and " +
+    "the model it was certified with -- which changes what the agent does. " +
+    "Set capture=false (or PERCEPTEYE_CAPTURE=0) to record nothing, " +
+    "applyPrompt=false (or PERCEPTEYE_APPLY_PROMPT=0) to leave the prompt " +
+    "alone, applyModel=false (or PERCEPTEYE_APPLY_MODEL=0) to leave the model " +
+    "alone.",
   // THE SAME OBJECT the manifest declares, not a second one. This used to be
   // `{additionalProperties: false, properties: {}}` -- a schema that rejects
   // every setting openclaw.plugin.json tells a customer to write.

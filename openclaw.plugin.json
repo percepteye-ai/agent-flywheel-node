@@ -1,8 +1,11 @@
 {
   "id": "percepteye-agent-flywheel",
   "name": "PerceptEye Agent Flywheel",
-  "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for an observe-only install.",
+  "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for a serving install, which claims no rollouts and starts no turn but does capture the turns you serve and apply the system prompt and the model your control plane has approved.",
   "version": "0.1.0",
+  "providers": [
+    "percepteye-flywheel"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -29,6 +32,20 @@
         ],
         "description": "Set false/0/off to disable local capture entirely. Unset means PERCEPTEYE_CAPTURE, then on."
       },
+      "applyPrompt": {
+        "type": [
+          "string",
+          "boolean"
+        ],
+        "description": "Set false/0/off to stop applying the control plane's approved system prompt in production mode. Unset means PERCEPTEYE_APPLY_PROMPT, then on."
+      },
+      "applyModel": {
+        "type": [
+          "string",
+          "boolean"
+        ],
+        "description": "Set false/0/off to stop pointing this agent at the control plane's approved model in production mode. Unset means PERCEPTEYE_APPLY_MODEL, then on. Needs hooks.allowConversationAccess=true to take effect at all."
+      },
       "mode": {
         "type": "string",
         "enum": [
@@ -43,7 +60,7 @@
           "prod",
           "serving"
         ],
-        "description": "training: this install claims rollouts and drives turns. production: observe-only -- the rollout hooks are never registered. Unset means PERCEPTEYE_AGENT_MODE, then training; a value here overrides the environment."
+        "description": "training: this install claims rollouts and drives turns. production: claims no rollout and starts no turn -- those hooks are never registered -- but captures the turns you serve and applies the system prompt your control plane approved. Unset means PERCEPTEYE_AGENT_MODE, then training; a value here overrides the environment."
       }
     }
   },

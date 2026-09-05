@@ -17,15 +17,19 @@ shipped the PYTHON frames — `pip install percepteye-agent-flywheel`,
 figure that advertises the wrong SDK is worse than no figure.
 
 The production beat says `PERCEPTEYE_AGENT_MODE=production` here rather than
-the Python `fw.apply_current_policy(...)`, because `policyCurrent()` on this
-package's transport **has no caller**: the plugin does not fetch a trained
-policy, so drawing that call would invent a capability.
+the Python `fw.apply_current_policy(...)`, and the closing caption says the
+plugin applies both halves itself. Both are true of this lane and false of the
+Python one, which is why the figures are flavoured at all: the Python SDK hands
+the policy back for your code to apply and deliberately does not apply the
+prompt, while this plugin applies the approved prompt through
+`before_prompt_build` and the approved model through `before_model_resolve`
+plus the `normalizeTransport` of a provider it registers.
 
-`flywheel-loop` is drawn on a WHITE ground (`THEME=light`, the default in
-`render_flywheel_loop.py`). The dark original looked handsome in isolation and
-was hard to read inline in a README — pale text on near-black, at whatever size
-the page gives it, beside white page chrome. Every accent is darkened rather
-than inverted, because a colour tuned to glow on #0d1117 washes out on white.
+So in the overview, BOTH the system-prompt row and the model row flip here,
+and only the model row flips in the Python figure. That difference is a claim
+about the packages, not styling — `_ROWS` in `render_overview.py` is the table
+that makes it, and it is the reason a figure copied between the two repos is
+wrong even when it looks right.
 
 Regenerate after touching either renderer. These are documentation only —
 `files` in package.json is a whitelist and excludes `docs/`, so none of this

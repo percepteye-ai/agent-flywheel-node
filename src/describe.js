@@ -24,26 +24,53 @@
  *                 both complete and true at the same moment.
  *   provider,model the model config, resolved after all overrides.
  *
- * WHY THIS IS STILL "OBSERVES ONLY". The sibling recorder chose
- * `after_tool_call` over `registerAgentToolResultMiddleware` on one rule:
- * capturing evidence must never be able to change the behaviour being
- * measured. `llm_input` keeps that rule. It is typed
- * `(event, ctx) => Promise<void> | void` -- the same structurally
- * non-mutating class as `after_tool_call`. The host discards our return
- * value, so there is no seam here through which a description could alter a
- * prompt, a tool result, or a routing decision. Introspection is a READ.
- * The mutation seams OpenClaw does expose -- `before_prompt_build`'s
+ * WHY *THIS FILE* OBSERVES ONLY. The sibling recorder chose `after_tool_call`
+ * over `registerAgentToolResultMiddleware` on one rule: capturing evidence
+ * must never be able to change the behaviour being measured. `llm_input` keeps
+ * that rule. It is typed `(event, ctx) => Promise<void> | void` -- the same
+ * structurally non-mutating class as `after_tool_call`. The host discards our
+ * return value, so there is no seam here through which a description could
+ * alter a prompt, a tool result, or a routing decision. Introspection is a
+ * READ.
+ *
+ * THAT IS A CLAIM ABOUT THIS FILE, NOT ABOUT THE PACKAGE, and it used to read
+ * as both: "the mutation seams OpenClaw does expose -- `before_prompt_build`'s
  * `{systemPrompt}`, `before_tool_call`'s `{block:true}` -- remain unused,
- * deliberately.
+ * deliberately." Half of that is no longer true. `policy.js` DOES use
+ * `before_prompt_build`, in production mode, to apply the system prompt the
+ * control plane approved -- and `before_model_resolve` plus a registered
+ * provider to point the agent at the model that prompt was certified with.
+ * Both deliberately, both gated on a pair check and a per-agent scope, both
+ * switchable off. `before_tool_call`'s `{block:true}` is still unused. The
+ * describer is unaffected either way: a describer that could rewrite a prompt
+ * would be measuring its own output.
+ *
+ * The old wording also invited a wrong reading of that seam. `systemPrompt` is
+ * a field on the hook's RESULT, not on its EVENT: the event is
+ * `{prompt, messages}` and writing to it does nothing at all. `policy.js`
+ * carries the verified mechanics.
  *
  * THE ONE THING THIS HOOK COSTS. `llm_input` is a CONVERSATION hook
- * (`CONVERSATION_HOOK_NAMES`, hook-types:386). The host REFUSES to register
- * it for a non-bundled plugin unless the operator opts in with
+ * (`CONVERSATION_HOOK_NAMES`, dist/hook-types-DQ9eTy2x.d.ts:386). The host
+ * REFUSES to register it for a non-bundled plugin unless the operator opts in
+ * with
  * `plugins.entries.percepteye-agent-flywheel.hooks.allowConversationAccess=true`
- * (registry:4226-4235). That refusal is a warn-level diagnostic, not a throw,
- * so a missing opt-in looks exactly like a working install that never fires.
- * `register()` below says so out loud at startup rather than letting the
- * operator discover it as an empty catalogue an hour later.
+ * (dist/registry-B8eQDFB4.js:4226-4241). That refusal is a warn-level
+ * diagnostic, not a throw, so a missing opt-in looks exactly like a working
+ * install that never fires. `register()` below says so out loud at startup
+ * rather than letting the operator discover it as an empty catalogue an hour
+ * later.
+ *
+ * ⚠ THAT GATE IS VERSION-SPECIFIC, verified by reading the INSTALLED OpenClaw
+ * 2026.7.1-2 -- the version `package.json`'s `openclaw.compat.pluginApi`
+ * requires. It is not universal: OpenClaw 2026.4.3 contains no
+ * `allowConversationAccess` and no `CONVERSATION_HOOK_NAMES` anywhere, so on
+ * that host `llm_input` is ungated and the setting the startup log asks for
+ * does not exist. Printing the line anyway is still right -- the failure it
+ * explains is otherwise silent, and a setting an older host ignores costs
+ * nothing -- but if the catalogue stays empty on a host where the opt-in is
+ * already set, this caveat is where to start: the cause is somewhere else and
+ * has not been found.
  *
  * Zero dependencies, `node:fs` only. This runs inside someone else's agent.
  */
