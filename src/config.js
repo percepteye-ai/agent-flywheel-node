@@ -28,6 +28,24 @@ export const PLUGIN_ID = "percepteye-agent-flywheel";
  * `{additionalProperties: false, properties: {}}`, which does not merely fail
  * to read the settings, it REJECTS them: a customer following the manifest and
  * setting `apiKey` would have had it refused by the schema the module exports.
+ *
+ * NO PROPERTY HERE DECLARES A `default`, and that absence is load-bearing.
+ * OpenClaw validates `plugins.entries.<id>.config` with
+ * `validateJsonSchemaValue({..., applyDefaults: true})`
+ * (dist/loader-D8d2EvVh.js:1381-1412 -> dist/schema-validator-BRkrm3P2.js:239)
+ * and hands the RESULT over as `api.pluginConfig`. A schema default is
+ * therefore NOT "what happens when nobody said": the host materialises it into
+ * an EXPLICIT config value for every install, including one with no `config`
+ * block at all. `mode: "training"` then outranked PERCEPTEYE_AGENT_MODE,
+ * `capture: true` outranked PERCEPTEYE_CAPTURE and `agentId: "openclaw"`
+ * outranked PERCEPTEYE_AGENT_ID -- so a gateway serving real end users, with
+ * PERCEPTEYE_AGENT_MODE=production set exactly as the README instructs, claimed
+ * rollouts and started unattended turns anyway, and the operator got no signal
+ * because the observe-only log is on the branch that was never taken.
+ *
+ * `resolveConfig` below is the ONE place a default is decided. A schema default
+ * is a second answer to a question already answered there, and this host turns
+ * it into the winning one. `test/config-gate.test.js` asserts the absence.
  */
 export const CONFIG_SCHEMA = {
   type: "object",
@@ -43,8 +61,9 @@ export const CONFIG_SCHEMA = {
     agentId: {
       type: "string",
       minLength: 1,
-      default: "openclaw",
-      description: "The agent name this install reports as.",
+      description:
+        "The agent name this install reports as. Unset means " +
+        'PERCEPTEYE_AGENT_ID, then "openclaw".',
     },
     controlPlaneUrl: {
       type: "string",
@@ -53,8 +72,9 @@ export const CONFIG_SCHEMA = {
     },
     capture: {
       type: ["string", "boolean"],
-      default: true,
-      description: "Set false/0/off to disable local capture entirely.",
+      description:
+        "Set false/0/off to disable local capture entirely. Unset means " +
+        "PERCEPTEYE_CAPTURE, then on.",
     },
     mode: {
       type: "string",
@@ -62,11 +82,11 @@ export const CONFIG_SCHEMA = {
         "training", "train", "rollout", "rollouts", "fine-tuning",
         "finetuning", "improving", "production", "prod", "serving",
       ],
-      default: "training",
       description:
         "training: this install claims rollouts and drives turns. " +
         "production: observe-only -- the rollout hooks are never registered. " +
-        "Overrides PERCEPTEYE_AGENT_MODE.",
+        "Unset means PERCEPTEYE_AGENT_MODE, then training; a value here " +
+        "overrides the environment.",
     },
   },
 };

@@ -15,8 +15,7 @@
       "agentId": {
         "type": "string",
         "minLength": 1,
-        "default": "openclaw",
-        "description": "The agent name this install reports as."
+        "description": "The agent name this install reports as. Unset means PERCEPTEYE_AGENT_ID, then \"openclaw\"."
       },
       "controlPlaneUrl": {
         "type": "string",
@@ -28,8 +27,7 @@
           "string",
           "boolean"
         ],
-        "default": true,
-        "description": "Set false/0/off to disable local capture entirely."
+        "description": "Set false/0/off to disable local capture entirely. Unset means PERCEPTEYE_CAPTURE, then on."
       },
       "mode": {
         "type": "string",
@@ -45,8 +43,7 @@
           "prod",
           "serving"
         ],
-        "default": "training",
-        "description": "training: this install claims rollouts and drives turns. production: observe-only -- the rollout hooks are never registered. Overrides PERCEPTEYE_AGENT_MODE."
+        "description": "training: this install claims rollouts and drives turns. production: observe-only -- the rollout hooks are never registered. Unset means PERCEPTEYE_AGENT_MODE, then training; a value here overrides the environment."
       }
     }
   },

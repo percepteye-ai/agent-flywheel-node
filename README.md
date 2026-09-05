@@ -10,7 +10,7 @@ One plugin. Zero dependencies. Zero lines changed in your agent.
 [![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#dependencies)
-[![tests](https://img.shields.io/badge/tests-152-22c55e?style=for-the-badge)](#tests)
+[![tests](https://img.shields.io/badge/tests-node%3Atest-22c55e?style=for-the-badge)](#tests)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 **[Install](#install)** · [What it writes](#what-it-writes) · [Why `unknown` is real](#why-unknown-is-a-real-answer) · [Which hook, and why](#which-hook-and-why) · [Python or Node?](#python-or-node)
@@ -61,15 +61,42 @@ openclaw plugins install percepteye-agent-flywheel          # OpenClaw
 dsh plugin --profile <name> add percepteye-agent-flywheel   # DeepSeek Harness
 ```
 
-Then set one environment variable on the process running your agent:
+Then set the mode on the process running your agent. This is the setting that
+decides what the install does:
 
 ```bash
-export PERCEPTEYE_TRAJECTORY_DIR=/path/to/this/rollout
+export PERCEPTEYE_AGENT_MODE=production   # observe-only: no rollout is claimed
+export PERCEPTEYE_AGENT_MODE=training     # the default: claim and run rollouts
 ```
 
-With the variable unset the plugin does nothing at all — no file, no writes, no
-overhead. That is what lets you leave it installed permanently and have it
-record only while a rollout is running.
+`PERCEPTEYE_TRAJECTORY_DIR` names where a **training** rollout's tool outcomes
+are written, and the rollout driver sets it per rollout. With it unset,
+training mode writes no trajectory.
+
+**It is not an off switch for the plugin, and this section used to say it
+was.** In `production` mode the plugin captures the turns your agent serves —
+the end user's message, the tool calls, and the agent's answer — under
+`PERCEPTEYE_CAPTURE_DIR`, default `~/.percepteye/captured`, whether or not
+`PERCEPTEYE_TRAJECTORY_DIR` is set. `PERCEPTEYE_TRAJECTORY_DIR` is not
+consulted there at all, by design: a production trajectory belongs to one
+turn, not to one rollout. Sending those turns anywhere is separately gated and
+off until an operator turns it on — see
+[Production capture is opt-in](#production-capture-is-opt-in) — but writing
+them to disk is not.
+
+The switch that stops the OpenClaw plugin outright, in either mode, is:
+
+```bash
+export PERCEPTEYE_CAPTURE=0   # register nothing, record nothing, claim nothing
+```
+
+With it set the OpenClaw entry registers no hooks at all and says so once at
+startup. That — not an unset trajectory dir — is what lets you leave it
+installed permanently on a process serving your users.
+
+On **DeepSeek Harness** the older claim still holds and is the whole story:
+that lane has no rollout driver and no turn capture, so it writes only to
+`PERCEPTEYE_TRAJECTORY_DIR` and with the variable unset it writes nothing.
 
 ## Python or Node?
 
@@ -277,7 +304,10 @@ must not have one.
 
 ## Dependencies
 
-None. `node:fs` and `node:path` only. This runs inside someone else's agent
+None — no third-party package, which the `no-dependencies` CI job
+enforces. Node builtins only: `node:fs`, `node:path`, `node:crypto` (the
+cross-SDK idempotency digest) and `node:os` (home-directory resolution, which
+is where production capture writes). This runs inside someone else's agent
 process, and every dependency added here is a version conflict imposed on a
 customer who did not ask for it.
 

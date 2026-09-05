@@ -1,5 +1,14 @@
 /**
- * The nine control-plane calls, and the one that must never be replayed.
+ * Every control-plane call this package makes, and the one that must never be
+ * replayed.
+ *
+ * NO COUNT IN THAT SENTENCE, deliberately. It used to open "the nine
+ * control-plane calls" and went stale the moment `captureCurrent` was added --
+ * a reviewer counting the header against the served-route list would have been
+ * counting nine of ten. What keeps this file's surface honest is not a number
+ * in a comment but `test/config-gate.test.js`, which parses every
+ * `request("METHOD", "<path>")` out of THIS SOURCE and asserts the control
+ * plane serves it. A count restates that check without performing it.
  *
  * A port of `percepteye_agent_flywheel/transport.py`. Everything here is
  * OUTBOUND-ONLY: there is no listening socket anywhere in this package, and a
@@ -10,7 +19,9 @@ import { createHash } from "node:crypto";
 import { rolloutOutputToWire, rolloutRequestFromWire } from "./wire.js";
 
 /**
- * `json.dumps(value, sort_keys=True)`, in JavaScript.
+ * `json.dumps(value, sort_keys=True)`, in JavaScript -- for STRINGS, BOOLEANS,
+ * NULLS AND INTEGERS. Numbers that are not integers are the one gap, and it is
+ * named below rather than left to be found by a digest that does not match.
  *
  * THE IDEMPOTENCY KEY IS A CROSS-SDK CONTRACT, and this function is the whole
  * of it. Both packages hash a batch of turns and send the digest as that
@@ -18,16 +29,44 @@ import { rolloutOutputToWire, rolloutRequestFromWire } from "./wire.js";
  * still on disk gets each SDK defeating the other's de-duplication if the two
  * hash the same payload differently.
  *
- * `JSON.stringify` differs from Python's default in THREE ways, and this
- * shipped claiming a parity it did not have until a test in the Python package
- * (`test_report_turns_wire.py`) hashed one real batch through both ends and
- * compared the digests:
+ * `JSON.stringify` differs from Python's default in three ways that ARE
+ * handled here, and this shipped claiming a parity it did not have until a
+ * test in the Python package (`test_report_turns_wire.py`) hashed one real
+ * batch through both ends and compared the digests:
  *
  *   1. KEY ORDER  -- Python sorts; JS preserves insertion order.
  *   2. SEPARATORS -- Python's defaults are ", " and ": ", WITH the spaces.
  *   3. NON-ASCII  -- Python's `ensure_ascii=True` escapes every non-ASCII
  *      codepoint; JS emits it literally. This is the one that bites in
  *      practice, because what is being hashed is end users' own messages.
+ *
+ * NUMBERS ARE A FOURTH WAY, AND THIS SIDE ALONE CANNOT CLOSE IT. Python
+ * renders a float with `repr`, JS with `Number.prototype.toString`, and they
+ * disagree on more than spacing (each verified by running both):
+ *
+ *     12.0  ->  Python `12.0`   Node `12`
+ *     1e-7  ->  Python `1e-07`  Node `1e-7`
+ *     1e16  ->  Python `1e+16`  Node `10000000000000000`
+ *    -0.0   ->  Python `-0.0`   Node `0`
+ *
+ * The first row is the one that matters and is also the reason a JS-side
+ * float formatter would be a pretence rather than a fix:
+ * `JSON.parse('{"latency_ms": 12.0}')` yields the number 12 with int-vs-float
+ * ALREADY ERASED, so nothing here can know which of the two forms Python would
+ * have emitted for the same file. This is reachable, not theoretical -- a tool
+ * call's `arguments` and `latency_ms` are the customer's own JSON, read back
+ * off disk.
+ *
+ * Closing it needs ONE canonicaliser applied on BOTH sides before hashing, so
+ * it is a change to the Python package too; a second number formatter here
+ * would fix the two rare rows and leave the common one broken while looking
+ * settled. Until then the guarantee is exactly: a batch of strings, booleans,
+ * nulls and integers hashes identically on both sides, and a batch carrying a
+ * non-integral or very large number may not -- in which case the replay is
+ * caught by the server's per-turn (org, agent, turn_id) rule, which this key
+ * sits in front of rather than replaces. `test/transport.test.js` pins the gap
+ * so it stays visible instead of being certified away by an integers-only
+ * fixture.
  */
 function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(", ")}]`;
@@ -74,6 +113,15 @@ export class AttachTransport {
     return this._c.request("GET", "/health");
   }
 
+  /**
+   * Create or update this agent's row. THE ONLY PRODUCER of one -- no other
+   * route in the control plane creates a `FlywheelAgent`, so an agent that
+   * never registers cannot be consented to, graded or described. Replayable:
+   * the route is an upsert and the key collapses a network-level resend.
+   *
+   * The payload is built by its caller, `capture.js:enrol`, which is where
+   * the three-state `discovered_agent` decision is made and explained.
+   */
   register(spec) {
     return this._c.request("POST", "/agents", {
       jsonBody: spec,
@@ -146,8 +194,12 @@ export class AttachTransport {
    * through `POST /agents` -- an upsert -- so re-asking cost a write, and a
    * registration that omits `discovered_agent` is recorded as introspection
    * `disabled`, which stops that agent's description driving workflow
-   * generation. This package carried an explicit `discovered_agent: null`
-   * purely to work around that; the workaround is gone with this route.
+   * generation.
+   *
+   * `register` above is still called, ONCE, at startup: it is the only
+   * producer of the agent row this verdict is computed from, and without it
+   * the answer is permanently "not registered". Re-asking is what this route
+   * made free, not registering. See `capture.js:enrol`.
    *
    * FAILS CLOSED. An unreachable control plane resolves to `{}`, which the
    * caller reads as "no". The opposite of `policyCurrent`, which fails OPEN
@@ -191,6 +243,23 @@ export class AttachTransport {
     });
   }
 
+  /**
+   * Renew the lease on a rollout that is STILL RUNNING.
+   *
+   * A REQUIREMENT ON WHOEVER HOLDS THE ROLLOUT, not an optional ping. The
+   * control plane reaps a lease that stops being renewed and requeues the work
+   * while attempts remain, so a rollout that outlives `leaseMs` -- 5 minutes by
+   * default, routine for a multi-tool task -- is handed to somebody else while
+   * this process is still working on it. The result then lands against a lease
+   * this process no longer owns: `report` is answered for an attempt that was
+   * superseded, and `heartbeat` itself raises `LeaseLost` (HTTP 410), which is
+   * the signal to stop working and report nothing rather than to retry.
+   *
+   * So a caller that keeps a rollout across an await must beat it at roughly
+   * `leaseMs / 3` until it reports or gives it back. The Python end does this
+   * from `RolloutRunner`, pinned by
+   * `tests/test_lease_and_concurrency.py::test_a_long_rollout_heartbeats_its_lease`.
+   */
   heartbeat(rollout, { progress } = {}) {
     const payload = {
       lease_token: rollout.leaseToken,

@@ -14,11 +14,14 @@
  * it refused by the schema the module itself publishes.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import plugin, { register, PLUGIN_ID } from "../src/index.js";
 import { CONFIG_SCHEMA, resolveConfig } from "../src/config.js";
+import { PRODUCTION } from "../src/mode.js";
 
 /** A host stub that records what the plugin subscribed to. */
 function fakeApi() {
@@ -151,4 +154,136 @@ test("the transport calls no route the control plane does not serve", async () =
     unserved, [],
     `transport calls routes the control plane does not serve: ${unserved.join(", ")}`,
   );
+});
+
+
+// ── THE HOST HYDRATES SCHEMA DEFAULTS INTO api.pluginConfig ────────────────
+//
+// The defect these cover: `mode`, `capture` and `agentId` each declared a
+// `default` in the schema. OpenClaw validates `plugins.entries.<id>.config`
+// with `validateJsonSchemaValue({..., applyDefaults: true})`
+// (dist/loader-D8d2EvVh.js:1381-1412 -> dist/schema-validator-BRkrm3P2.js:239)
+// and hands the RESULT over as `api.pluginConfig`, so a customer with NO
+// config block at all was given `{agentId:"openclaw", capture:true,
+// mode:"training"}` as EXPLICIT config — which outranks the environment. Every
+// documented env switch was therefore inert: PERCEPTEYE_AGENT_MODE=production
+// on a gateway serving real users still claimed rollouts and started
+// unattended turns, PERCEPTEYE_CAPTURE=0 still recorded, and three fleets
+// distinguished by PERCEPTEYE_AGENT_ID all reported as "openclaw".
+//
+// Every existing test stayed green because none of them ever fed `register`
+// the config the host actually produces — they pass `{}`, or an
+// `api.pluginConfig` written by hand.
+
+/**
+ * `validateJsonSchemaValue({..., applyDefaults: true})`, in the one respect
+ * that bit us: a missing key with a schema `default` becomes present.
+ *
+ * Reproduced rather than imported. This package must not depend on the host
+ * (the same reason `schema/flywheel-1.json` is a vendored copy), and the
+ * assertion below is about what the schema DECLARES, which is knowable here.
+ */
+function hydrateAsHostWould(schema, value = {}) {
+  const out = { ...value };
+  for (const [key, prop] of Object.entries(schema.properties ?? {})) {
+    if (!Object.hasOwn(out, key) && Object.hasOwn(prop ?? {}, "default")) {
+      out[key] = prop.default;
+    }
+  }
+  return out;
+}
+
+test("no schema property declares a `default` — the host would make it explicit", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  for (const [label, schema] of [
+    ["openclaw.plugin.json", manifest.configSchema],
+    ["src/config.js CONFIG_SCHEMA", CONFIG_SCHEMA],
+  ]) {
+    const withDefaults = Object.entries(schema.properties ?? {})
+      .filter(([, prop]) => Object.hasOwn(prop ?? {}, "default"))
+      .map(([key]) => key);
+    assert.deepEqual(
+      withDefaults, [],
+      `${label} declares a default for ${withDefaults.join(", ")}. The host ` +
+      `hydrates it into api.pluginConfig as an EXPLICIT value, which beats ` +
+      `the environment — resolveConfig is the only place a default belongs`,
+    );
+  }
+});
+
+test("the config the host builds from an EMPTY config block leaves every env switch working", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  // Exactly what OpenClaw hands a customer who wrote no `config` block.
+  const supplied = hydrateAsHostWould(manifest.configSchema, {});
+  const config = resolveConfig(supplied, {
+    PERCEPTEYE_AGENT_MODE: "production",
+    PERCEPTEYE_CAPTURE: "0",
+    PERCEPTEYE_AGENT_ID: "support-bot",
+  });
+  assert.equal(config.mode, PRODUCTION, "PERCEPTEYE_AGENT_MODE must decide the mode");
+  assert.equal(
+    config.modeSource, "environment",
+    "a hydrated default must not be reported as the customer's own config",
+  );
+  assert.equal(config.captureEnabled, false, "PERCEPTEYE_CAPTURE=0 must disable capture");
+  assert.equal(config.agentId, "support-bot", "PERCEPTEYE_AGENT_ID must name the agent");
+});
+
+test("PERCEPTEYE_AGENT_MODE=production keeps the rollout driver unregistered under the host's own calling convention", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  const api = fakeApi();
+  // The host calls `register(api)` with ONE argument
+  // (loader-D8d2EvVh.js:761) and puts the validated config here.
+  api.pluginConfig = hydrateAsHostWould(manifest.configSchema, {});
+  const out = register(api, {}, {
+    PERCEPTEYE_AGENT_MODE: "production",
+    PERCEPTEYE_CAPTURE_DIR: join(tmpdir(), "percepteye-config-gate-test"),
+  });
+  assert.equal(out.mode, PRODUCTION);
+  assert.equal(out.rollouts, null, "production must not construct the rollout driver");
+  const subscribed = api.hooks.map(([name]) => name);
+  for (const hook of ["session_start", "gateway_start", "cron_changed", "session_end"]) {
+    assert.ok(
+      !subscribed.includes(hook),
+      `${hook} is a rollout hook and must not be subscribed in production; ` +
+      `subscribed: ${subscribed.join(", ")}`,
+    );
+  }
+});
+
+test("production is NOT inert without a trajectory dir, and the description no longer says it is", () => {
+  // `plugin.description` is what `openclaw plugins list` prints, and it read
+  // "Inert unless PERCEPTEYE_TRAJECTORY_DIR is set" — the README's "no file,
+  // no writes ... that is what lets you leave it installed permanently" said
+  // the same. Both were INVERTED once production mode gained turn capture:
+  // production is the mode that writes with that variable unset, and what it
+  // writes is the END USER'S message text.
+  const root = mkdtempSync(join(tmpdir(), "percepteye-inert-"));
+  try {
+    const api = fakeApi();
+    // No PERCEPTEYE_TRAJECTORY_DIR anywhere in this env, deliberately.
+    register(api, {}, {
+      PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
+    });
+    const received = api.hooks.find(([name]) => name === "message_received");
+    assert.ok(received, "production subscribes the end user's message");
+    received[1]({ runId: "run1", content: "my account number is 12345", sessionKey: "s" }, {});
+    assert.ok(
+      readdirSync(root).length > 0,
+      "production capture writes the served turn to disk with no trajectory dir set",
+    );
+    assert.ok(
+      !/\binert\b/i.test(plugin.description),
+      `the description a customer reads claims inertness while the plugin ` +
+      `writes their users' messages: ${JSON.stringify(plugin.description)}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

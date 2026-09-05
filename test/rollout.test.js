@@ -283,7 +283,29 @@ describe("the claim / deliver / report loop", () => {
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onSessionEnd({ sessionKey: "s1", reason: "shutdown" });
     assert.equal(tx.calls.report.length, 0, "an answerless rollout must not be reported");
-    assert.equal(tx.calls.abandon[0][1].reason, "cancelled");
+    assert.equal(tx.calls.abandon[0][1].reason, "entrypoint_error");
+  });
+
+  it("gives it back with a REQUEUING reason, never 'cancelled'", async () => {
+    // `cancelled` is the one reason Mission Control never requeues:
+    // `RolloutRepository.abandon` computes
+    // `requeue = attempt < max_attempts and reason != "cancelled"`, so it
+    // retires the rollout ABANDONED with its remaining attempts unused. This
+    // path used to send exactly that, and the ordinary case for it is not a
+    // cancellation at all -- an operator opens a session, the task is queued
+    // for the NEXT turn, and they close it without ever taking one. Nothing
+    // ran, so the work is worth handing back.
+    const tx = fakeTransport();
+    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    await d.onSessionStart({ sessionKey: "s1" });
+    await d.onSessionEnd({ sessionKey: "s1", reason: "shutdown" });
+    assert.notEqual(
+      tx.calls.abandon[0][1].reason, "cancelled",
+      "'cancelled' is terminal in Mission Control; a session that simply " +
+      "ended must leave the rollout requeueable",
+    );
+    assert.match(tx.calls.abandon[0][1].detail, /before the agent answered/);
+    assert.equal(d.inFlight.size, 0);
   });
 
   it("does not claim twice for one session", async () => {

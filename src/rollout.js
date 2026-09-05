@@ -39,20 +39,33 @@
  *   reaches `runIsolatedAgentJob` (:2433) and then `runCronIsolatedAgentTurn`
  *   (:4484), which runs the agent.
  *
- *   THIS LANE DELIBERATELY DOES NOT USE THAT PATH, which is a product
- *   decision and not a technical limit. Reaching past a restriction the host
- *   states explicitly ("Bundled-only") by way of a service it hands out
- *   elsewhere is depending on what looks like an inconsistency in someone
- *   else's permission model: it can be closed in a patch release, and it is
- *   not a thing to do silently inside a customer's agent. If unattended
- *   rollouts are wanted, that is the mechanism -- taken as a decision, with
- *   the operator told what it does.
+ *   THIS LANE USES THAT PATH, IN TRAINING MODE, AND SAYS SO. An earlier
+ *   version of this header said the opposite -- "deliberately does not use
+ *   that path" -- and it stayed there after `registerRolloutDriver` below
+ *   started wiring it, which made the most sensitive claim in the package a
+ *   false one. Reaching past a restriction the host states explicitly
+ *   ("Bundled-only") by way of a service it hands out elsewhere is depending
+ *   on what looks like an inconsistency in someone else's permission model,
+ *   so it is done as a decision with three things designed in:
  *
- *   So today the task is placed in the NEXT turn the operator or harness
- *   starts. The Python SDK's CLI-hook lane has the same shape -- there a
- *   SessionStart hook writes the task into the working directory -- so the
- *   parity statement holds; this lane simply delivers into the agent's real
- *   context, exactly once, with a delivery verdict.
+ *     - TRAINING MODE ONLY, structurally: this function is not called at all
+ *       in production, so a process serving real users can never start a turn
+ *       on its own, whatever any setting says.
+ *     - IN A DEDICATED SESSION, `percepteye-rollout-<id>`, never one a person
+ *       is using, and with `delivery.mode: "none"` so training output cannot
+ *       surface in a human's chat.
+ *     - DEGRADING WHEN THE SEAM CLOSES, which a patch release may do at any
+ *       time: the runner stops polling and this file's injection lane carries
+ *       on alone. See `unattended.js` for the mechanism and why stopping (not
+ *       just announcing) is the whole of it.
+ *
+ *   The injection lane below is NOT replaced by any of that. It stays
+ *   subscribed and it is what runs when there is no cron: the task is placed
+ *   in the NEXT turn the operator or harness starts. The Python SDK's CLI-hook
+ *   lane has the same shape -- there a SessionStart hook writes the task into
+ *   the working directory -- so the parity statement holds; this lane simply
+ *   delivers into the agent's real context, exactly once, with a delivery
+ *   verdict.
  *
  * `agent_end`                 CONVERSATION-GATED. It is in
  *   `CONVERSATION_HOOK_NAMES`, and a non-bundled plugin's registration is
@@ -324,13 +337,24 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
    * arrived. Give it back rather than reporting an empty result: a report with
    * no final text is a report about nothing, and it would count as a completed
    * rollout.
+   *
+   * `entrypoint_error`, NOT `cancelled`, and the difference is the whole
+   * point of giving it back. `cancelled` is the ONE reason Mission Control
+   * never requeues -- `RolloutRepository.abandon` computes
+   * `requeue = attempt < max_attempts and reason != "cancelled"` -- so it
+   * retires the rollout with its remaining attempts unused. Nothing in this
+   * lane is an operator cancelling anything: the ordinary case is a session
+   * opened and closed before a second turn, and the task never ran. That is
+   * exactly `entrypoint_error` ("the agent could not be STARTED -- nothing
+   * ran, so there is nothing to learn from and the work is worth handing
+   * back"), which is what the other give-back sites above already use.
    */
   async function onSessionEnd(event) {
     const sessionKey = event?.sessionKey ?? event?.sessionId;
     const rollout = sessionKey ? inFlight.get(sessionKey) : null;
     if (!rollout) return null;
     await giveBack(
-      sessionKey, rollout, "cancelled",
+      sessionKey, rollout, "entrypoint_error",
       `the session ended (${event?.reason ?? "unknown"}) before the agent ` +
       `answered, so no trajectory was produced`,
     );
@@ -401,6 +425,12 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
   // plugin keeps claiming and delivering through injection rather than losing
   // rollouts entirely. Starting turns is an ADDITION to that lane, not a
   // replacement for it -- which is what makes the degradation path safe.
+  //
+  // The other half of that path lives in the runner: on a degraded start it
+  // STOPS POLLING, so the injection lane is left as the only claimer instead
+  // of competing with a loop that claims and hands back every 30 seconds.
+  // `capture` below is what can re-arm it, and only because both hooks it is
+  // bound to mean the host has just handed over a cron context.
   let unattended = null;
   {
     // `getCron` lives on the gateway hook CONTEXT and nowhere else, so it has

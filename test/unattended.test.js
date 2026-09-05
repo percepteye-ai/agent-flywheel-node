@@ -1,11 +1,23 @@
 /**
- * THE OPT-IN LANE. Off unless asked for; degrades instead of failing.
+ * THE MODE IS THE ONLY SWITCH. Training drives; production cannot reach here.
+ *
+ * This header used to say the lane was opt-in and that "an operator has to
+ * turn it on". Commit 2db3b15 deleted `PERCEPTEYE_UNATTENDED` and the header
+ * outlived it -- so a reviewer asking "does this plugin start turns by
+ * itself?" read a file whose first suite is titled "the mode is the only
+ * switch" and was told the opposite by the paragraph above it.
  *
  * This lane starts turns through a host seam OpenClaw restricts for its own
- * scheduling API, so the two properties that make it defensible are the ones
- * asserted hardest here: an operator has to turn it on, and when the seam is
- * not there the plugin keeps working the ordinary way instead of dropping
- * rollouts.
+ * scheduling API, so the two properties that actually make it defensible are
+ * the ones asserted hardest here:
+ *
+ *   1. It is confined to training mode STRUCTURALLY -- production never
+ *      constructs the driver, so this module is unreachable there.
+ *   2. When the seam is not there it DEGRADES: it STOPS POLLING and leaves
+ *      the injection lane to claim, rather than claiming a rollout every poll
+ *      and handing it straight back. Mission Control spends an attempt on
+ *      each of those and retires the rollout unrun at the third, so "degrades
+ *      instead of failing" is only true if the loop actually stops.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -112,12 +124,18 @@ describe("starting a turn through cron", () => {
   });
 });
 
-function harness({ started = true, degraded = false, rollouts } = {}) {
-  const calls = { claim: 0, report: [], abandon: [], turns: [] };
+function harness({ started = true, degraded = false, rollouts, pollMs } = {}) {
+  const calls = { claim: 0, report: [], abandon: [], turns: [], warns: [] };
   const transport = {
     claim: async () => {
       calls.claim += 1;
-      return { rollouts: rollouts ?? [{ rolloutId: "r1", turnInput: "t", leaseToken: "lt" }] };
+      // DISTINCT ids per claim, like a real queue: the churn this suite pins
+      // is one rollout burned per poll, and a fixture that hands back the
+      // same row every time hides how many of them there were.
+      return {
+        rollouts: rollouts
+          ?? [{ rolloutId: `r${calls.claim}`, turnInput: "t", leaseToken: "lt" }],
+      };
     },
     report: async (r, o) => { calls.report.push([r, o]); },
     abandon: async (r, o) => { calls.abandon.push([r, o]); },
@@ -126,7 +144,8 @@ function harness({ started = true, degraded = false, rollouts } = {}) {
     transport, enqueue: async () => ({ enqueued: true }),
   });
   const runner = createUnattendedRunner({
-    transport, driver,
+    transport, driver, pollMs,
+    logger: { info() {}, warn: (m) => calls.warns.push(String(m)) },
     startTurn: async (t) => {
       calls.turns.push(t);
       return { started, degraded, reason: started ? null : "no cron" };
@@ -202,5 +221,73 @@ describe("the unattended loop", () => {
   it("stop() is safe before start() and idempotent", () => {
     const h = harness();
     assert.doesNotThrow(() => { h.runner.stop(); h.runner.stop(); });
+  });
+});
+
+describe("a dead seam stops this lane instead of eating the queue", () => {
+  it("claims ONCE across many ticks, not once per tick", async () => {
+    // THE FAILURE THIS PINS. `giveBack` posts `entrypoint_error`, and Mission
+    // Control's `claim` increments `attempt` while `abandon` requeues only
+    // while `attempt < max_attempts` (default 3). So a runner that claims and
+    // hands back on every poll retires each rollout ABANDONED, unrun, inside
+    // 90 seconds -- and the earlier code did exactly that, forever, having
+    // announced that it had "fallen back to the default lane".
+    const h = harness({ started: false, degraded: true });
+    for (let i = 0; i < 5; i += 1) await h.runner.tick();
+    assert.equal(h.calls.claim, 1,
+      "the degraded runner kept claiming; each extra claim spends one of a " +
+      "rollout's three attempts on a turn that can never start");
+    assert.equal(h.calls.abandon.length, 1);
+    assert.equal(h.calls.turns.length, 1);
+  });
+
+  it("says so ONCE, and says that it stopped polling", async () => {
+    const h = harness({ started: false, degraded: true });
+    for (let i = 0; i < 3; i += 1) await h.runner.tick();
+    assert.equal(h.calls.warns.length, 1, "the fallback is announced once");
+    assert.match(h.calls.warns[0], /stopped polling/);
+  });
+
+  it("CANCELS THE POLLER, not just the claiming", async () => {
+    // Asserted on `polling`, not on the claim count, and that is the point:
+    // the claim count stays at 1 whether or not the interval was cleared,
+    // because `tick`'s guard turns every later wake-up into an early return.
+    // A test that checked only the count would pass with `stopTimer()`
+    // deleted, leaving a 30s timer running forever in a customer's gateway
+    // for a lane the operator was told had gone quiet.
+    const h = harness({ started: false, degraded: true, pollMs: 5 });
+    h.runner.start();
+    assert.equal(h.runner.polling, true);
+    await h.runner.tick();
+    assert.equal(h.runner.polling, false,
+      "the poll interval survived the degradation");
+    await new Promise((r) => { setTimeout(r, 60); });
+    assert.equal(h.calls.claim, 1, "it woke up and claimed again anyway");
+    h.runner.stop();
+  });
+
+  it("a refusal is NOT a degradation, so the loop keeps working", async () => {
+    // Cron answered and said no to this one job. That is a per-rollout error,
+    // not a closed seam, and stopping the lane on it would turn one bad job
+    // into an outage.
+    const h = harness({ started: false, degraded: false });
+    await h.runner.tick();
+    await h.runner.tick();
+    assert.equal(h.calls.claim, 2);
+    assert.equal(h.calls.warns.length, 0);
+  });
+
+  it("start() re-arms it, because only a fresh cron context calls start()", async () => {
+    // `gateway_start` and `cron_changed` are the only callers, and both mean
+    // the host just handed over a cron context -- which is what keeps a
+    // later-arriving cron usable rather than caching the degradation forever.
+    const h = harness({ started: false, degraded: true });
+    await h.runner.tick();
+    await h.runner.tick();
+    assert.equal(h.calls.claim, 1);
+    h.runner.start();
+    h.runner.stop();
+    await h.runner.tick();
+    assert.equal(h.calls.claim, 2, "a re-armed runner must claim again");
   });
 });

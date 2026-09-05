@@ -7,16 +7,25 @@ on:
 
 jobs:
   test:
-    # Both ends of OpenClaw's supported engine range. A plugin runs inside
-    # somebody else's process on whatever Node they already have, so testing
-    # one version tests the version WE happen to run, not the one a customer
-    # does.
+    # A plugin runs inside somebody else's process on whatever Node they
+    # already have, so testing one version tests the version WE happen to run,
+    # not the one a customer does.
+    #
+    # OpenClaw admits `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`, so these
+    # are the three majors a customer can actually be on. This said "both ends
+    # of OpenClaw's supported engine range" while testing 22 and 24 -- 25 was
+    # the open-ended top of that range and was never run.
+    #
+    # `engines` in package.json (`>=22.22.3`) is deliberately only a FLOOR:
+    # this package also ships to DeepSeek Harness, which publishes no such
+    # range, so mirroring OpenClaw's here would refuse an install this code
+    # supports.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: ["22", "24"]
+        node: ["22", "24", "25"]
     # A backstop for a hang OUTSIDE a test, which the per-test timeout cannot
     # catch. In the repo this was split from, this job once sat for six minutes
     # and reported nothing until it was cancelled by hand.
@@ -88,22 +97,74 @@ jobs:
           if grep -q "^test/" /tmp/shipped.txt; then
             echo "test/ must not ship"; exit 1
           fi
-      - name: the entry points the manifests name actually exist
+      - name: the entry points the manifests name actually SHIP
         # openclaw.plugin.json and cordis.patch.yml each name a file the HOST
         # will load. A manifest pointing at a path that is not in `files` is a
         # plugin that installs and cannot start, and npm will not catch it.
+        #
+        # So the question is NOT "does this path exist in the checkout" -- it
+        # always does, that is where it was just edited -- but "is it inside
+        # the tarball". This step used to ask the first question, which is why
+        # deleting "src" from `files` left it green while npm packed LICENSE,
+        # README.md, the two manifests and no code at all.
+        #
+        # Reads /tmp/shipped.txt from the step above: the packed listing, which
+        # is the only place `files` membership is observable.
         run: |
           node -e '
-            const { readFileSync, existsSync } = require("node:fs");
+            const { readFileSync } = require("node:fs");
             const pkg = require("./package.json");
+            const shipped = new Set(
+              readFileSync("/tmp/shipped.txt", "utf8").split("\n").filter(Boolean),
+            );
             const targets = new Set();
-            for (const p of Object.values(pkg.exports ?? {})) targets.add(p);
+            if (typeof pkg.main === "string") targets.add(pkg.main);
+            for (const p of Object.values(pkg.exports ?? {})) {
+              if (typeof p === "string") targets.add(p);
+            }
             for (const p of pkg.openclaw?.extensions ?? []) targets.add(p);
             const patch = pkg.dsh?.bundle?.patch;
             if (patch) targets.add(patch);
+            if (!targets.size) {
+              console.error("no entry points found to check -- this check has stopped checking");
+              process.exit(1);
+            }
             let bad = 0;
             for (const t of targets) {
-              if (!existsSync(t)) { console.error(`missing entry point: ${t}`); bad = 1; }
+              if (!shipped.has(String(t).replace(/^\.\//, ""))) {
+                console.error(`entry point is NOT in the tarball: ${t}`);
+                bad = 1;
+              }
             }
+            if (!bad) console.log(`all ${targets.size} entry points ship`);
             process.exit(bad);
           '
+
+  oss-boundary:
+    # This repo is PUBLIC. The Python package enforces this as a test over
+    # every git-tracked file, with a docstring explaining why a src/-only scan
+    # was not enough: "the README, the examples and the tests are as public as
+    # the package, so they are scanned the same way".
+    #
+    # Splitting the Node package into its own repo carried the package and not
+    # the mechanism, and an internal control-plane module path was already
+    # sitting in a tracked test file with the whole suite green. This is the
+    # producer for that consumer.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no internal names in any tracked file
+        # `git ls-files`, not `src/`: what a reader of the public repo sees is
+        # every tracked file, not just what npm packs.
+        #
+        # This workflow is excluded because it is the guard -- it has to name
+        # the strings it forbids.
+        run: |
+          if git grep -nIwE 'mission_control|missioncontrol|MissionControl|agent_protocol|ranger|compass|scout|ftagent|vllm|doctrine' \
+               -- . ':!.github/workflows/ci.yml'; then
+            echo
+            echo "An internal name appears in a tracked file of a public repo."
+            echo "Name the public surface instead of the private module path."
+            exit 1
+          fi
+          echo "no internal names in tracked files"

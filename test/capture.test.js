@@ -16,10 +16,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  BATCH_SIZE, FLUSH_EVERY, UPLOADED_INDEX, announce, captureRoot,
-  captureVerdict, createTurnCapture, createTurnUploader, lastAssistantText,
-  registerTurnCapture,
+  BATCH_SIZE, FLUSH_EVERY, UNANSWERED_SETTLE_MS, UPLOADED_INDEX, announce,
+  captureRoot, captureVerdict, createTurnCapture, createTurnUploader,
+  lastAssistantText, registerTurnCapture,
 } from "../src/capture.js";
+import { SDK_UA } from "../src/http.js";
+import { CONTRACT_VERSION } from "../src/wire.js";
 import {
   CONVERSATION_ID_FILENAME, MAX_TEXT_CHARS, TURNS_FILENAME, readTurnText,
   recordTurnText,
@@ -229,14 +231,22 @@ describe("consent", () => {
   });
 });
 
-function fakeTransport({ turns = true, reason = null } = {}) {
+function fakeTransport({ turns = true, reason = null, registerFails = null } = {}) {
   const batches = [];
   return {
     batches,
     registered: [],
     verdictReads: [],
-    register(spec) { this.registered.push(spec); return { capture: { turns } }; },
+    /** Every control-plane method called, in order. The ORDER is asserted. */
+    calls: [],
+    register(spec) {
+      this.calls.push("register");
+      this.registered.push(spec);
+      if (registerFails) throw new Error(registerFails);
+      return { capture: { turns } };
+    },
     async captureCurrent(agentId) {
+      this.calls.push("captureCurrent");
       this.verdictReads.push(agentId);
       return { agent_id: agentId,
                capture: reason ? { turns, reason } : { turns } };
@@ -353,14 +363,193 @@ describe("uploading", () => {
   });
 });
 
-describe("registration reads the verdict without a harmful side effect", () => {
+/**
+ * A host api that enforces the CONVERSATION GATE the way OpenClaw does:
+ * `registerTypedHook` drops `agent_end` for a non-bundled plugin unless
+ * `allowConversationAccess === true`, and the refusal is a BARE RETURN --
+ * `api.on()` reports nothing either way, so the plugin cannot detect it
+ * afterwards. A fixture whose `on()` records every hook cannot see the defect
+ * this suite exists for, which is exactly why the old one did not.
+ */
+function hostApi({ allowConversationAccess = false } = {}) {
+  const hooks = [];
+  return {
+    hooks,
+    logger: { info() {}, warn() {} },
+    on(name, fn) {
+      if (name === "agent_end" && !allowConversationAccess) return;
+      hooks.push({ name, fn });
+    },
+    config: {
+      plugins: {
+        entries: { [PLUGIN_ID]: { hooks: { allowConversationAccess } } },
+      },
+    },
+    fire(name, ...args) {
+      for (const h of hooks) if (h.name === name) h.fn(...args);
+    },
+  };
+}
+
+/** Let a not-awaited cadence flush run to completion. */
+async function settle() {
+  for (let i = 0; i < 5; i += 1) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+/** Backdate a turn directory past the settle window: it stopped changing. */
+function age(dir) {
+  const t = new Date(Date.now() - UNANSWERED_SETTLE_MS - 60_000);
+  utimesSync(dir, t, t);
+  return dir;
+}
+
+/** Wire the production lane against a fake control plane, verdict already in. */
+async function wireCapture(root, a, tr) {
+  const out = registerTurnCapture(a, {
+    config: { apiKey: "k", agentId: "a1" },
+    turns: createTurnCapture({ root }),
+    pluginId: PLUGIN_ID,
+    logger: a.logger,
+    env: { PERCEPTEYE_CAPTURE_DIR: root },
+    makeTransport: () => tr,
+  });
+  await settle();
+  assert.equal(out.uploader.mayUpload, true, "the fake verdict did not land");
+  return out;
+}
+
+describe("the cadence hangs off a hook the host actually delivers", () => {
+  it("flushes after FLUSH_EVERY message_received, with agent_end DROPPED", async () => {
+    // THE DEFECT THIS SUITE EXISTS FOR. `uploader.note()` -- the only thing
+    // that advances the flush counter -- used to be called from the
+    // `agent_end` handler alone. `agent_end` is the one hook this host drops
+    // for a non-bundled plugin, and the only other trigger is `gateway_stop`,
+    // which a gateway that keeps running never reaches. So the default
+    // install uploaded NOTHING, EVER, while the startup log told the operator
+    // its turns were being uploaded. The old cadence test called `u.note()`
+    // by hand and never asked which hook drives it, so it passed green.
+    const root = tmp();
+    const a = hostApi();
+    const tr = fakeTransport();
+    await wireCapture(root, a, tr);
+    assert.ok(!a.hooks.some((h) => h.name === "agent_end"),
+      "the fixture must model the host DROPPING the conversation hook");
+
+    // One turn already on disk and finished, so a flush has something to send.
+    age(makeTurn(root, "earlier", { task: "t", answer: "a" }));
+
+    for (let i = 0; i < FLUSH_EVERY; i += 1) {
+      a.fire("message_received", { runId: `r${i}`, content: "hi", sessionKey: "c" }, {});
+    }
+    await settle();
+    assert.deepEqual(tr.sent.map((t) => t.turn_id), ["earlier"],
+      "FLUSH_EVERY user messages did not trigger an upload; the cadence is " +
+      "still waiting on a hook this host does not deliver");
+  });
+
+  it("does not flush on agent_end, so the cadence stays Python's", async () => {
+    // Python increments `_turns_since_flush` in `turn()` and NOT in
+    // `record_answer`; counting in both places would flush a granted install
+    // at twice the documented rate, and "same cadence" is a promise this
+    // package makes in its first paragraph.
+    const root = tmp();
+    const a = hostApi({ allowConversationAccess: true });
+    const tr = fakeTransport();
+    await wireCapture(root, a, tr);
+    assert.ok(a.hooks.some((h) => h.name === "agent_end"),
+      "the granted fixture must actually subscribe the conversation hook");
+
+    age(makeTurn(root, "earlier", { task: "t", answer: "a" }));
+    for (let i = 0; i < FLUSH_EVERY; i += 1) {
+      a.fire("agent_end",
+             { runId: `r${i}`, messages: [{ role: "assistant", content: "a" }] }, {});
+    }
+    await settle();
+    assert.deepEqual(tr.sent, [], "agent_end advanced the flush counter");
+  });
+
+  it("sends unanswered turns on the cadence when no answer is coming", async () => {
+    // "Hold a turn back, an answer may still be coming" is only true where
+    // answers come at all. With `agent_end` dropped, EVERY turn has
+    // `final_text: null` forever -- so a cadence that skips them sends zero
+    // turns however often it fires.
+    const root = tmp();
+    const a = hostApi();
+    const tr = fakeTransport();
+    await wireCapture(root, a, tr);
+
+    age(makeTurn(root, "quiet", { task: "t", calls: [OK_CALL] }));
+    for (let i = 0; i < FLUSH_EVERY; i += 1) {
+      a.fire("message_received", { runId: `r${i}`, content: "hi" }, {});
+    }
+    await settle();
+    assert.deepEqual(tr.sent.map((t) => t.turn_id), ["quiet"],
+      "the cadence fired but sent nothing: every turn is unanswered here");
+    assert.equal(tr.sent[0].final_text, null);
+    assert.deepEqual(tr.sent[0].tool_calls, [OK_CALL]);
+  });
+
+  it("still holds an unanswered turn back while an answer may be coming", async () => {
+    const root = tmp();
+    age(makeTurn(root, "r1", { task: "t" }));
+    const tr = fakeTransport();
+    const u = createTurnUploader({
+      transport: tr, agentId: "a1", root, flushEvery: 1,
+    });
+    u.setVerdict({ mayUpload: true });
+    await u.note();
+    assert.deepEqual(tr.sent, [],
+      "this host delivers agent_end, so an answer may still be coming");
+  });
+
+  it("will not send a turn that is still being written", async () => {
+    // The cadence fires from inside the NEWEST turn's own handler, before that
+    // turn has called a tool. Sending it there marks it uploaded, and the
+    // calls it goes on to make are never sent -- a worse loss than the one the
+    // cadence exists to fix. Quiescence is the only "this turn is done" signal
+    // left once there is no answer to wait for.
+    const root = tmp();
+    makeTurn(root, "inflight", { task: "t" });
+    const tr = fakeTransport();
+    const u = createTurnUploader({
+      transport: tr, agentId: "a1", root, flushEvery: 1, answersExpected: false,
+    });
+    u.setVerdict({ mayUpload: true });
+    await u.note();
+    assert.deepEqual(tr.sent, [],
+      "a turn written moments ago was uploaded and marked sent; its tool " +
+      "calls can now never be sent");
+
+    age(turnDir(root, "inflight"));
+    await u.note();
+    assert.deepEqual(tr.sent.map((t) => t.turn_id), ["inflight"]);
+  });
+
+  it("sends even a just-written unanswered turn at shutdown", async () => {
+    // Shutdown does NOT wait out the settle window: nothing more is coming for
+    // anything by then, so waiting would only lose the turn.
+    const root = tmp();
+    makeTurn(root, "inflight", { task: "t" });
+    const tr = fakeTransport();
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    u.setVerdict({ mayUpload: true });
+    assert.equal((await u.flush({ includeUnanswered: true })).sent, 1);
+  });
+});
+
+describe("asking for the verdict is a READ", () => {
   it("READS the verdict and never registers", async () => {
     // THE POINT OF THE ROUTE. Reading it through `POST /agents` upserts, and a
     // registration omitting `discovered_agent` is recorded as introspection
     // `disabled` -- which stops that agent's description driving workflow
-    // generation. This package used to send an explicit `discovered_agent:
-    // null` purely to make that side effect harmless; both the workaround and
-    // the write are gone.
+    // generation, so re-asking a permission question must not write.
+    //
+    // This is about `announce` ALONE. The agent IS registered, once, at
+    // startup by `enrol` -- see the suite below -- because that row is what
+    // the verdict is computed from. What must never come back is registering
+    // in order to ASK.
     const tr = fakeTransport();
     const root = tmp();
     const u = createTurnUploader({ transport: tr, agentId: "a1", root });
@@ -396,6 +585,185 @@ describe("registration reads the verdict without a harmful side effect", () => {
     });
     assert.equal(v.mayUpload, false);
     assert.equal(u.refusal, "an operator enables it.");
+  });
+});
+
+/**
+ * REGISTRATION -- the producer of the row every consent decision needs.
+ *
+ * THE DEFECT THIS SUITE EXISTS FOR. `AttachTransport.register` shipped with no
+ * caller at all, so no install ever created a `FlywheelAgent` row -- and
+ * `POST /agents` is the only route in the control plane that creates one. The
+ * consequences are not "the dashboard looks empty": the operator's consent
+ * control, `POST /flywheel-agents/{id}/production-capture`, 404s on a missing
+ * row, and `capture_verdict` answers "this agent is not registered, so no
+ * operator has been able to enable production capture for it. Register it
+ * first." So production turn upload -- the whole point of this file -- was
+ * unreachable by construction, and the remedy the control plane named was the
+ * one call the package did not make.
+ *
+ * Every test above stayed green because they wire the uploader by hand and
+ * assert what happens once permission is granted; none of them asked how an
+ * agent could ever be granted it.
+ */
+describe("the agent is registered, so an operator has something to enable", () => {
+  it("registers ONCE at startup, and BEFORE it asks for the verdict", async () => {
+    // The order is load-bearing, not tidiness. The verdict is computed FROM
+    // the agent row, so a first start that asks first can only be told "not
+    // registered" -- an answer whose remedy is the call it just skipped.
+    const root = tmp();
+    const a = hostApi();
+    const tr = fakeTransport();
+    await wireCapture(root, a, tr);
+    assert.deepEqual(tr.calls, ["register", "captureCurrent"],
+      "the agent row must exist before the permission question is asked");
+    assert.equal(tr.registered.length, 1, "registration must happen ONCE");
+  });
+
+  it("sends a registration the control plane will accept", async () => {
+    // Vendored from MissionControl/mission_control/api/flywheel.py --
+    // SUPPORTED_MODES and SUPPORTED_CONTRACT_VERSIONS, which the E2 handler
+    // checks BEFORE anything else and answers 422 on. Vendored rather than
+    // imported for the same reason `config-gate.test.js` vendors the route
+    // set: this package must not import the control plane. A registration that
+    // 422s is indistinguishable, from the operator's side, from no
+    // registration at all.
+    const SUPPORTED_MODES = ["rollout", "production"];
+    const SUPPORTED_CONTRACT_VERSIONS = ["flywheel/1"];
+
+    const root = tmp();
+    const tr = fakeTransport();
+    await wireCapture(root, hostApi(), tr);
+    const spec = tr.registered[0];
+
+    assert.equal(spec.agent_id, "a1", "the row must be keyed on OUR agent id");
+    assert.ok(SUPPORTED_MODES.includes(spec.mode),
+      `mode=${JSON.stringify(spec.mode)} is refused with 422 mode_not_available`);
+    assert.equal(spec.mode, "production",
+      "this process serves users and claims no rollouts; sending the donor " +
+      "value would make the field carry zero bits");
+    assert.ok(SUPPORTED_CONTRACT_VERSIONS.includes(spec.contract_version),
+      `contract_version=${JSON.stringify(spec.contract_version)} is refused ` +
+      `with 422 unsupported_contract_version`);
+    assert.equal(spec.contract_version, CONTRACT_VERSION,
+      "the registration must claim the contract this package speaks");
+    assert.equal(spec.sdk, SDK_UA, "one version, from package.json");
+    assert.equal(spec.reports_tool_calls, true,
+      "this plugin does report tool outcomes; false earns the " +
+      "flywheel_does_not_report_tool_outcomes grade reason for no reason");
+  });
+
+  it("sends discovered_agent as an explicit null ON THE WIRE", async () => {
+    // THE THREE-STATE FIELD, and the one assertion that has to survive
+    // serialisation. The handler branches on key ABSENT (-> introspection
+    // `disabled`, "the customer opted out") versus key = null (-> `unreadable`,
+    // "we looked and could not describe it"), and `JSON.stringify` DROPS a key
+    // whose value is `undefined` -- so `discovered_agent: undefined` would
+    // pass a naive equality check here and arrive as the opting-out state.
+    //
+    // `disabled` is the destructive one: `FlywheelAgentRepository.upsert`
+    // writes it onto the row unconditionally, which stops an existing
+    // description driving workflow generation. That side effect is why the
+    // old permission-probe registration was removed; a registration that
+    // re-introduced it would trade this defect for that one.
+    const root = tmp();
+    const tr = fakeTransport();
+    await wireCapture(root, hostApi(), tr);
+    const wire = JSON.parse(JSON.stringify(tr.registered[0]));
+
+    assert.ok("discovered_agent" in wire,
+      "discovered_agent is ABSENT on the wire, which records introspection " +
+      "as `disabled` -- a claim that the customer opted out, and one that " +
+      "overwrites a description an operator can no longer get back");
+    assert.equal(wire.discovered_agent, null,
+      "the honest state is `unreadable`: this lane has no description to " +
+      "send, and `unreadable` is the one state that preserves a stored one");
+  });
+
+  it("still reads the verdict when the registration is REFUSED", async () => {
+    // A registration the intake dislikes must not also cost this process its
+    // permission. An operator may have consented long ago; the row may already
+    // exist. Same split the Python SDK's `attach()` makes.
+    const root = tmp();
+    const tr = fakeTransport({ registerFails: "422 unsupported_contract_version" });
+    const a = hostApi();
+    const out = registerTurnCapture(a, {
+      config: { apiKey: "k", agentId: "a1" },
+      turns: createTurnCapture({ root }),
+      pluginId: PLUGIN_ID,
+      logger: a.logger,
+      env: { PERCEPTEYE_CAPTURE_DIR: root },
+      makeTransport: () => tr,
+    });
+    await settle();
+    assert.deepEqual(tr.calls, ["register", "captureCurrent"]);
+    assert.equal(out.uploader.mayUpload, true,
+      "a refused registration swallowed the verdict read with it");
+  });
+
+  it("never throws, and never rejects, when the control plane is down", async () => {
+    // The host treats a throw from the plugin's `register()` as a FAILED
+    // PLUGIN LOAD, which would take local capture -- the half that needs no
+    // account at all -- down with a control plane the customer may not even
+    // have configured.
+    const rejections = [];
+    const onUnhandled = (err) => rejections.push(err);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const root = tmp();
+      const a = hostApi();
+      const dead = {
+        register() { throw new Error("ECONNREFUSED"); },
+        captureCurrent() { throw new Error("ECONNREFUSED"); },
+      };
+      assert.doesNotThrow(() => registerTurnCapture(a, {
+        config: { apiKey: "k", agentId: "a1" },
+        turns: createTurnCapture({ root }),
+        pluginId: PLUGIN_ID,
+        logger: a.logger,
+        env: { PERCEPTEYE_CAPTURE_DIR: root },
+        makeTransport: () => dead,
+      }));
+      await settle();
+      assert.deepEqual(rejections, [], "an unhandled rejection escaped");
+      // And capture still works with no control plane at all.
+      a.fire("message_received", { runId: "r", content: "hi", sessionKey: "c" }, {});
+      assert.ok(existsSync(join(root, "r", TURNS_FILENAME)));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("attempts NO registration without an API key", async () => {
+    // THE CONSENT BOUNDARY, unchanged: no key means nothing leaves the
+    // machine, and a registration is something leaving the machine.
+    //
+    // TWO assertions because one is not enough. "No transport was built" alone
+    // stays green if the registration is hoisted OUT of the key gate: with no
+    // key the transport is `null`, `null.register` throws, and `enrol` catches
+    // it -- so the attempt is invisible except in the log it then writes. A
+    // keyless install must not be told its registration failed; it never made
+    // one.
+    const root = tmp();
+    const a = hostApi();
+    const said = [];
+    const logger = { info: (m) => said.push(m), warn: (m) => said.push(m) };
+    let built = 0;
+    const out = registerTurnCapture(a, {
+      config: { apiKey: null, agentId: "a1" },
+      turns: createTurnCapture({ root }),
+      pluginId: PLUGIN_ID,
+      logger,
+      env: { PERCEPTEYE_CAPTURE_DIR: root },
+      makeTransport: () => { built += 1; return fakeTransport(); },
+    });
+    await settle();
+    assert.equal(built, 0, "a keyless install built a transport");
+    assert.equal(out.uploader, null);
+    assert.deepEqual(
+      said.filter((m) => /could not register/.test(m)), [],
+      "a keyless install tried to register and reported the failure",
+    );
   });
 });
 

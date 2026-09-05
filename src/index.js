@@ -29,8 +29,26 @@
  * the behaviour being measured. A collector that can corrupt the run it is
  * measuring is worse than no collector.
  *
- * Zero dependencies. Inert unless PERCEPTEYE_TRAJECTORY_DIR is set, so one
- * install is a no-op in production and a recorder during a rollout.
+ * Zero dependencies.
+ *
+ * WHAT THIS WRITES, PER MODE. This used to read "inert unless
+ * PERCEPTEYE_TRAJECTORY_DIR is set, so one install is a no-op in production and
+ * a recorder during a rollout". Once production mode gained turn capture that
+ * was not merely stale, it was INVERTED -- production became the mode that
+ * writes unconditionally -- and what it understated was the recording of
+ * somebody's END USERS' message text. The truth:
+ *
+ *   training    tool outcomes go to the rollout's PERCEPTEYE_TRAJECTORY_DIR.
+ *               With the variable unset nothing is written.
+ *   production  every served turn -- the user's message, the tool calls, and
+ *               (with allowConversationAccess) the agent's answer -- is written
+ *               under PERCEPTEYE_CAPTURE_DIR, default ~/.percepteye/captured,
+ *               whether or not PERCEPTEYE_TRAJECTORY_DIR is set. Nothing is
+ *               uploaded without a key AND the control plane's per-agent
+ *               consent, but it is on disk either way.
+ *
+ * The off switch is `capture: false` / PERCEPTEYE_CAPTURE=0, which returns from
+ * `register` before any hook is subscribed, in either mode.
  */
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
@@ -236,9 +254,21 @@ export function register(api, pluginConfig = {}, env = process.env) {
 export default {
   id: PLUGIN_ID,
   name: "PerceptEye Agent Flywheel",
+  // THE STRING `openclaw plugins list` PRINTS, so it has to be true of the
+  // install the reader is looking at. It said "Inert unless
+  // PERCEPTEYE_TRAJECTORY_DIR is set" while production mode captured every
+  // served turn to disk with that variable unset -- an operator who left the
+  // plugin installed "because it is inert" was accumulating their end users'
+  // messages.
   description:
-    "Records tool-call outcomes (ok/failed/unknown) into the active " +
-    `rollout's trajectory. Inert unless ${TRAJECTORY_DIR_ENV} is set.`,
+    "Records tool-call outcomes (ok/failed/unknown). In training mode they " +
+    `go to the active rollout's trajectory under ${TRAJECTORY_DIR_ENV}. In ` +
+    "production mode every served turn -- the user's message, the tool " +
+    "calls and the agent's answer -- is captured under " +
+    "PERCEPTEYE_CAPTURE_DIR (default ~/.percepteye/captured) even when " +
+    `${TRAJECTORY_DIR_ENV} is unset, and uploaded only with a key and the ` +
+    "control plane's per-agent consent. Set capture=false (or " +
+    "PERCEPTEYE_CAPTURE=0) to record nothing.",
   // THE SAME OBJECT the manifest declares, not a second one. This used to be
   // `{additionalProperties: false, properties: {}}` -- a schema that rejects
   // every setting openclaw.plugin.json tells a customer to write.

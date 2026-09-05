@@ -32,9 +32,9 @@ import {
   appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
-import { readTrajectory } from "./trajectory.js";
+import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
 
 export const TURNS_FILENAME = "turns.jsonl";
 export const CONVERSATION_ID_FILENAME = "conversation_id";
@@ -49,8 +49,33 @@ export const TURN_KINDS = ["task", "answer"];
  * text and a runaway paste should not put a megabyte per turn on their disk.
  * The same number on both sides, so a turn captured by either package
  * truncates at the same point and the two corpora are comparable.
+ *
+ * CHARS MEANS CODE POINTS, which is what `truncateChars` below exists to make
+ * true -- see it for why `slice` was not that.
  */
 export const MAX_TEXT_CHARS = 20_000;
+
+/**
+ * `text[:MAX_TEXT_CHARS]` as PYTHON means it: code POINTS, not UTF-16 units.
+ *
+ * `String.prototype.slice` counts UTF-16 code units, so it truncated a
+ * mostly-emoji message at HALF the documented point -- the two corpora were
+ * not comparable, which is the one thing the shared constant is for. Worse, a
+ * cut landing between the halves of a surrogate pair leaves a LONE SURROGATE,
+ * which `JSON.stringify` writes into `turns.jsonl` and onto the wire; the
+ * intake cannot encode it to UTF-8, the chunk is never acknowledged, and
+ * `createTurnUploader.flush` leaves every marker in that chunk unwritten, so
+ * the poisoned turn is re-sent on every flush forever. Iterating the string
+ * yields whole code points, so neither is possible.
+ *
+ * The length guard is not an optimisation of the general case, it IS the
+ * common case: code units are never fewer than code points, so text under the
+ * cap in units is under it in points and never needs to be split at all.
+ */
+function truncateChars(text) {
+  if (text.length <= MAX_TEXT_CHARS) return text;
+  return [...text].slice(0, MAX_TEXT_CHARS).join("");
+}
 
 /** One turn's directory. The directory name IS the turn id. */
 export function turnDir(root, turnId) {
@@ -96,7 +121,7 @@ export function recordTurnText(dir, kind, text, ids = {}) {
     throw new Error(`turn kind must be one of ${TURN_KINDS}, got ${kind}`);
   }
   if (typeof text !== "string" || !text.trim()) return false;
-  const record = { kind, text: text.trim().slice(0, MAX_TEXT_CHARS) };
+  const record = { kind, text: truncateChars(text.trim()) };
   for (const [k, v] of Object.entries(ids)) {
     if (typeof v === "string" && v) record[k] = v;
   }
@@ -194,13 +219,19 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
 
   let toolCalls;
   if (calls && calls.length) toolCalls = calls;
-  else if (existsSync(join(dir, "tool_calls.jsonl"))) toolCalls = [];
+  else if (existsSync(join(dir, TOOL_CALLS_FILENAME))) toolCalls = [];
   else toolCalls = null;
 
   if (!task && !answer && !(toolCalls && toolCalls.length)) return null;
 
   const wire = {
-    turn_id: dir.split("/").pop(),
+    // `basename`, not `split("/")`. The turn id is the DIRECTORY NAME, and on
+    // win32 `join` builds paths with `\`, so splitting on a hardcoded "/"
+    // returned the whole absolute path: an operator's home directory went onto
+    // the wire as the turn id, and it could never match the bare `d.name` that
+    // `createTurnUploader` writes into `.uploaded` -- so no turn was ever
+    // considered uploaded and every flush re-sent the entire capture root.
+    turn_id: basename(dir),
     input_text: task,
     final_text: answer,
     tool_calls: toolCalls,

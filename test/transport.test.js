@@ -2,8 +2,17 @@
  * The transport, with emphasis on the ONE call that must never be replayed.
  */
 import { strict as assert } from "node:assert";
+import {
+  mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
 import { describe, it } from "node:test";
 import { AttachTransport } from "../src/transport.js";
+import { TOOL_CALLS_FILENAME } from "../src/trajectory.js";
+import {
+  MAX_TEXT_CHARS, readTurnText, recordTurnText, turnWire,
+} from "../src/turns.js";
 
 /** Records every request the transport makes, and replays scripted bodies. */
 function recorder(bodies = {}) {
@@ -160,6 +169,156 @@ describe("the turn-upload wire", () => {
 //:   AttachTransport(c, "a1").report_turns(
 //:       "a1", [{"turn_id": "t1", "final_text": "mañana — \U0001f4e6"}])
 const PY_NON_ASCII_KEY = "turns-a1-a496e0f0d4c048270af7fa9b8de992ed";
+
+/** The batch key this package would send for `turns`. */
+async function batchKey(turns, agentId = "a1") {
+  const calls = [];
+  await new AttachTransport({ request: (m, p, o) => calls.push(o) },
+                            { agentId }).reportTurns(agentId, turns);
+  return calls[0].idempotencyKey;
+}
+
+describe("the batch key's parity with json.dumps, and where it stops", () => {
+  it("matches Python on a whole turn of strings, ints, nulls and lists", async () => {
+    // A REAL turn wire, not a toy: this is the shape `turnWire` emits, and
+    // every digest below was produced by the Python end rather than by reading
+    // this package's own output back to itself.
+    assert.equal(
+      await batchKey([{
+        turn_id: "t1", input_text: "hi", final_text: "ok", tool_calls: [],
+        tool_calls_omitted_count: 0, conversation_id: "c1", turn_index: 2,
+      }]),
+      "turns-a1-f30b6c6cbc68ac203d9628806fe22837",
+      "the batch key no longer matches json.dumps(sort_keys=True) for the " +
+      "value shapes the two SDKs DO agree on",
+    );
+  });
+
+  it("does NOT match Python on a non-integral number, and that is documented", async () => {
+    // NOT A CERTIFICATION THAT THE GAP IS FINE -- a pin so it stays visible.
+    // The shared fixture in the Python package contains only the integers 0, 1
+    // and 2, so it agrees by construction on the one axis that still diverges;
+    // this asserts the divergence itself, with Python's own two digests.
+    //
+    // `12.0` reaches this through JSON on disk, not only through native
+    // values: `JSON.parse` erases int-vs-float before `stableStringify` ever
+    // sees the number, which is why no formatter on THIS side can fix it and
+    // why the fix is one canonicaliser applied on both. See the
+    // `stableStringify` docstring.
+    const withFloat = [{
+      turn_id: "t1",
+      tool_calls: [{
+        name: "refund", arguments: { amount: 100.0 }, outcome: "ok",
+        status_code: 200,
+      }],
+    }];
+    const PY_FLOAT = "turns-a1-e0c67725d65add96c39c78cb14ebc313";
+    const PY_INT = "turns-a1-373e710f1f1cc0aebbcaffa509763a09";
+    const ours = await batchKey(withFloat);
+    assert.equal(ours, PY_INT,
+      "this side renders 100.0 as the integer 100; if that changed, the " +
+      "docstring's statement of the gap changed with it");
+    assert.notEqual(ours, PY_FLOAT,
+      "the number gap is CLOSED -- update stableStringify's docstring, which " +
+      "still says a batch carrying a non-integral number may not collapse");
+  });
+});
+
+describe("the captured turn's wire", () => {
+  const roots = [];
+  const newRoot = () => {
+    const r = mkdtempSync(join(tmpdir(), "pe-turnwire-"));
+    roots.push(r);
+    return r;
+  };
+  const cleanup = () => {
+    for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+  };
+
+  it("takes turn_id from the directory NAME, not from splitting on '/'", async (t) => {
+    t.after(cleanup);
+    // The bug is win32-only in production -- `join` builds `C:\...\run1`, a
+    // hardcoded "/" split returns the WHOLE path, and that path goes onto the
+    // wire as the turn id AND can never match the bare `d.name` that
+    // `createTurnUploader` writes into `.uploaded`, so every flush re-sends
+    // the entire capture root. A posix job cannot make `join` emit a
+    // backslash, so the probe here is the other input on which the two
+    // derivations differ: a trailing separator, where the split yields "".
+    const root = newRoot();
+    const dir = join(root, "run1");
+    recordTurnText(dir, "task", "hello");
+    assert.equal(turnWire(dir).turn_id, "run1");
+    assert.equal(turnWire(dir + sep).turn_id, "run1",
+      "turn_id must be the directory name under node:path's rules, not the " +
+      "last field of a hardcoded '/' split");
+  });
+
+  it("asks for the tool-call file by the ABI's own name, in one place", async (t) => {
+    t.after(cleanup);
+    // The tri-state's `[]` branch and `readTrajectory` must ask about the SAME
+    // file: `[]` claims the agent ran and called nothing, `null` claims
+    // nothing was recorded, and a second copy of the filename makes a rename
+    // turn the first silently into the second.
+    const root = newRoot();
+    const dir = join(root, "run2");
+    mkdirSync(dir, { recursive: true });
+    recordTurnText(dir, "task", "hello");
+    writeFileSync(join(dir, TOOL_CALLS_FILENAME), "", "utf8");
+    assert.deepEqual(turnWire(dir).tool_calls, [],
+      "a turn that ran and called nothing must not be reported as a turn " +
+      "that reports no tool calls");
+
+    // There is exactly ONE spelling of that filename in the module, for the
+    // same reason `config-gate.test.js` reads the transport's routes out of
+    // the source: the property is that no second copy exists, and only the
+    // source can say so.
+    const src = readFileSync(new URL("../src/turns.js", import.meta.url), "utf8");
+    assert.ok(!src.includes(`"${TOOL_CALLS_FILENAME}"`),
+      `src/turns.js hardcodes "${TOOL_CALLS_FILENAME}" instead of importing ` +
+      `TOOL_CALLS_FILENAME from the module that owns the ABI`);
+  });
+});
+
+describe("turn text truncates where PYTHON truncates", () => {
+  const roots = [];
+  const cleanup = () => {
+    for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+  };
+  const dirFor = (name) => {
+    const r = mkdtempSync(join(tmpdir(), "pe-turntext-"));
+    roots.push(r);
+    return join(r, name);
+  };
+
+  it("counts CODE POINTS, so an emoji message under the cap is kept whole", (t) => {
+    t.after(cleanup);
+    // Python's `record_turn_text` does `text.strip()[:20_000]` -- code points.
+    // `slice` counts UTF-16 units, so this message was cut in half and the two
+    // corpora stopped being comparable, which is the only thing the shared
+    // constant is for.
+    const dir = dirFor("emoji");
+    const text = "\u{1F4E6}".repeat(15_000);
+    assert.equal(recordTurnText(dir, "task", text), true);
+    assert.equal([...readTurnText(dir).task].length, 15_000);
+  });
+
+  it("never emits a LONE SURROGATE when it does truncate", (t) => {
+    t.after(cleanup);
+    // The cut landing between the halves of a pair put an unpaired \ud83d on
+    // the wire; the intake cannot encode that to UTF-8, so the chunk was never
+    // acknowledged and `flush` re-sent it on every flush forever.
+    // One leading ASCII char, so the 20,000th CODE UNIT falls on the high half
+    // of a pair; over the cap in code points too, so the cap really fires.
+    const dir = dirFor("split-pair");
+    assert.equal(
+      recordTurnText(dir, "task", "a" + "\u{1F4E6}".repeat(25_000)), true);
+    const stored = readTurnText(dir).task;
+    assert.equal([...stored].length, MAX_TEXT_CHARS);
+    assert.equal(Buffer.from(stored, "utf8").toString("utf8"), stored,
+      "the stored text does not survive a UTF-8 round trip, so it holds an " +
+      "unpaired surrogate and the intake will refuse the whole chunk");
+  });
+});
 
 describe("the capture verdict read", () => {
   it("is a GET on the agent, with no body and no idempotency key", async () => {

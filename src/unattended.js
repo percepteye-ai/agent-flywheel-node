@@ -50,8 +50,24 @@
  *      users never reaches this module, whatever the setting says.
  *   2. It DEGRADES to the default lane instead of failing. If `getCron()`
  *      returns nothing -- the seam closed, or cron is simply unavailable --
- *      the plugin says so once and keeps claiming through injection. A
- *      capability that disappears must not take rollouts down with it.
+ *      the plugin says so once, STOPS POLLING, and leaves the `session_start`
+ *      injection lane as the only claimer. A capability that disappears must
+ *      not take rollouts down with it.
+ *
+ *      STOPPING IS THE WHOLE OF THE DEGRADATION, and the first version of it
+ *      left that part out: it announced the fallback, handed the rollout
+ *      back, and then polled again `pollMs` later, forever. Mission Control's
+ *      `claim` increments `attempt`, and its `abandon` requeues only while
+ *      `attempt < max_attempts` -- so a runner that claims and hands back
+ *      every 30 seconds walks the whole org's queue to ABANDONED at three
+ *      attempts each, having run none of it, while reporting itself as having
+ *      fallen back. A seam that is gone must make this lane QUIET, not busy.
+ *
+ *      `start()` is the one thing that undoes it, because its only callers
+ *      are `gateway_start` and `cron_changed` and both mean the host has just
+ *      handed over a cron context. That keeps a LATER-ARRIVING cron usable
+ *      (see `cronTurnStarter` below) without reopening the churn: a host with
+ *      no cron service emits neither event, so nothing restarts the loop.
  *
  * ── ONE ROLLOUT AT A TIME, IN ITS OWN SESSION ─────────────────────────────
  *
@@ -140,11 +156,27 @@ export function createUnattendedRunner({
 }) {
   let timer = null;
   let running = false;
-  let degradedAnnounced = false;
+  /**
+   * The turn-starting seam is gone, so this lane claims nothing.
+   *
+   * ONE FLAG, NOT TWO. It used to be `degradedAnnounced`, gating only the
+   * warning, which meant the loop went on claiming and handing back -- see the
+   * header. "Have we said it" and "should we still claim" are the same
+   * question here: the announcement IS the fallback taking effect.
+   */
+  let degraded = false;
+
+  function stopTimer() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
 
   async function tick() {
-    // Serial: never claim while a rollout is still running.
-    if (running || driver.inFlight.size > 0) return null;
+    // Never claim once the seam is known dead: a claim we cannot start still
+    // costs the rollout an attempt, and three of those retire it unrun.
+    // Checked HERE rather than in `start()` alone, so a directly driven tick
+    // cannot walk around it either.
+    if (degraded || running || driver.inFlight.size > 0) return null;
     running = true;
     try {
       let claimed;
@@ -175,12 +207,16 @@ export function createUnattendedRunner({
       // until its lease lapses.
       await driver.giveBack(
         sessionKey, rollout, "entrypoint_error", result.reason);
-      if (result.degraded && !degradedAnnounced) {
-        degradedAnnounced = true;
+      if (result.degraded) {
+        degraded = true;
+        // The fallback, actually taken: stop looking for work. Anything else
+        // spends one rollout's attempt per poll on a turn that cannot start.
+        stopTimer();
         logger?.warn?.(
           `[percepteye] unattended rollouts are configured but ${result.reason}. ` +
-          `Falling back to the default lane: tasks are delivered into the next ` +
-          `turn you start. Nothing else changes.`);
+          `Falling back to the default lane: this plugin has stopped polling ` +
+          `for rollouts and tasks are delivered into the next turn you start. ` +
+          `Nothing else changes.`);
       }
       return null;
     } finally {
@@ -190,15 +226,26 @@ export function createUnattendedRunner({
 
   return {
     tick,
+    /**
+     * Is this lane still looking for work?
+     *
+     * The observable half of the degradation. `tick`'s own guard is what stops
+     * the claiming, and a test that only counts claims passes just as happily
+     * with `stopTimer()` deleted -- leaving a poll interval waking every 30
+     * seconds forever to return immediately, in a customer's gateway, in a
+     * lane the operator was told had gone quiet.
+     */
+    get polling() { return timer !== null; },
     start() {
+      // Only `gateway_start` and `cron_changed` call this, and both mean the
+      // host has just handed over a cron context -- the one event that can
+      // undo a degradation, and the only thing that restarts the loop.
+      degraded = false;
       if (timer) return;
       timer = setInterval(() => { tick().catch(() => {}); }, pollMs);
       // Never hold a customer's gateway open on our account.
       timer.unref?.();
     },
-    stop() {
-      if (timer) clearInterval(timer);
-      timer = null;
-    },
+    stop: stopTimer,
   };
 }

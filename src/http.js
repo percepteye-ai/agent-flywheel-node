@@ -12,6 +12,9 @@
  * Zero dependencies. `fetch` and `AbortController` are builtins in Node 22+,
  * which `engines` already requires, so this adds nothing to a customer's tree.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { CONTRACT_VERSION } from "./wire.js";
 import { LeaseLost, TransportError } from "./errors.js";
 
@@ -33,7 +36,25 @@ const NEVER_SENT_CODES = new Set([
   "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL",
 ]);
 
-const SDK_UA = "percepteye-agent-flywheel-node/0.1.0";
+/**
+ * ONE version, read from the file npm publishes it in.
+ *
+ * This was a hand-typed literal beside two other copies of the same number
+ * (package.json and openclaw.plugin.json). `npm version patch` rewrites
+ * package.json and nothing else, so the literal would go on announcing the
+ * previous release to the control plane and a bug reported against 0.1.1
+ * would be attributed server-side to 0.1.0. npm puts package.json in every
+ * tarball whether or not `files` names it, so this read cannot miss.
+ *
+ * The manifest's copy cannot be derived -- the host reads it as static JSON
+ * before any of this runs -- so it is held equal by a test instead
+ * (test/version.test.js).
+ */
+export const SDK_VERSION = JSON.parse(
+  readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"),
+).version;
+
+export const SDK_UA = `percepteye-agent-flywheel-node/${SDK_VERSION}`;
 
 function neverSent(err) {
   // An AbortError is our own timeout firing. The request was in flight; the
