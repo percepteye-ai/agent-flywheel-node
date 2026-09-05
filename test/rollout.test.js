@@ -18,7 +18,13 @@ import {
   driveVerdict, lastAssistantText, taskText,
 } from "../src/rollout.js";
 
-const ROLLOUT_HOOKS = ["session_start", "agent_end", "session_end"];
+// ROLLOUT-EXCLUSIVE hooks only. `agent_end` used to be in this list and had
+// to come out: production turn capture subscribes it too, to record the
+// agent's answer, so its presence no longer discriminates between the two
+// lanes. Narrowing the list does NOT weaken the claim -- "the driver is never
+// constructed in production" is asserted directly by the observe-only branch
+// test below, which is the assertion that actually caught a deleted split.
+const ROLLOUT_HOOKS = ["session_start", "session_end", "gateway_start"];
 
 /** A host api that records what was subscribed. */
 function fakeApi({ conversationAccess = true, enqueue } = {}) {

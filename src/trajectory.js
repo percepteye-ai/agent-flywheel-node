@@ -64,18 +64,28 @@ export function toWire({ name, args, outcome, status_code = null, entity_ids,
  * stray file. Absence is the normal production case, not an error -- the same
  * plugin stays installed whether or not a rollout is running.
  */
-export function createWriter({ dir = null, onError = null } = {}) {
+export function createWriter({ dir = null, resolveDir = null,
+                               onError = null } = {}) {
   let warned = false;
 
-  const resolveDir = () => dir ?? process.env[TRAJECTORY_DIR_ENV] ?? null;
+  // `resolveDir` lets a caller route each record to its OWN directory -- which
+  // is what production turn capture needs, because there a trajectory belongs
+  // to one turn rather than to one rollout. It receives the record's context
+  // (`{runId}`) and may return null to drop the record.
+  //
+  // An OPTION rather than a second writer module: the append semantics below
+  // are the wire ABI shared with the Python SDK, and a second implementation
+  // of them is a second thing to keep true.
+  const resolve = resolveDir
+    ?? (() => dir ?? process.env[TRAJECTORY_DIR_ENV] ?? null);
 
   return {
     get active() {
-      return Boolean(resolveDir());
+      return Boolean(resolveDir ? true : resolve());
     },
     /** @returns {boolean} whether the record was written. */
-    write(record) {
-      const base = resolveDir();
+    write(record, ctx = undefined) {
+      const base = resolve(ctx);
       if (!base) return false;
       const path = join(base, TOOL_CALLS_FILENAME);
       try {

@@ -41,6 +41,9 @@ import { AttachTransport } from "./transport.js";
 import { PRODUCTION, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
+import {
+  captureRoot, createTurnCapture, registerTurnCapture,
+} from "./capture.js";
 
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
@@ -118,7 +121,21 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
     return null;
   }
+  // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
+  //
+  // In TRAINING mode a trajectory belongs to one ROLLOUT, and the rollout
+  // driver names the directory through PERCEPTEYE_TRAJECTORY_DIR. Unchanged.
+  //
+  // In PRODUCTION mode there is no rollout: a trajectory belongs to one TURN,
+  // so each call is routed to its own turn directory by `runId`. The env var
+  // is not consulted there, because a single shared directory would merge
+  // every end user's calls into one trajectory -- and `PERCEPTEYE_AGENT_MODE`
+  // is the authority on which of the two this process is.
+  const turns = config.mode === PRODUCTION
+    ? createTurnCapture({ root: captureRoot(env), logger })
+    : null;
   const writer = createWriter({
+    resolveDir: turns ? turns.resolveToolDir : null,
     onError: (err) => logger?.warn?.(
       `[${PLUGIN_ID}] trajectory write failed; tool outcomes are not being ` +
       `recorded for this run: ${err?.message ?? err}`,
@@ -152,6 +169,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // Local capture above is UNAFFECTED by mode. It never leaves the machine,
   // and it is the plugin's day-one value with no account at all.
   let rollouts = null;
+  let capture = null;
   if (config.mode === TRAINING) {
     // WRAPPED, because the host requires `register` to be SYNCHRONOUS and
     // treats a throw here as a failed plugin load (loader-D8d2EvVh.js:762).
@@ -183,6 +201,9 @@ export function register(api, pluginConfig = {}, env = process.env) {
       `is injected -- those hooks are not registered at all. Tool outcomes are ` +
       `still recorded locally.`,
     );
+    capture = registerTurnCapture(api, {
+      config, turns, pluginId: PLUGIN_ID, logger, env,
+    });
   }
 
   // The describer answers a different question from the recorder: not "what
@@ -209,7 +230,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
 
-  return { recorder, writer, describer, rollouts, mode: config.mode };
+  return { recorder, writer, describer, rollouts, capture, mode: config.mode };
 }
 
 export default {

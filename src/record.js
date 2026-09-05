@@ -24,7 +24,7 @@ export function createRecorder({ writer }) {
     /**
      * @param {{toolName?:string, params?:object, toolCallId?:string,
      *          result?:unknown, error?:string, durationMs?:number}} event
-     * @param {{agentId?:string}} [ctx]
+     * @param {{agentId?:string, runId?:string}} [ctx]
      * @returns {boolean} whether a record was written
      */
     handle(event, ctx = {}) {
@@ -65,7 +65,17 @@ export function createRecorder({ writer }) {
           ? event.toolCallId
           : undefined,
         entity_ids,
-      }));
+      }), {
+        // Which TURN this call belongs to. Ignored by the default writer
+        // (a rollout has one directory); used by production capture, where a
+        // trajectory belongs to one turn. The host puts `runId` on both the
+        // event and the context, so a missing one here means the host gave us
+        // neither -- and an unattributable call must not land in some other
+        // turn's directory.
+        runId: (typeof event.runId === "string" && event.runId)
+          || (typeof ctx.runId === "string" && ctx.runId)
+          || null,
+      });
       if (ok) written += 1;
       return ok;
     },

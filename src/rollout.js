@@ -72,6 +72,7 @@
  * the exact setting, instead of a queue that quietly stops moving.
  */
 import { ConfigurationError } from "./errors.js";
+import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 
 export const SESSION_START = "session_start";
@@ -82,21 +83,6 @@ export const GATEWAY_STOP = "gateway_stop";
 
 /** The host's own ceilings, so an oversized task is refused, not dropped. */
 export const MAX_INJECTION_BYTES = 32 * 1024;
-
-/**
- * Does the host permit this plugin the conversation hooks, per the host's own
- * rule?
- *
- * THE HOST'S PREDICATE, not a paraphrase of it: non-bundled plugins need
- * `allowConversationAccess === true` explicitly, and this package is
- * non-bundled by construction -- it is installed from npm, and a bundled
- * plugin is one shipped inside OpenClaw itself. Read from `api.config`, which
- * is the same config object the registry consults.
- */
-export function conversationAccessGranted(api, pluginId) {
-  const entry = api?.config?.plugins?.entries?.[pluginId];
-  return entry?.hooks?.allowConversationAccess === true;
-}
 
 /**
  * Everything that must be true before this install claims work.
@@ -358,25 +344,6 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
   return { onSessionStart, onAgentEnd, onSessionEnd, inFlight, track, giveBack };
 }
 
-/** The last assistant message's text, or "" when there is none. */
-export function lastAssistantText(messages) {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const m = messages[i];
-    if (!m || typeof m !== "object" || m.role !== "assistant") continue;
-    const { content } = m;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      const text = content
-        .filter((p) => p && typeof p === "object" && typeof p.text === "string")
-        .map((p) => p.text)
-        .join("");
-      if (text) return text;
-    }
-  }
-  return "";
-}
-
 /**
  * Subscribe the driver. CALLED ONLY IN TRAINING MODE.
  *
@@ -466,3 +433,6 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
   driver.unattended = unattended;
   return driver;
 }
+
+// Re-exported for the tests that pin these behaviours against this lane.
+export { conversationAccessGranted, lastAssistantText };

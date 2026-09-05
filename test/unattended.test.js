@@ -49,7 +49,9 @@ describe("the mode is the only switch", () => {
     // that would be indefensible -- a plugin starting its own turns inside a
     // process serving real users.
     const api = trainingApi();
-    register(api, {}, { PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_API_KEY: "k" });
+    // No key: production capture would otherwise subscribe `gateway_stop` for
+    // its shutdown flush, which is a capture concern and not a rollout one.
+    register(api, {}, { PERCEPTEYE_AGENT_MODE: "production" });
     for (const h of ["gateway_start", "gateway_stop", "session_start"]) {
       assert.ok(!api.hooks.includes(h), `production mode subscribed '${h}'`);
     }

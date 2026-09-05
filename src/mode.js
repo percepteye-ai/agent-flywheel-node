@@ -118,26 +118,16 @@ export function resolveMode(explicit = null, env = process.env) {
   return resolveModeSource(explicit, env).mode;
 }
 
-// WHERE THE SECOND GATE WILL LIVE.
+// THE SECOND GATE LIVES IN `capture.js`.
 //
 // Uploading a captured PRODUCTION turn needs a second yes, separate from mode:
 // Mission Control's per-agent `production_capture_enabled`, which is opt-in
 // (NULL is not consent) because a production turn carries the customer's END
-// USERS' messages. The registration response carries it as
-// `capture: {turns, reason}` precisely so a client never learns its permission
-// BY uploading.
+// USERS' messages. It arrives as `capture: {turns, reason}` on the
+// registration response, precisely so a client never learns its permission BY
+// uploading, and `capture.js:captureVerdict` is the only thing that reads it.
 //
-// A `captureVerdict(registration)` reader for it was written here and REMOVED
-// before commit, because this package has no turn-upload path yet and nothing
-// would have called it. Two things have to be true before it comes back, and
-// both belong with the upload path rather than ahead of it:
-//
-//  1. A consumer -- the upload itself.
-//  2. A way to ASK that is not a write. The only surface carrying the verdict
-//     today is the registration response, and registering merely to read it
-//     has a side effect: a registration with no `discovered_agent` is recorded
-//     as introspection `disabled`, which is an INSTRUCTION ("the customer
-//     turned it off") and stops that agent's description driving workflow
-//     generation. Sending `discovered_agent: null` avoids the write but
-//     asserts introspection failed, which would be untrue. The flywheel-key
-//     routes need a read-only verdict for this.
+// It was written HERE first and removed before commit, because nothing then
+// uploaded turns and a predicate with no consumer is the shape this codebase
+// keeps finding. It came back with its consumer, in the module that owns the
+// question -- not here, where it would have been a second place to look.

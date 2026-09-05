@@ -40,7 +40,8 @@ about your data that the code does not keep is worse than a narrower one:
 | Claims rollouts from the control plane | **no** | yes |
 | Puts a task into your agent’s context | **no** | yes |
 | Starts turns by itself | **no** | yes |
-| Uploads production turns | [not yet — see below](#production-capture-is-opt-in) | n/a |
+| Captures the turns you serve | yes | n/a |
+| Uploads them | [with consent](#production-capture-is-opt-in) | n/a |
 
 In `production` the rollout hooks **are not registered at all** — the guarantee
 is the absence of the subscription, not a branch inside a handler that a later
@@ -137,21 +138,40 @@ driver is never constructed there.
 
 ### Production capture is opt-in
 
-**This package does not upload production turns today.** In `production` mode
-it records tool outcomes locally and sends nothing. The Python SDK's `attach()`
-does upload them, and that is the one capability where the two are not yet at
-parity; it is the next piece of work here.
+In `production` mode the plugin records the turns your agent is already
+serving — the end user's message, the tool calls, and the agent's answer — as
+one directory per turn, in the same on-disk format the Python SDK writes:
 
-Worth knowing before it lands, because it governs whether anything will arrive
-when it does: uploading production turns is **off until an operator turns it on,
-per agent**. That is a deliberate exception to this project's default-on rule —
-a production turn carries *your end users'* own messages, so a default that
-starts sending them is a disclosure nobody made. The control plane answers the
-question when an agent registers, so a client never learns its permission by
-uploading and finding out.
+```
+<capture root>/<runId>/
+    turns.jsonl        {"kind":"task"|"answer", "text", "turn_id", "conversation_id"}
+    conversation_id
+    tool_calls.jsonl
+```
 
-Local recording is unaffected by any of this. It never leaves the machine, and
-it works with no account at all.
+**Uploading is off until an operator turns it on, per agent.** That is a
+deliberate exception to this project's default-on rule: a production turn
+carries *your end users'* own messages, so a default that starts sending them
+is a disclosure nobody made. The control plane answers when the agent
+registers, so the plugin never learns its permission by uploading and finding
+out. Once enabled, turns go up every 32 and again at gateway shutdown; turns
+with no answer are held back until shutdown, because an answer may still be
+coming.
+
+**Two things affect how complete a captured turn is:**
+
+- The **answer** arrives on `agent_end`, a conversation hook. Without
+  `allowConversationAccess=true` the host drops it and turns are captured with
+  their tool calls but no `final_text`. They are still stored and are graded
+  advisory with that reason — nothing that needs a completion can use them. The
+  plugin says so once at startup rather than leaving you to wonder.
+- The **user's message** arrives on `message_received`, which OpenClaw emits on
+  the inbound channel path. An agent served over a channel gets it; a local
+  terminal session does not, and the turn is uploaded without `input_text`
+  rather than having one invented from the model's prompt.
+
+Recording is unaffected by all of this: it never leaves the machine, and works
+with no account at all.
 
 ## What it writes
 

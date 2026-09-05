@@ -5,7 +5,29 @@
  * OUTBOUND-ONLY: there is no listening socket anywhere in this package, and a
  * customer's agent opens every connection.
  */
+import { createHash } from "node:crypto";
+
 import { rolloutOutputToWire, rolloutRequestFromWire } from "./wire.js";
+
+/**
+ * JSON with object keys sorted, at every depth.
+ *
+ * `json.dumps(..., sort_keys=True)` is what the Python end hashes, and
+ * `JSON.stringify` preserves insertion order instead. Two SDKs that hashed
+ * the same turns into different keys would each defeat the other's batch
+ * de-duplication -- which matters exactly once, for the customer who
+ * migrates between harnesses with turns still on disk.
+ */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const body = Object.keys(value).sort()
+      .map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`)
+      .join(",");
+    return `{${body}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
 
@@ -89,6 +111,33 @@ export class AttachTransport {
       rollouts: raw.map(rolloutRequestFromWire),
       pollAfterMs: Number(body.poll_after_ms) || 1000,
     };
+  }
+
+  /**
+   * Upload a batch of captured PRODUCTION turns.
+   *
+   * REPLAYABLE, unlike `claim`. The server keys each turn on
+   * (org, agent, turn_id) and answers an identical resubmission as a
+   * duplicate, so an ambiguous retry costs nothing -- whereas a replayed claim
+   * would lease a second piece of work. This therefore leaves the client's
+   * default retry behaviour ON.
+   *
+   * The idempotency key covers the BATCH, matching
+   * `percepteye_agent_flywheel.transport.report_turns`, so a network-level
+   * replay of the same bytes is collapsed before the per-turn rule is reached.
+   * Both ends derive it the same way -- a sha256 over the turns, first 32 hex
+   * characters -- because two SDKs deriving one key differently would defeat
+   * the collapse for whichever customer happened to switch harnesses.
+   */
+  reportTurns(agentId, turns) {
+    const digest = createHash("sha256")
+      .update(stableStringify(turns))
+      .digest("hex")
+      .slice(0, 32);
+    return this._c.request("POST", "/turns", {
+      jsonBody: { agent_id: agentId, turns },
+      idempotencyKey: `turns-${agentId}-${digest}`,
+    });
   }
 
   heartbeat(rollout, { progress } = {}) {
