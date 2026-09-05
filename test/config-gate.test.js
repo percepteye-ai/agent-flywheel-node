@@ -127,6 +127,7 @@ test("the transport calls no route the control plane does not serve", async () =
   const SERVED = new Set([
     "GET /health",
     "POST /agents",
+    "GET /agents/{id}/capture",
     "POST /rollouts/claim",
     "POST /rollouts/{id}/heartbeat",
     "POST /rollouts/{id}/result",

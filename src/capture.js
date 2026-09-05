@@ -412,28 +412,23 @@ function defaultTransport(config) {
 /**
  * Ask the control plane whether this agent may upload, and say so once.
  *
- * The registration response carries the verdict precisely so a client never
- * learns its permission BY uploading -- i.e. by sending the data whose
- * permission is in question. Until it answers, `uploader.mayUpload` is false
- * and nothing leaves the machine.
+ * A READ. The verdict carries BOTH halves -- the per-agent consent an operator
+ * grants in Mission Control, and whether this key carries the `turn.report`
+ * scope -- so a client never learns its permission BY uploading, i.e. by
+ * sending the data whose permission is in question. Until it answers,
+ * `uploader.mayUpload` is false and nothing leaves the machine.
  *
- * `discovered_agent` IS SENT, and its value matters. Mission Control reads an
- * ABSENT key as "the customer opted out of introspection", which flips that
- * agent's `introspection_state` to `disabled` and stops its description
- * driving workflow generation -- a real side effect for a call made only to
- * read a verdict. An explicit `null` means "introspection ran and could not
- * describe this agent", which leaves both stored columns alone. The second is
- * harmless AND true here: without the conversation opt-in the describer cannot
- * read the agent at all.
+ * IT USED TO BE A REGISTRATION, and that was a workaround this route removed.
+ * `POST /agents` is an upsert, and a registration omitting `discovered_agent`
+ * is recorded as introspection `disabled` -- which stops that agent's
+ * description driving workflow generation. So asking a permission question
+ * changed an unrelated column, and this package sent an explicit
+ * `discovered_agent: null` purely to make the side effect harmless. Both the
+ * workaround and the write are gone.
  */
-export function announce({ transport, uploader, config, pluginId, logger, env }) {
+export function announce({ transport, uploader, config, pluginId, logger }) {
   return Promise.resolve()
-    .then(() => transport.register({
-      agent_id: config.agentId,
-      mode: "production",
-      reports_tool_calls: true,
-      discovered_agent: readDescribedAgent(env),
-    }))
+    .then(() => transport.captureCurrent(config.agentId))
     .then((response) => {
       const v = captureVerdict(response);
       uploader.setVerdict(v);
@@ -451,16 +446,4 @@ export function announce({ transport, uploader, config, pluginId, logger, env })
     });
 }
 
-/** The describer's payload, when it wrote one. `null` means it could not. */
-export function readDescribedAgent(env = process.env) {
-  const dir = env.PERCEPTEYE_TRAJECTORY_DIR;
-  if (!dir) return null;
-  try {
-    return JSON.parse(readFileSync(join(dir, "discovered_agent.json"), "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-// Re-exported so this lane's tests pin the behaviour where it is used.
 export { conversationAccessGranted, lastAssistantText };

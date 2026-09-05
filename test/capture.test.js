@@ -18,7 +18,7 @@ import { join } from "node:path";
 import {
   BATCH_SIZE, FLUSH_EVERY, UPLOADED_INDEX, announce, captureRoot,
   captureVerdict, createTurnCapture, createTurnUploader, lastAssistantText,
-  readDescribedAgent, registerTurnCapture,
+  registerTurnCapture,
 } from "../src/capture.js";
 import {
   CONVERSATION_ID_FILENAME, MAX_TEXT_CHARS, TURNS_FILENAME, readTurnText,
@@ -229,13 +229,19 @@ describe("consent", () => {
   });
 });
 
-function fakeTransport() {
+function fakeTransport({ turns = true, reason = null } = {}) {
   const batches = [];
   return {
     batches,
     registered: [],
-    register(spec) { this.registered.push(spec); return { capture: { turns: true } }; },
-    async reportTurns(agentId, turns) { batches.push(turns); return {}; },
+    verdictReads: [],
+    register(spec) { this.registered.push(spec); return { capture: { turns } }; },
+    async captureCurrent(agentId) {
+      this.verdictReads.push(agentId);
+      return { agent_id: agentId,
+               capture: reason ? { turns, reason } : { turns } };
+    },
+    async reportTurns(agentId, ts) { batches.push(ts); return {}; },
     get sent() { return batches.flat(); },
   };
 }
@@ -348,13 +354,13 @@ describe("uploading", () => {
 });
 
 describe("registration reads the verdict without a harmful side effect", () => {
-  it("sends discovered_agent EXPLICITLY NULL, never absent", async () => {
-    // Mission Control reads an ABSENT key as "the customer opted out of
-    // introspection", which flips introspection_state to `disabled` and stops
-    // that agent's description driving workflow generation -- a real side
-    // effect for a call made only to read a verdict. Explicit null means
-    // "introspection ran and could not describe it", which leaves both stored
-    // columns alone, and is true here.
+  it("READS the verdict and never registers", async () => {
+    // THE POINT OF THE ROUTE. Reading it through `POST /agents` upserts, and a
+    // registration omitting `discovered_agent` is recorded as introspection
+    // `disabled` -- which stops that agent's description driving workflow
+    // generation. This package used to send an explicit `discovered_agent:
+    // null` purely to make that side effect harmless; both the workaround and
+    // the write are gone.
     const tr = fakeTransport();
     const root = tmp();
     const u = createTurnUploader({ transport: tr, agentId: "a1", root });
@@ -362,10 +368,10 @@ describe("registration reads the verdict without a harmful side effect", () => {
       transport: tr, uploader: u,
       config: { agentId: "a1" }, pluginId: PLUGIN_ID, logger: null, env: {},
     });
-    const spec = tr.registered[0];
-    assert.ok("discovered_agent" in spec, "the key must be PRESENT");
-    assert.equal(spec.discovered_agent, null);
-    assert.equal(spec.mode, "production");
+    assert.deepEqual(tr.registered, [],
+      "asking for the verdict registered the agent; that write has a side " +
+      "effect on introspection_state that this route exists to avoid");
+    assert.deepEqual(tr.verdictReads, ["a1"]);
     assert.equal(u.mayUpload, true);
   });
 
@@ -373,11 +379,23 @@ describe("registration reads the verdict without a harmful side effect", () => {
     const root = tmp();
     const u = createTurnUploader({ transport: {}, agentId: "a1", root });
     await announce({
-      transport: { register() { throw new Error("down"); } },
+      transport: { captureCurrent() { throw new Error("down"); } },
       uploader: u, config: { agentId: "a1" }, pluginId: PLUGIN_ID,
       logger: null, env: {},
     });
     assert.equal(u.mayUpload, false);
+  });
+
+  it("passes the server's refusal through to the operator", async () => {
+    const root = tmp();
+    const tr = fakeTransport({ turns: false, reason: "an operator enables it." });
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    const v = await announce({
+      transport: tr, uploader: u, config: { agentId: "a1" },
+      pluginId: PLUGIN_ID, logger: null, env: {},
+    });
+    assert.equal(v.mayUpload, false);
+    assert.equal(u.refusal, "an operator enables it.");
   });
 });
 
@@ -468,9 +486,7 @@ describe("where capture lands", () => {
     assert.match(captureRoot({ PERCEPTEYE_HOME: "/h" }), /^\/h\/captured$/);
   });
 
-  it("reads no description when there is no trajectory dir", () => {
-    assert.equal(readDescribedAgent({}), null);
-  });
+
 });
 
 describe("one answer per question", () => {

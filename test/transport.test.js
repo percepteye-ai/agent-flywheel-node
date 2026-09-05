@@ -160,3 +160,37 @@ describe("the turn-upload wire", () => {
 //:   AttachTransport(c, "a1").report_turns(
 //:       "a1", [{"turn_id": "t1", "final_text": "mañana — \U0001f4e6"}])
 const PY_NON_ASCII_KEY = "turns-a1-a496e0f0d4c048270af7fa9b8de992ed";
+
+describe("the capture verdict read", () => {
+  it("is a GET on the agent, with no body and no idempotency key", async () => {
+    const calls = [];
+    const tx = new AttachTransport(
+      { request: (m, p, o) => { calls.push({ m, p, o }); return { capture: { turns: true } }; } },
+      { agentId: "a1" });
+    const out = await tx.captureCurrent("a1");
+    assert.equal(calls[0].m, "GET");
+    assert.equal(calls[0].p, "/agents/a1/capture");
+    assert.equal(calls[0].o, undefined,
+      "a READ that sends a body or a key looks like the write it replaces");
+    assert.equal(out.capture.turns, true);
+  });
+
+  it("escapes an agent id that would otherwise change the path", async () => {
+    const calls = [];
+    await new AttachTransport({ request: (m, p) => calls.push(p) }, { agentId: "a" })
+      .captureCurrent("a/../b");
+    assert.ok(!calls[0].includes("/../"), calls[0]);
+  });
+
+  it("FAILS CLOSED when the control plane cannot be reached", async () => {
+    // The opposite of `policyCurrent`, whose safe direction is the other way.
+    // Asserted against the REAL method: a fake transport that throws exercises
+    // the CALLER's catch, not this one, which is how the same mutation
+    // survived on the Python side.
+    const tx = new AttachTransport(
+      { request: () => { throw new Error("unreachable"); } }, { agentId: "a1" });
+    const out = await tx.captureCurrent("a1");
+    assert.deepEqual(out, {});
+    assert.notEqual(out?.capture?.turns, true);
+  });
+});

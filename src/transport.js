@@ -140,6 +140,31 @@ export class AttachTransport {
   }
 
   /**
+   * May this key upload this agent's production turns, right now?
+   *
+   * A READ, and that is the point. The verdict used to be reachable only
+   * through `POST /agents` -- an upsert -- so re-asking cost a write, and a
+   * registration that omits `discovered_agent` is recorded as introspection
+   * `disabled`, which stops that agent's description driving workflow
+   * generation. This package carried an explicit `discovered_agent: null`
+   * purely to work around that; the workaround is gone with this route.
+   *
+   * FAILS CLOSED. An unreachable control plane resolves to `{}`, which the
+   * caller reads as "no". The opposite of `policyCurrent`, which fails OPEN
+   * because keeping the current policy is the safe answer there -- the two
+   * look alike and their safe directions are opposite, which is why this one
+   * says so.
+   */
+  async captureCurrent(agentId) {
+    try {
+      return (await this._c.request(
+        "GET", `/agents/${encodeURIComponent(agentId)}/capture`)) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * Upload a batch of captured PRODUCTION turns.
    *
    * REPLAYABLE, unlike `claim`. The server keys each turn on

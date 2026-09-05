@@ -152,9 +152,9 @@ one directory per turn, in the same on-disk format the Python SDK writes:
 **Uploading is off until an operator turns it on, per agent.** That is a
 deliberate exception to this project's default-on rule: a production turn
 carries *your end users'* own messages, so a default that starts sending them
-is a disclosure nobody made. The control plane answers when the agent
-registers, so the plugin never learns its permission by uploading and finding
-out. Once enabled, turns go up every 32 and again at gateway shutdown; turns
+is a disclosure nobody made. The plugin asks the control plane directly —
+`GET /agents/{agent_id}/capture`, a plain read — so it never learns its
+permission by uploading and finding out. Once enabled, turns go up every 32 and again at gateway shutdown; turns
 with no answer are held back until shutdown, because an answer may still be
 coming.
 
