@@ -117,10 +117,9 @@ test("an explicit argument still wins, so the gate stays testable", () => {
 
 
 test("the transport calls no route the control plane does not serve", async () => {
-  // The flywheel sub-app's complete route set, read from
-  // MissionControl/mission_control/api/flywheel.py (@app decorators) plus the
-  // policy router it mounts (api/policy_current.py:453,493). Vendored as a
-  // list because this package must not import the control plane — the same
+  // The complete route set the control plane's flywheel API serves, read from
+  // its own route declarations plus the policy routes it mounts. Vendored as
+  // a list because this package must not import the control plane — the same
   // reason schema/flywheel-1.json is a copy — and asserted here so a new
   // transport method calling a route that does not exist is caught at test
   // time rather than as a 404 in a customer's process.

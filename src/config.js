@@ -108,6 +108,13 @@ export const CONFIG_SCHEMA = {
   },
 };
 
+/**
+ * Where this plugin dials when nothing names a control plane.
+ *
+ * `launch.percepteye.ai` is the live API domain. Named in the README's
+ * configuration table too, because a default a customer cannot see is a
+ * default they cannot tell apart from a control plane that is down.
+ */
 const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
 
 /** The spellings that mean OFF. One list, because one typo rule applies. */
@@ -141,10 +148,19 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     agentId: firstString(
       pluginConfig.agentId, env.PERCEPTEYE_AGENT_ID,
     ) ?? "openclaw",
+    // ONE NAME FOR ONE QUESTION. This also read an unprefixed
+    // `CONTROL_PLANE_ENV_URL`, at the LOWEST precedence -- while the Python
+    // SDK's harness recorder read the same variable at the HIGHEST. Nothing in
+    // the platform has ever set it, neither README named it, and it is not in
+    // `CONFIG_SCHEMA`, so no customer could discover it existed; what it could
+    // do was collide with an unrelated variable of that generic name in a
+    // customer's environment and send this agent's telemetry somewhere else.
+    // Two components of one product resolving the control plane differently is
+    // not something a precedence rule fixes -- it is a second answer, so it is
+    // gone rather than aligned.
     controlPlaneUrl: firstString(
       pluginConfig.controlPlaneUrl,
       env.PERCEPTEYE_CONTROL_PLANE_URL,
-      env.CONTROL_PLANE_ENV_URL,
     ) ?? DEFAULT_CONTROL_PLANE,
     // Capture is on unless DELIBERATELY disabled. A typo must not silently
     // switch it off and leave the operator believing it is on.

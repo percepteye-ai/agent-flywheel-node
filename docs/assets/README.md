@@ -31,6 +31,14 @@ about the packages, not styling — `_ROWS` in `render_overview.py` is the table
 that makes it, and it is the reason a figure copied between the two repos is
 wrong even when it looks right.
 
-Regenerate after touching either renderer. These are documentation only —
-`files` in package.json is a whitelist and excludes `docs/`, so none of this
-reaches the npm tarball.
+Regenerate after touching either renderer — and note what that sentence is:
+a request, not a mechanism. Nothing in either repo compares these four files
+with the ones `render.sh node` produces, so a `_ROWS` edit that is rendered but
+not copied leaves this README advertising the wrong set of applied halves with
+nothing anywhere going red. Treat a renderer change as a two-repo change.
+
+These are documentation only, and that part IS mechanised: `files` in
+package.json is an allowlist that excludes `docs/`, and
+`test/oss-boundary.test.js` asserts it against what `npm pack` actually
+produces rather than against the manifest, so no image extension and nothing
+under `docs/` can reach a customer's disk.

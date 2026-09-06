@@ -43,9 +43,9 @@ import { resolveServedAgent } from "../src/scope.js";
 import {
   MODEL_HOOK_NAME, MODEL_OFF_REASON, NO_KEY_REASON, PROMPT_HOOK_NAME,
   PROMPT_OFF_REASON, PROVIDER_ID, PROVIDER_TRANSPORT_API,
-  SERVABLE_PROMPT_STATUSES, createPolicySource, modelDecision,
-  modelHookBlockedReason, pairNote, promptDecision, registerServingPolicy,
-  servedPolicySummary,
+  NO_PROVIDER_SURFACE_REASON, SERVABLE_PROMPT_STATUSES, createPolicySource,
+  modelDecision, modelHookBlockedReason, pairNote, promptDecision,
+  providerRefusedReason, registerServingPolicy, servedPolicySummary,
 } from "../src/policy.js";
 
 /** A `/prompt/current` body that passes every check. */
@@ -133,7 +133,7 @@ describe("promptDecision — the pair check, cause by cause", () => {
   });
 
   it("`delivered` serves too — the control plane's own set, not a narrower one", () => {
-    // `_servable_prompt_for_agent` filters status.in_(("approved","delivered")).
+    // The control plane serves a bundle only in those two states.
     // Accepting only "approved" would silently stop applying a prompt the
     // moment a human collected the deliverable, which flips it to "delivered".
     assert.equal(promptDecision({ ...APPROVED, status: "delivered" }).apply, true);
@@ -200,10 +200,10 @@ describe("modelDecision — is this an address an agent can call", () => {
   });
 
   it("refuses a stored-artifact reference in `model`", () => {
-    // `agent_protocol.served_policy.is_servable` refuses these server-side for
-    // the same reason: `model="gs://bucket/run/iter_0"` 404s on every
-    // completion. A refusal here is the only thing standing between a control
-    // plane that one day widens its own filter and a broken agent.
+    // The control plane refuses these server-side for the same reason:
+    // `model="gs://bucket/run/iter_0"` 404s on every completion. A refusal
+    // here is the only thing standing between a control plane that one day
+    // widens its own filter and a broken agent.
     for (const model of ["gs://bucket/run/iter_0", "s3://b/k", "file:///ckpt",
       "/mnt/ckpt"]) {
       const d = modelDecision({ ...SERVED, endpoint: { ...SERVED.endpoint, model } });
@@ -380,7 +380,8 @@ describe("createPolicySource — resolve once, then serve the answer", () => {
 
   it("a served endpoint the host will never ask about is refused by ITS cause", async () => {
     const src = createPolicySource({
-      pluginId: PLUGIN_ID, logger: fakeLogger(), modelHookAvailable: false,
+      pluginId: PLUGIN_ID, logger: fakeLogger(),
+      modelBlocked: modelHookBlockedReason(PLUGIN_ID),
     });
     await src.resolve(fakeTransport());
     assert.equal(src.appliedModel, null);
@@ -454,6 +455,55 @@ describe("the scope gate at the seam — one agent's bundle, one agent's turns",
       assert.equal(src.handle({}, ctx), undefined, JSON.stringify(ctx));
       assert.equal(src.handleModelResolve({}, ctx), undefined, JSON.stringify(ctx));
     }
+  });
+
+  it("SAYS WHY it refused a run, once per distinct reason", async () => {
+    // `scopeDecision` builds a specific sentence for each of its six cases and
+    // nothing in production read `.reason`: a producer with no consumer, and
+    // the one diagnostic an operator whose bundle is not landing actually
+    // needs. It was computed on every turn and dropped on the floor.
+    const logger = fakeLogger();
+    const servedAgent = resolveServedAgent({
+      agentId: "support",
+      hostConfig: { agents: { list: [{ id: "main" }, { id: "support" }] } },
+    });
+    const src = await applied({ logger, servedAgent });
+    const other = { agentId: "main", sessionKey: "agent:main:slack:chat:c1" };
+    const ownSub = { agentId: "support", sessionKey: "agent:support:subagent:t9" };
+    const ownCron = { agentId: "support", sessionKey: "agent:support:cron:n:run:1" };
+
+    for (const ctx of [other, ownSub, ownCron, null]) {
+      src.handle({}, ctx);
+      src.handleModelResolve({}, ctx);
+    }
+
+    const refusals = logger.lines.filter((l) => l.includes("was NOT applied to this run"));
+    // Each of the four causes, for each of the two halves, named by ITS cause.
+    for (const fragment of [
+      'the control plane\'s answer is for "support"',
+      "this is a subagent session",
+      "this is a scheduled (cron) session",
+      "the host passed no hook context",
+    ]) {
+      const said = refusals.filter((l) => l.includes(fragment));
+      assert.equal(said.length, 2,
+        `both halves must name ${JSON.stringify(fragment)}, got ${said.length}`);
+      assert.ok(said.some((l) => l.includes("system prompt")));
+      assert.ok(said.some((l) => l.includes("model")));
+    }
+
+    // ONCE PER DISTINCT REASON, not per turn: this sits in front of every turn
+    // the process serves.
+    const before = refusals.length;
+    for (let i = 0; i < 20; i += 1) {
+      src.handle({}, other);
+      src.handleModelResolve({}, ownSub);
+    }
+    assert.equal(
+      logger.lines.filter((l) => l.includes("was NOT applied to this run")).length,
+      before,
+      "a per-turn diagnostic would fill a customer's logs with our name",
+    );
   });
 });
 
@@ -604,20 +654,23 @@ describe("registerServingPolicy — the seams, wired", () => {
     const said = logger.lines.find((l) => l.includes("applying nothing"));
     assert.ok(said, "a keyless install must be told why nothing is applied");
     assert.ok(said.includes(NO_KEY_REASON), "and the reason must be the actual one");
-    assert.ok(!logger.text().includes("api.on is missing"),
-      "the refusal must name the real cause, not the other one");
+    assert.equal(src.refusal, NO_KEY_REASON,
+      "and the source must report the same sentence the log printed");
+    assert.equal(src.modelRefusal, NO_KEY_REASON,
+      "for BOTH halves -- neither was read, for the one reason");
   });
 
-  it("names the OTHER unwired cause when it is the real one", () => {
-    const logger = fakeLogger();
-    registerServingPolicy({ config: {} }, {
-      config: productionConfig(),
-      pluginId: PLUGIN_ID, logger, transport: fakeTransport(), hostConfig: {},
-    });
-    assert.ok(logger.text().includes("api.on is missing"));
-    assert.ok(!logger.text().includes(NO_KEY_REASON),
-      "a host with no hook seam must not be reported as a missing key",
-    );
+  it("a host with no hook seam is refused by register(), before this is reached", () => {
+    // `registerServingPolicy` used to carry a second `unwired` cause -- "this
+    // host exposes no plugin hook seam (api.on is missing)" -- reachable only
+    // by constructing it directly, as this test once did. `register()` is the
+    // only production caller and it returns null several frames earlier, so
+    // the refusal was dead text that a future refactor would have preserved
+    // because it looked live. The GUARANTEE is real and is asserted where it
+    // actually lives.
+    assert.equal(register({}, { apiKey: "pefw_x" }, {}), null,
+      "a host with no api.on must be refused at the entry point");
+    assert.equal(register({ on: undefined }, { apiKey: "pefw_x" }, {}), null);
   });
 
   it("the prompt kill switch subscribes NOTHING, and says so in the ONE phrasing", () => {
@@ -717,6 +770,91 @@ describe("registerServingPolicy — the seams, wired", () => {
     }));
     assert.ok(api.hook(PROMPT_HOOK_NAME));
     assert.ok(logger.text().includes("already registered"));
+  });
+
+  it("a refused provider registration DOES cost the model half", async () => {
+    // THE PROVIDER IS THE ONLY PRODUCER OF THE BASE URL. The registration was
+    // wrapped in a try/catch, the refusal was logged -- and `api.on` was then
+    // called unconditionally, so the hook went on returning
+    // `providerOverride: 'percepteye-flywheel'` for a provider the host has no
+    // transport for. The startup log warned that registration had failed and
+    // then, two lines later, said "applying the approved model ... through the
+    // provider this plugin registers", with `modelRefusal` null.
+    const api = hostApi({
+      registerProvider: () => { throw new Error("provider id already taken"); },
+    });
+    const logger = fakeLogger();
+    const src = registerServingPolicy(api, {
+      config: productionConfig(),
+      pluginId: PLUGIN_ID, logger, transport: fakeTransport(), hostConfig: {},
+    });
+    await src.resolve(fakeTransport());
+
+    assert.equal(api.hook(MODEL_HOOK_NAME), undefined,
+      "the model hook must not be subscribed when nothing can serve the base URL");
+    assert.equal(src.appliedModel, null, "and nothing may be reported as applied");
+    assert.equal(src.modelRefusal,
+      providerRefusedReason("provider id already taken"),
+      "the refusal must name the ACTUAL cause");
+    assert.ok(!logger.text().includes("applying the approved model"),
+      "the log must not promise a model the host cannot resolve");
+    // The prompt half is untouched, and so is the pair note: half a pair is a
+    // warning, and it must name the model half's real cause.
+    assert.equal(src.appliedPrompt, APPROVED.text);
+    const note = logger.lines.find((l) => l.includes("HALF THE PAIR"));
+    assert.ok(note && note.includes("provider id already taken"));
+  });
+
+  it("a host with NO provider surface does not get an override it cannot resolve", async () => {
+    const api = hostApi({ registerProvider: undefined });
+    const logger = fakeLogger();
+    const src = registerServingPolicy(api, {
+      config: productionConfig(),
+      pluginId: PLUGIN_ID, logger, transport: fakeTransport(), hostConfig: {},
+    });
+    await src.resolve(fakeTransport());
+
+    assert.equal(api.hook(MODEL_HOOK_NAME), undefined);
+    assert.equal(src.appliedModel, null);
+    assert.equal(src.modelRefusal, NO_PROVIDER_SURFACE_REASON);
+    assert.ok(logger.lines.some((l) => l.startsWith("warn:")
+      && l.includes(NO_PROVIDER_SURFACE_REASON)),
+      "a silently dropped model half must be a warning, not silence");
+    assert.ok(api.hook(PROMPT_HOOK_NAME), "the prompt half is unaffected");
+  });
+
+  it("reports NEITHER half applied when the agent scope cannot be resolved", async () => {
+    // The per-run scope gate was consulted only inside the handlers, so this
+    // source took the control plane's answer, set BOTH halves from it, cleared
+    // both refusals and announced "the pair is intact ... which is the
+    // combination that was evaluated" -- for a pair that reached no turn. The
+    // one honest line was the warn emitted before the reads, then contradicted
+    // by three INFO lines after them.
+    const api = hostApi();
+    const logger = fakeLogger();
+    const transport = fakeTransport();
+    const src = registerServingPolicy(api, {
+      config: productionConfig(),
+      pluginId: PLUGIN_ID, logger, transport, hostConfig: {
+        agents: { list: [{ id: "main" }, { id: "helper" }] },
+      },
+    });
+    await src.resolve(transport);
+
+    assert.equal(src.appliedPrompt, null, "nothing is applied to any run");
+    assert.equal(src.appliedModel, null);
+    assert.match(src.refusal, /2 agents \(main, helper\)/,
+      "and the documented reason getter must say so");
+    assert.match(src.modelRefusal, /2 agents \(main, helper\)/);
+    assert.ok(!logger.text().includes("pair is intact"),
+      "a pair that runs on nothing is not intact");
+    assert.ok(!logger.text().includes("applying the approved"),
+      "no INFO line may claim an application the scope gate will refuse");
+    // The customer's prompt text is not pulled over the wire to be discarded.
+    assert.ok(!transport.calls.includes("prompt"),
+      `/prompt/current must not be read when nothing can be applied: ${transport.calls}`);
+    // And the hooks agree with the getters.
+    assert.equal(api.hook(PROMPT_HOOK_NAME)({}, TURN), undefined);
   });
 
   it("the pair note is an ORDINARY confirmation when both halves land", async () => {
@@ -907,6 +1045,26 @@ describe("mode decides it, structurally", () => {
       assert.ok(!/and the model/.test(one),
         "the model half cannot fire without the conversation opt-in, so the " +
         "line must not claim it",
+      );
+
+      // KEYED, opted in, but the host REFUSES the provider id. This line used
+      // to be computed from three facts -- a key, the kill switch, the
+      // conversation opt-in -- so it claimed the model half on a host where
+      // nothing could ever supply the served base URL, and the warning saying
+      // so sat two lines away.
+      const noProvider = hostApi({
+        logger: fakeLogger(),
+        config: { plugins: { entries: { [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
+        registerProvider: () => { throw new Error("provider id already taken"); },
+      });
+      register(noProvider, { apiKey: "pefw_x" }, {
+        PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
+      });
+      const refused = noProvider.logger.lines.find((l) => l.includes("claims no rollout"));
+      assert.match(refused, /It also applies the system prompt your control plane/);
+      assert.ok(!/and the model/.test(refused),
+        "a provider the host refused cannot serve the model, so the line " +
+        "must not claim it",
       );
     } finally {
       rmSync(root, { recursive: true, force: true });

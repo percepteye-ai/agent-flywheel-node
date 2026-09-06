@@ -13,10 +13,9 @@
  *                         "use no prompt".
  *
  * ⚠ `policy.prompt` IS NOT PROMPT TEXT, and the name invites exactly that
- * mistake. It is the control plane's own prompt-PIN identity snapshot
- * (`{pins, digest, captured_at}` from `mission_control/prompt_identity.py`) --
- * a record of which of ITS prompts were in force when the answer was
- * computed, over `agent_protocol.prompt_pins`. It has nothing to do with the
+ * mistake. It is the control plane's own prompt-PIN identity snapshot --
+ * `{pins, digest, captured_at}`, a record of which of ITS OWN prompts were in
+ * force when the answer was computed. It has nothing to do with the
  * customer's twin candidate, so `policy.prompt.digest` and this prompt's
  * `sha256` are not comparable and are never compared here. The TEXT only ever
  * comes from `/prompt/current`.
@@ -97,7 +96,9 @@
  *   provider-runtime-CLQOjLJ6.js:126-149). The two go together: the override
  *   is what makes `ctx.provider` ours, and ours is the only value we may act
  *   on -- see `normalizeTransport` below for the footgun that makes that gate
- *   mandatory rather than tidy.
+ *   mandatory rather than tidy. So the REGISTRATION is part of whether the
+ *   model half may fire at all, not a step that follows that decision: see
+ *   `openModelSeam`, which asks the whole question once.
  *
  *   BOTH hook contexts carry `agentId` and `sessionKey`
  *   (lifecycle-hook-helpers-BwL6869q.js:9-34,
@@ -135,31 +136,31 @@ export const PROVIDER_ID = "percepteye-flywheel";
  *
  * The control plane serves an OpenAI-compatible completions API, and
  * `openai-completions` is the host's own vocabulary for it
- * (config-3MmNBWgm.js:22,46). `base_url` arrives with a trailing
- * `/chat/completions` ALREADY STRIPPED (`agent_protocol.served_policy
- * .openai_base_url`), because an OpenAI client appends that suffix itself --
- * so it is used verbatim and never re-appended.
+ * (config-3MmNBWgm.js:22,46). `GET /policy/current` answers with a `base_url`
+ * whose trailing `/chat/completions` is ALREADY STRIPPED, because an OpenAI
+ * client appends that suffix itself -- so it is used verbatim and never
+ * re-appended.
  */
 export const PROVIDER_TRANSPORT_API = "openai-completions";
 
 /**
  * The delivery states that may serve.
  *
- * The control plane's own boundary, not a second one: `_servable_prompt_for_agent`
- * filters `status.in_(("approved", "delivered"))` and `api/prompt_export`
- * enforces the same set. Re-asserting it here is not a duplicate gate -- it is
- * the only thing standing between a control plane that one day widens the
- * filter and a customer's agent silently running an unapproved prompt.
+ * The control plane's own boundary, not a second one: it serves a bundle only
+ * in these two states, and its prompt export enforces the same set.
+ * Re-asserting it here is not a duplicate gate -- it is the only thing
+ * standing between a control plane that one day widens the filter and a
+ * customer's agent silently running an unapproved prompt.
  */
 export const SERVABLE_PROMPT_STATUSES = new Set(["approved", "delivered"]);
 
 /**
  * Prefixes that mean STORED ARTIFACT, not sampling address.
  *
- * `agent_protocol.served_policy.is_archive_ref` -- the control plane already
- * refuses to hand one of these out as a `model`, for exactly the reason this
- * refuses to send one: `model="gs://bucket/run/iter_0"` 404s on every
- * completion. Re-asserted here on the same argument as the status set above.
+ * The control plane already refuses to hand one of these out as a `model`,
+ * for exactly the reason this refuses to send one:
+ * `model="gs://bucket/run/iter_0"` 404s on every completion. Re-asserted here
+ * on the same argument as the status set above.
  */
 export const ARCHIVE_REF_PREFIXES = ["gs://", "s3://", "file://", "/"];
 
@@ -177,6 +178,45 @@ export const modelHookBlockedReason = (pluginId) =>
   `non-bundled plugins unless you set plugins.entries.${pluginId}.hooks.` +
   "allowConversationAccess=true -- the same setting that lets this plugin " +
   "capture your agent's answers";
+
+/**
+ * Why the model half cannot fire when this host has no provider surface.
+ *
+ * THE PROVIDER IS THE ONLY PRODUCER OF THE BASE URL. `handleModelResolve`
+ * returns `providerOverride: PROVIDER_ID`, and the only thing that turns that
+ * id into `{api, baseUrl}` is the registered provider's `normalizeTransport`.
+ * Returning the override on a host that never took the registration names a
+ * provider the host does not know: the resolve fails outright, or the served
+ * model name is handed to the customer's OWN provider, which does not serve
+ * it. Both break a working agent to deliver an improvement that cannot
+ * arrive, which is the one thing this file exists not to do.
+ */
+export const NO_PROVIDER_SURFACE_REASON =
+  `this host exposes no provider registration (api.registerProvider is ` +
+  `missing), and a registered provider is the only thing that can supply the ` +
+  `base URL of the approved endpoint -- so naming '${PROVIDER_ID}' in ` +
+  `${MODEL_HOOK_NAME} would point this agent at a provider the host does not ` +
+  "know";
+
+/** Why the model half cannot fire when the host REFUSED the registration. */
+export const providerRefusedReason = (detail) =>
+  `registering the provider '${PROVIDER_ID}' failed (${detail}), and a ` +
+  "registered provider is the only thing that can supply the base URL of the " +
+  `approved endpoint -- so naming it in ${MODEL_HOOK_NAME} would point this ` +
+  "agent at a provider the host does not know";
+
+/**
+ * The refusal that means NOTHING IS WRONG -- the answer has not arrived yet.
+ *
+ * `refusal` and `modelRefusal` are true at every moment, so before the startup
+ * read they have to say something, and this is it. It is exported because it
+ * is also the ONE test for "this half can still apply": every other value
+ * either half can hold at construction is a settled refusal. `index.js` asks
+ * that question rather than re-deriving the predicate from a subset of its
+ * inputs, which is how its startup line came to promise a model half that a
+ * refused provider registration had already ruled out.
+ */
+export const PENDING_ANSWER_REASON = "the control plane has not been asked yet";
 
 /** Why nothing is read or applied when no key is configured. */
 export const NO_KEY_REASON =
@@ -249,11 +289,11 @@ export function promptDecision(prompt) {
 
   // THE PAIR, AS FAR AS THIS SIDE CAN CHECK IT. `model_prompt_checksum` is
   // the prompt identity STAMPED ON THE CHECKPOINT at certification;
-  // `sha256` is the optimized prompt's own identity. Delivery assembly
-  // refuses with a 409 unless the two are equal
-  // (`mission_control/api/prompt_deliveries.py`), so a served bundle where
-  // they differ is not the validated pair, whatever its status says. That is
-  // an inconsistency in the deliverable, not a policy call, so it refuses.
+  // `sha256` is the optimized prompt's own identity. Delivery assembly on the
+  // control plane refuses with a 409 unless the two are equal, so a served
+  // bundle where they differ is not the validated pair, whatever its status
+  // says. That is an inconsistency in the deliverable, not a policy call, so
+  // it refuses.
   //
   // Checked only when BOTH are present: a blank one means we could not look,
   // which is the "cannot prove" case the pair note names, not a proven
@@ -407,19 +447,34 @@ export function pairNote({
  * @param {boolean} [opts.applyPrompt]  the prompt kill switch, already resolved
  * @param {boolean} [opts.applyModel]   the model kill switch, already resolved
  * @param {object}  [opts.servedAgent]  from `resolveServedAgent`
- * @param {boolean} [opts.modelHookAvailable] whether the host will deliver
- *   `before_model_resolve` to this plugin at all
+ * @param {string|null} [opts.modelBlocked] why the model half cannot fire on
+ *   this host AT ALL -- the kill switch, a missing conversation opt-in, or a
+ *   provider registration the host does not offer or refused. Decided once by
+ *   `registerServingPolicy`, which is the only place that knows all three.
  * @param {string|null} [opts.unwired]  why no seam was wired, when none was
  */
 export function createPolicySource({
   pluginId, logger = null, applyPrompt = true, applyModel = true,
-  servedAgent = resolveServedAgent({}), modelHookAvailable = true,
+  servedAgent = resolveServedAgent({}), modelBlocked = null,
   unwired = null,
 }) {
   let policy = {};
   let prompt = {};
   let applied = null;
   let appliedModel = null;
+
+  // NOTHING CAN BE APPLIED TO ANY RUN when the agent scope is unresolvable --
+  // several agents on this host and none of them named -- because
+  // `scopeDecision` refuses every one of them. It is known at construction,
+  // so it belongs here beside the other never-going-to-happen causes rather
+  // than only inside the handlers: this source used to take the control
+  // plane's answer, set BOTH `applied` and `appliedModel` from it, clear both
+  // refusals, and then announce "the pair is intact" for a pair that ran on
+  // nothing.
+  const scopeUnresolved = servedAgent?.id
+    ? null
+    : servedAgent?.reason || "no agent is resolved";
+
   // TRUE AT EVERY MOMENT, including before the read and when the read never
   // happens (no key, no transport). A `refusal` that is null while
   // `appliedPrompt` is also null cannot be told apart from a source that
@@ -429,16 +484,35 @@ export function createPolicySource({
   // operator must read the same sentence here and in the startup log, and a
   // comment saying "keep these in sync" is not a mechanism.
   let refusal = !applyPrompt ? PROMPT_OFF_REASON
-    : unwired ?? "the control plane has not been asked yet";
+    : unwired ?? scopeUnresolved ?? PENDING_ANSWER_REASON;
   let refusedModel = !applyModel ? MODEL_OFF_REASON
-    : !modelHookAvailable ? modelHookBlockedReason(pluginId)
-      : unwired ?? "the control plane has not been asked yet";
+    : modelBlocked ?? unwired ?? scopeUnresolved ?? PENDING_ANSWER_REASON;
   let resolved = false;
   let announcedPrompt = false;
   let announcedModel = false;
 
   /** The scope gate, asked identically by both halves. */
   const inScope = (ctx) => scopeDecision(ctx, servedAgent);
+
+  // EVERY SCOPE REFUSAL HAS A READER NOW. `scopeDecision` builds a specific
+  // sentence for each of its cases -- a subagent session, a cron turn, the
+  // wrong host agent, no hook context, neither identifier -- and until this
+  // existed every one of them was computed on every turn and dropped, leaving
+  // an operator with a startup log promising both halves, no behaviour change,
+  // and nothing anywhere naming the cause.
+  //
+  // Once per DISTINCT reason, not per turn: this sits in front of every turn
+  // the process serves. The set is bounded by the six sentences and the host's
+  // own agent ids.
+  const saidScope = new Set();
+  const sayScope = (half, reason) => {
+    const line = `${half}: ${reason}`;
+    if (saidScope.has(line)) return;
+    saidScope.add(line);
+    logger?.info?.(
+      `[${pluginId}] the approved ${half} was NOT applied to this run -- ` +
+      `${reason}.`);
+  };
 
   const source = {
     /** The `/policy/current` body. `{}` until resolved, or on any failure. */
@@ -458,9 +532,9 @@ export function createPolicySource({
     /**
      * Whether the startup read has finished.
      *
-     * ONE read or TWO, depending on the prompt kill switch: `/policy/current`
-     * always, `/prompt/current` only when prompt application is on -- pulling
-     * the customer's prompt text over the wire to discard it is a cost with no
+     * ONE read or TWO: `/policy/current` always, `/prompt/current` only when
+     * prompt application is on AND the agent scope resolved -- pulling the
+     * customer's prompt text over the wire to discard it is a cost with no
      * reader. Stays false forever when there is no transport to read through,
      * because no read was ever attempted.
      */
@@ -482,12 +556,27 @@ export function createPolicySource({
       }
       logger?.info?.(`[${pluginId}] ${servedPolicySummary(policy)}`);
 
+      // WHOSE RUN? -- and when the answer is "we cannot tell", NOTHING is
+      // applied to any run, so neither half's refusal may be overwritten by
+      // the payload's answer and the customer's prompt text is not fetched to
+      // be discarded. `registerServingPolicy` has already warned, naming the
+      // agents and the remedy; `announcePair` stays silent because there is no
+      // pair, which is what stops "the pair is intact" being logged for a
+      // bundle that reaches no turn.
+      if (scopeUnresolved) {
+        resolved = true;
+        source.announcePair();
+        return source;
+      }
+
       // ── THE MODEL HALF ────────────────────────────────────────────────
-      // The kill switch and a missing conversation opt-in are decided before
-      // any read and must not be overwritten by the payload's answer: an
-      // operator who switched the model half off is not owed a sentence about
-      // an endpoint they asked not to use.
-      if (applyModel && modelHookAvailable) {
+      // The kill switch, a missing conversation opt-in and a provider the host
+      // will not register are decided before any read and must not be
+      // overwritten by the payload's answer: an operator who switched the
+      // model half off is not owed a sentence about an endpoint they asked not
+      // to use, and an endpoint that has no provider to reach it is not
+      // applied however good the answer is.
+      if (applyModel && !modelBlocked) {
         const decision = modelDecision(policy);
         if (decision.apply) {
           appliedModel = {
@@ -579,7 +668,11 @@ export function createPolicySource({
      */
     handle(event, ctx) {
       if (!applied) return undefined;
-      if (!inScope(ctx).apply) return undefined;
+      const scope = inScope(ctx);
+      if (!scope.apply) {
+        sayScope("system prompt", scope.reason);
+        return undefined;
+      }
       if (!announcedPrompt) {
         announcedPrompt = true;
         // FEATURE DETECTION, reported once. This is the only evidence
@@ -610,7 +703,11 @@ export function createPolicySource({
      */
     handleModelResolve(event, ctx) {
       if (!appliedModel) return undefined;
-      if (!inScope(ctx).apply) return undefined;
+      const scope = inScope(ctx);
+      if (!scope.apply) {
+        sayScope("model", scope.reason);
+        return undefined;
+      }
       if (!announcedModel) {
         announcedModel = true;
         logger?.info?.(
@@ -688,19 +785,75 @@ export function registerServingPolicy(api, {
     agentId: config?.agentId, hostConfig,
   });
 
-  // WHY NOTHING WILL BE WIRED, named by ITS OWN cause rather than one message
-  // covering two very different situations. "No key" is the ordinary first
-  // install and the consent boundary; "no hook seam" is a host we do not
-  // recognise, and an operator sent to look for a missing key would find one.
-  const unwired = !transport ? NO_KEY_REASON
-    : typeof api?.on !== "function"
-      ? "this host exposes no plugin hook seam (api.on is missing), so " +
-        "nothing could be subscribed"
-      : null;
+  // WHY NOTHING WILL BE WIRED. "No key" is the ordinary first install and the
+  // consent boundary, and it is the only cause reachable here: `register()` in
+  // `index.js` returns before this is called when the host exposes no `api.on`,
+  // so a second branch naming that would be a refusal no host can produce.
+  const unwired = transport ? null : NO_KEY_REASON;
 
-  const source = createPolicySource({
+  // Assigned immediately below. The provider's `normalizeTransport` closes
+  // over it and is called by the HOST, long after this function returns.
+  let source = null;
+
+  /**
+   * CAN THE MODEL HALF FIRE ON THIS HOST AT ALL, and if not, why -- asked
+   * ONCE, here, because this is the only place that knows every input to it.
+   *
+   * Registering the provider IS part of the question, not a step that follows
+   * it. `handleModelResolve` returns `providerOverride: PROVIDER_ID` and the
+   * registered provider is the ONLY producer of the base URL that override
+   * consumes, so a host that has no provider surface, or that refuses the
+   * registration, cannot serve the approved model however good the control
+   * plane's answer is. This used to swallow the refusal, subscribe the hook
+   * anyway and log "applying the approved model ... through the provider this
+   * plugin registers" two lines after warning that the registration failed.
+   *
+   * @returns {string|null} the refusal, or null when the seam is open
+   */
+  const openModelSeam = () => {
+    if (!applyModel) return MODEL_OFF_REASON;
+    if (!conversationAccess) return modelHookBlockedReason(pluginId);
+    if (typeof api.registerProvider !== "function") {
+      return NO_PROVIDER_SURFACE_REASON;
+    }
+    try {
+      // REGISTERED BEFORE WE KNOW WHETHER A MODEL IS SERVED:
+      // `providerOverride` names it on a later turn, and a provider registered
+      // at that point would be too late. It answers for nothing until
+      // `appliedModel` is set, and never for anyone else's provider id.
+      api.registerProvider({
+        id: PROVIDER_ID,
+        label: "PerceptEye Flywheel",
+        // The served endpoint is OpenAI-compatible and may need a key, which
+        // the control plane names rather than this plugin inventing one. An
+        // empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
+        // leaves the host's auth surfaces with nothing to show an operator.
+        auth: [{
+          id: "api_key",
+          label: "API key",
+          kind: "api_key",
+          hint: `Set models.providers.${PROVIDER_ID}.apiKey to the ` +
+            "credential your control plane names for the served endpoint.",
+        }],
+        normalizeTransport: (ctx) => source?.normalizeTransport(ctx),
+      });
+    } catch (err) {
+      // A refused provider registration must not take the prompt half, the
+      // turn capture, or the plugin load down with it -- it costs the MODEL
+      // half, and only that.
+      return providerRefusedReason(err?.message ?? err);
+    }
+    return null;
+  };
+
+  // Not attempted at all with no key: nothing is read, so there is nothing for
+  // a provider to serve, and `unwired` is already the refusal both halves
+  // carry.
+  const modelBlocked = unwired ? null : openModelSeam();
+
+  source = createPolicySource({
     pluginId, logger, applyPrompt, applyModel, servedAgent,
-    modelHookAvailable: conversationAccess, unwired,
+    modelBlocked, unwired,
   });
 
   // THE CONSENT BOUNDARY, again. With no key there is no transport, nothing
@@ -747,51 +900,20 @@ export function registerServingPolicy(api, {
       `${PROMPT_OFF_REASON}. ${PROMPT_HOOK_NAME} is not subscribed.`);
   }
 
-  if (!applyModel) {
-    logger?.info?.(
+  // THE MODEL HOOK IS SUBSCRIBED ONLY WHEN THE WHOLE SEAM IS OPEN, and the
+  // sentence the operator reads is the SAME STRING the source reports through
+  // `modelRefusal`. `api.on` accepts a subscription the host will silently
+  // drop, and `providerOverride` is honoured whether or not a provider answers
+  // for the id, so the guarantee has to be the absence of the subscription.
+  if (modelBlocked) {
+    // The kill switch is the operator's own instruction; the rest are things
+    // they would want to know about.
+    const write = modelBlocked === MODEL_OFF_REASON ? logger?.info : logger?.warn;
+    write?.call(logger,
       `[${pluginId}] the approved model is NOT being applied: ` +
-      `${MODEL_OFF_REASON}. ${MODEL_HOOK_NAME} is not subscribed and no ` +
-      "provider is registered.");
-  } else if (!conversationAccess) {
-    // SAID PLAINLY, ONCE. `api.on` accepts the subscription and the host drops
-    // it with a warn-level diagnostic of its own, so without this line a
-    // missing opt-in is indistinguishable from a control plane with nothing to
-    // serve -- the operator would go looking at the wrong end.
-    logger?.warn?.(
-      `[${pluginId}] the approved model is NOT being applied: ` +
-      `${modelHookBlockedReason(pluginId)}.`);
+      `${modelBlocked}. ${MODEL_HOOK_NAME} is not subscribed. The prompt ` +
+      "half is unaffected.");
   } else {
-    // THE PROVIDER, registered before we know whether a model is served:
-    // `providerOverride` names it on a later turn, and a provider registered
-    // at that point would be too late. It answers for nothing until
-    // `appliedModel` is set, and never for anyone else's provider id.
-    if (typeof api.registerProvider === "function") {
-      try {
-        api.registerProvider({
-          id: PROVIDER_ID,
-          label: "PerceptEye Flywheel",
-          // The served endpoint is OpenAI-compatible and may need a key, which
-          // the control plane names rather than this plugin inventing one. An
-          // empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
-          // leaves the host's auth surfaces with nothing to show an operator.
-          auth: [{
-            id: "api_key",
-            label: "API key",
-            kind: "api_key",
-            hint: `Set models.providers.${PROVIDER_ID}.apiKey to the ` +
-              "credential your control plane names for the served endpoint.",
-          }],
-          normalizeTransport: (ctx) => source.normalizeTransport(ctx),
-        });
-      } catch (err) {
-        // A refused provider registration must not take the prompt half, the
-        // turn capture, or the plugin load down with it.
-        logger?.warn?.(
-          `[${pluginId}] the approved model cannot be applied: registering ` +
-          `the provider '${PROVIDER_ID}' failed (${err?.message ?? err}). ` +
-          "The prompt half is unaffected.");
-      }
-    }
     api.on(MODEL_HOOK_NAME, (event, ctx) => {
       try {
         return source.handleModelResolve(event, ctx ?? null);

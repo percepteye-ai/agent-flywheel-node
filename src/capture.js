@@ -128,7 +128,16 @@ export function captureRoot(env = process.env) {
 export function captureVerdict(registration) {
   const capture = registration && typeof registration === "object"
     ? registration.capture : null;
-  if (!capture || typeof capture !== "object") {
+  // `Array.isArray` beside the `typeof` check, because `typeof [] === "object"`
+  // in JavaScript: without it a JSON ARRAY is accepted as a capture block,
+  // finds no `turns` on it, and falls through to "production capture is not
+  // enabled for this agent" -- naming a switch an operator can flip when what
+  // actually happened is that the control plane sent something that is not an
+  // answer. Both branches refuse, so consent was never at risk; the defect was
+  // that the refusal named the wrong cause. Python has always said "the
+  // control plane did not answer" for this body, and the two SDKs owe the same
+  // sentence to the same input.
+  if (!capture || typeof capture !== "object" || Array.isArray(capture)) {
     return {
       mayUpload: false,
       reason:

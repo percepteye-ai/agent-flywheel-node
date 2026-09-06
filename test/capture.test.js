@@ -621,13 +621,12 @@ describe("the agent is registered, so an operator has something to enable", () =
   });
 
   it("sends a registration the control plane will accept", async () => {
-    // Vendored from MissionControl/mission_control/api/flywheel.py --
-    // SUPPORTED_MODES and SUPPORTED_CONTRACT_VERSIONS, which the E2 handler
-    // checks BEFORE anything else and answers 422 on. Vendored rather than
-    // imported for the same reason `config-gate.test.js` vendors the route
-    // set: this package must not import the control plane. A registration that
-    // 422s is indistinguishable, from the operator's side, from no
-    // registration at all.
+    // The modes and contract versions `POST /agents` accepts, which it checks
+    // BEFORE anything else and answers 422 on. Vendored rather than imported
+    // for the same reason `config-gate.test.js` vendors the route set: this
+    // package must not import the control plane. A registration that 422s is
+    // indistinguishable, from the operator's side, from no registration at
+    // all.
     const SUPPORTED_MODES = ["rollout", "production"];
     const SUPPORTED_CONTRACT_VERSIONS = ["flywheel/1"];
 

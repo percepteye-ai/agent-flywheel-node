@@ -79,7 +79,7 @@ import { AttachTransport } from "./transport.js";
 import { PRODUCTION, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
-import { registerServingPolicy } from "./policy.js";
+import { PENDING_ANSWER_REASON, registerServingPolicy } from "./policy.js";
 import { conversationAccessGranted } from "./host.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
@@ -249,28 +249,14 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // `registerServingPolicy` subscribes nothing, and the operator was told
     // otherwise by the line immediately before the silence.
     //
-    // So the three facts that decide it are read HERE, before the claim is
-    // made. `registerServingPolicy` says WHY for each half; this line says
-    // only what happens.
+    // So the claim is READ OFF THE SOURCE, after it has wired itself, rather
+    // than re-derived here. It used to be computed from three facts -- a key,
+    // the kill switch, the conversation opt-in -- and there are more than
+    // three: a host that has no provider surface, or that refuses the provider
+    // id, rules the model half out too, and only `registerServingPolicy` knows
+    // that. A predicate assembled here from a SUBSET of the source's own
+    // inputs is a second answer that drifts the moment a cause is added.
     const conversationAccess = conversationAccessGranted(api, PLUGIN_ID);
-    const willApplyPrompt = config.contributing && config.applyPromptEnabled;
-    const willApplyModel = config.contributing && config.applyModelEnabled
-      && conversationAccess;
-    const applying = [
-      willApplyPrompt ? "the system prompt" : null,
-      willApplyModel ? "the model" : null,
-    ].filter(Boolean);
-    logger?.info?.(
-      `[${PLUGIN_ID}] mode=${config.mode} (from ${config.modeSource}): this ` +
-      `install claims no rollout and starts no turn -- those hooks are not ` +
-      `registered at all. It DOES capture the turns you serve. ` +
-      (applying.length
-        ? `It also applies ${applying.join(" and ")} your control plane has ` +
-          "approved."
-        : "It applies NOTHING your control plane has approved; the next line " +
-          "says why.") +
-      ` Tool outcomes are still recorded locally.`,
-    );
     capture = registerTurnCapture(api, {
       config, turns, pluginId: PLUGIN_ID, logger, env,
     });
@@ -288,6 +274,24 @@ export function register(api, pluginConfig = {}, env = process.env) {
       hostConfig: api?.config,
       conversationAccess,
     });
+    // PENDING is the only value either half can hold here that is not a
+    // settled refusal: the read has not happened yet, so anything else is a
+    // cause that has already ruled that half out.
+    const applying = [
+      serving.refusal === PENDING_ANSWER_REASON ? "the system prompt" : null,
+      serving.modelRefusal === PENDING_ANSWER_REASON ? "the model" : null,
+    ].filter(Boolean);
+    logger?.info?.(
+      `[${PLUGIN_ID}] mode=${config.mode} (from ${config.modeSource}): this ` +
+      `install claims no rollout and starts no turn -- those hooks are not ` +
+      `registered at all. It DOES capture the turns you serve. ` +
+      (applying.length
+        ? `It also applies ${applying.join(" and ")} your control plane has ` +
+          "approved."
+        : "It applies NOTHING your control plane has approved; the lines " +
+          "above say why.") +
+      ` Tool outcomes are still recorded locally.`,
+    );
   }
 
   // The describer answers a different question from the recorder: not "what
