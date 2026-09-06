@@ -7,7 +7,23 @@
 **It keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
 One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
-[![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
+<!-- BADGES — `npm` was a live shields.io version badge and rendered as a red
+     "package not found": percepteye-agent-flywheel is not published to npm
+     (verified against the live registry 2026-09-06). It is the only live-data
+     badge in this README — every other badge here is a hardcoded shields
+     `/badge/` and renders fine — so there is no `ci` badge to fix, and none
+     should be added while this repo is private: shields.io queries GitHub
+     anonymously and a private repo 404s regardless of what CI did.
+
+     ON PUBLISH restore this one verbatim. Do not hand-write a version into a
+     static badge — that asserts a release nothing checks.
+       [![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
+
+     Separately: the `tests` badge below is hardcoded and nothing checks it
+     either; its 362 was true on 2026-09-06. Re-derive with `npm test` (prints
+     "tests 362" / "skipped 0") before trusting it — the Python SDK's equivalent
+     badge had drifted to 54 short. -->
+[![npm](https://img.shields.io/badge/npm-not_yet_published-64748b?style=for-the-badge&logo=npm&logoColor=white)](#-develop)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
