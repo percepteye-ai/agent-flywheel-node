@@ -6,7 +6,7 @@
  * refusing to do the training work it was installed for.
  *
  *   MODE           -- a CLIENT-side deployment switch, `PERCEPTEYE_AGENT_MODE`.
- *                     `training` means this install contributes capacity: it
+ *                     `training` means this install does training work: it
  *                     claims rollouts, hands them to the agent, and reports
  *                     what happened. `production` means it does not.
  *
@@ -97,7 +97,7 @@ function modeFrom(raw, source) {
   if (!Object.hasOwn(MODE_ALIASES, key)) {
     throw new ConfigurationError(
       `${source}${JSON.stringify(String(raw))} is not a mode. Use 'training' ` +
-      `(this process contributes capacity: it claims rollouts and runs them) ` +
+      `(this process does training work: it claims rollouts and runs them) ` +
       `or 'production' (it does not). Recognised spellings: ` +
       `${Object.keys(MODE_ALIASES).sort().join(", ")}.`,
     );
