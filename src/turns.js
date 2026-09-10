@@ -5,14 +5,16 @@
  * ONE FORMAT, TWO IMPLEMENTATIONS. A customer deploys this package or the
  * Python one, never both -- so the two must agree, and the thing that makes
  * them agree cannot be a comment saying so. It is this: a turn is a DIRECTORY
- * named for the turn id, holding at most three files, and both packages write
- * and read exactly these:
+ * named for the turn id, with the shared core files below and two optional
+ * execution-identity files whose names and shapes also match Python:
  *
  *   tool_calls.jsonl   one JSON object per executed tool call  (already ours:
  *                      `trajectory.js` has written it since day one, and it is
  *                      why nothing here reimplements it)
  *   turns.jsonl        {kind:"task"|"answer", text, turn_id, conversation_id}
  *   conversation_id    the conversation this turn belongs to, as bare text
+ *   agent_fingerprint.json  an exact, SDK-reconciled execution fingerprint
+ *   agent_fingerprint.conflict  permanent abstention if writers disagree
  *
  * The Python end is `percepteye_agent_flywheel.outcomes` (`record_turn_text`,
  * `read_turn_text`, `read_conversation_id`) and `production.Attachment._turn_wire`.
@@ -35,9 +37,12 @@ import {
 import { basename, join } from "node:path";
 
 import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
+import { isLowerSha256 } from "./execution-identity.js";
 
 export const TURNS_FILENAME = "turns.jsonl";
 export const CONVERSATION_ID_FILENAME = "conversation_id";
+export const AGENT_FINGERPRINT_FILENAME = "agent_fingerprint.json";
+export const AGENT_FINGERPRINT_CONFLICT_FILENAME = "agent_fingerprint.conflict";
 
 /** The two halves of a turn. Anything else is a programming error. */
 export const TURN_KINDS = ["task", "answer"];
@@ -148,6 +153,83 @@ export function recordConversationId(dir, conversationId) {
   }
 }
 
+/**
+ * Persist an SDK-reconciled identity without letting a second writer relabel
+ * a mixed turn. A conflict marker is monotonic and makes every reader abstain.
+ */
+export function recordExecutionFingerprint(dir, fingerprint) {
+  const digest = fingerprint?.execution_sha256;
+  if (!isLowerSha256(digest)) return false;
+  const expected = { execution_sha256: digest };
+  const sidecar = join(dir, AGENT_FINGERPRINT_FILENAME);
+  const conflict = join(dir, AGENT_FINGERPRINT_CONFLICT_FILENAME);
+  try {
+    mkdirSync(dir, { recursive: true });
+    if (existsSync(conflict)) return false;
+    try {
+      writeFileSync(sidecar, JSON.stringify(expected), { encoding: "utf8", flag: "wx" });
+      return true;
+    } catch (err) {
+      if (err?.code !== "EEXIST") return false;
+    }
+    let current = null;
+    try {
+      current = JSON.parse(readFileSync(sidecar, "utf8"));
+    } catch {
+      current = null;
+    }
+    if (
+      current && typeof current === "object" && !Array.isArray(current)
+      && Object.keys(current).length === 1
+      && current.execution_sha256 === digest
+    ) return true;
+    try {
+      writeFileSync(conflict, "", { encoding: "utf8", flag: "wx" });
+    } catch (err) {
+      if (err?.code !== "EEXIST") return false;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/** Permanently invalidate a turn whose observations disagree. */
+export function recordExecutionFingerprintConflict(dir) {
+  try {
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(join(dir, AGENT_FINGERPRINT_CONFLICT_FILENAME), "", {
+        encoding: "utf8", flag: "wx",
+      });
+    } catch (err) {
+      if (err?.code !== "EEXIST") return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Read only the exact sidecar shape this SDK authors. */
+export function readExecutionFingerprint(dir) {
+  const conflict = join(dir, AGENT_FINGERPRINT_CONFLICT_FILENAME);
+  if (existsSync(conflict)) return null;
+  let value;
+  try {
+    value = JSON.parse(readFileSync(join(dir, AGENT_FINGERPRINT_FILENAME), "utf8"));
+  } catch {
+    return null;
+  }
+  if (
+    !value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).length !== 1
+    || !isLowerSha256(value.execution_sha256)
+    || existsSync(conflict)
+  ) return null;
+  return { execution_sha256: value.execution_sha256 };
+}
+
 /** The conversation this turn declared, or `null`. */
 export function readConversationId(dir) {
   try {
@@ -242,6 +324,8 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
     wire.conversation_id = cid;
     wire.turn_index = turnIndex;
   }
+  const fingerprint = readExecutionFingerprint(dir);
+  if (fingerprint !== null) wire.agent_fingerprint = fingerprint;
   return wire;
 }
 

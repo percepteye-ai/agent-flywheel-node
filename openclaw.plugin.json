@@ -46,6 +46,37 @@
         ],
         "description": "Set false/0/off to stop pointing this agent at the control plane's approved model in production mode. Unset means PERCEPTEYE_APPLY_MODEL, then on. Needs hooks.allowConversationAccess=true to take effect at all."
       },
+      "executionSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "adapterName",
+          "executionIdentityComplete",
+          "executionComponents"
+        ],
+        "properties": {
+          "adapterName": {
+            "type": "string",
+            "minLength": 1
+          },
+          "executionIdentityComplete": {
+            "type": "boolean"
+          },
+          "executionComponents": {
+            "type": "object",
+            "minProperties": 1,
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1
+            },
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "description": "Host-adapter evidence for exact execution identity. Component names are opaque to the SDK; incomplete or invalid evidence emits no identity."
+      },
       "mode": {
         "type": "string",
         "enum": [

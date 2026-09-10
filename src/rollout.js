@@ -75,7 +75,11 @@
  *   so it cannot be detected after the fact and is read from `api.config`
  *   instead, using the host's own predicate.
  *
- * ── WHY WE REFUSE TO CLAIM WITHOUT THE ANSWER CHANNEL ─────────────────────
+ * llm_input / llm_output are available, but they bracket a host attempt
+ * rather than each provider invocation and carry no call id. Tool loops,
+ * retries, and compaction can issue several provider calls inside one
+ * attempt. This adapter therefore makes no llm_call_count claim. A custom
+ * host adapter may inject the generic counter only with true per-call evidence.
  *
  * A claimed rollout is a LEASE on work nobody else can take. Claiming one we
  * cannot report is worse than not claiming it: the task sits unrunnable until
@@ -86,6 +90,7 @@
  */
 import { ConfigurationError } from "./errors.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
+import { createModelCallCounter } from "./model-calls.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 
 export const SESSION_START = "session_start";
@@ -153,7 +158,10 @@ export function taskText(rollout) {
  * constructing an OpenClaw api: `enqueue` is
  * `api.session.workflow.enqueueNextTurnInjection`.
  */
-export function createRolloutDriver({ transport, enqueue, logger = null }) {
+export function createRolloutDriver({
+  transport, enqueue, logger = null, executionIdentity = null,
+  modelCalls = createModelCallCounter(),
+}) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
     throw new ConfigurationError("an enqueue function is required");
@@ -172,6 +180,7 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
    * first left to lapse.
    */
   const claiming = new Set();
+  let warnedMissingModelCallCount = false;
 
   /**
    * Give the work back, typed, and stop tracking it.
@@ -183,6 +192,11 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
    */
   async function giveBack(sessionKey, rollout, reason, detail) {
     inFlight.delete(sessionKey);
+    try {
+      modelCalls?.abandon?.(sessionKey);
+    } catch {
+      /* measurement cleanup must not keep a lease from being returned */
+    }
     try {
       await transport.abandon(rollout, { reason, detail });
     } catch (err) {
@@ -196,6 +210,29 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
   /** Record a rollout as running in `sessionKey`, so `onAgentEnd` reports it. */
   function track(sessionKey, rollout) {
     inFlight.set(sessionKey, rollout);
+    try {
+      modelCalls?.begin?.(sessionKey);
+    } catch {
+      /* the result will be reported without an attested count */
+    }
+  }
+
+  /** Generic adapter seam: one host-proven provider invocation began. */
+  function onModelCallStarted(event, ctx = {}) {
+    try {
+      return modelCalls?.observeStarted?.(event, ctx) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Generic adapter seam: the same host-proven provider invocation ended. */
+  function onModelCallEnded(event, ctx = {}) {
+    try {
+      return modelCalls?.observeEnded?.(event, ctx) === true;
+    } catch {
+      return false;
+    }
   }
 
   async function onSessionStart(event) {
@@ -241,7 +278,7 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
       return null;
     }
 
-    inFlight.set(sessionKey, rollout);
+    track(sessionKey, rollout);
 
     let result;
     try {
@@ -314,6 +351,38 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
     }
 
     const finalText = lastAssistantText(event?.messages);
+    let modelCallMeasurement;
+    try {
+      modelCallMeasurement = modelCalls?.finish?.(sessionKey, event, ctx);
+    } catch (err) {
+      modelCallMeasurement = {
+        count: null,
+        reason: `the model-call observer failed: ${err?.message ?? err}`,
+      };
+    }
+    modelCallMeasurement ??= {
+      count: null,
+      reason: "no independent model-call observer was configured",
+    };
+    if (
+      modelCallMeasurement.count !== null
+      && (!Number.isInteger(modelCallMeasurement.count)
+        || modelCallMeasurement.count < 0)
+    ) {
+      modelCallMeasurement = {
+        count: null,
+        reason: "the model-call observer returned an invalid count",
+      };
+    }
+    if (modelCallMeasurement.count === null && !warnedMissingModelCallCount) {
+      warnedMissingModelCallCount = true;
+      logger?.warn?.(
+        `[percepteye] rollout ${rollout.rolloutId} has no exact, independently ` +
+        `observed model-call count (${modelCallMeasurement.reason}); it will be ` +
+        `reported without llm_call_count and is ineligible for verified ` +
+        `on-policy training.`,
+      );
+    }
     try {
       await transport.report(rollout, {
         finalText,
@@ -321,6 +390,17 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
         // them to the trajectory; asserting zero here would overwrite what it
         // observed with a claim this function cannot make.
         success: event?.success === true ? true : undefined,
+        // Counted from the host's provider-call lifecycle and reconciled by
+        // run/call ids. Never copied from the control plane's gateway.
+        llmCallCount: modelCallMeasurement.count ?? undefined,
+        // SDK-reconciled execution identity only. The tracker returns null on
+        // absent/incomplete adapter evidence or a mixed run, and this lane
+        // never manufactures policy identity from the current serving config.
+        agentFingerprint: (
+          executionIdentity?.consumeFingerprintFor?.(event, ctx)
+          ?? executionIdentity?.fingerprintFor?.(event, ctx)
+          ?? undefined
+        ),
       });
       return rollout;
     } catch (err) {
@@ -365,7 +445,11 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
   // own claiming and turn-starting, but reporting and typed abandon must stay
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
-  return { onSessionStart, onAgentEnd, onSessionEnd, inFlight, track, giveBack };
+  return {
+    onSessionStart, onAgentEnd, onSessionEnd,
+    onModelCallStarted, onModelCallEnded,
+    inFlight, track, giveBack,
+  };
 }
 
 /**
@@ -375,7 +459,9 @@ export function createRolloutDriver({ transport, enqueue, logger = null }) {
  * caller does not branch on mode -- `index.js` decides that -- so there is one
  * place where "may this install claim work" is answered.
  */
-export function registerRolloutDriver(api, { config, transport, pluginId, logger = null }) {
+export function registerRolloutDriver(api, {
+  config, transport, pluginId, logger = null, executionIdentity = null,
+}) {
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
     logger?.info?.(`[${pluginId}] not claiming rollouts: ${verdict.reason}`);
@@ -395,6 +481,7 @@ export function registerRolloutDriver(api, { config, transport, pluginId, logger
     transport,
     enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
     logger,
+    executionIdentity,
   });
 
   // Failures are swallowed at the boundary: a telemetry plugin must never be

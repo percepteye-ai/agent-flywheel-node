@@ -77,7 +77,9 @@ test("the module's config schema is the manifest's, not a second one", () => {
 test("the schema accepts the settings the manifest tells customers to set", () => {
   // The regression that matters: `additionalProperties: false` with no
   // properties refuses apiKey, which is the first thing the manifest documents.
-  for (const key of ["apiKey", "agentId", "controlPlaneUrl", "capture"]) {
+  for (const key of [
+    "apiKey", "agentId", "controlPlaneUrl", "capture", "executionSnapshot",
+  ]) {
     assert.ok(
       key in plugin.configSchema.properties,
       `${key} is documented in the manifest and must be accepted`,

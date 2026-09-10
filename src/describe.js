@@ -10,19 +10,21 @@
  * no graded rollouts, and no dataset. The whole flywheel is downstream of this
  * one fact, and reflection cannot cross a process AND a language boundary.
  *
- * WHY THIS HOOK. `llm_input` is the only place the host offers what a
- * description needs, and it offers it already assembled:
+ * WHY THIS HOOK. `llm_input` offers the post-policy provider/model and the
+ * assembled system prompt without exposing a mutation seam:
  *
  *   systemPrompt  the FULLY ASSEMBLED prompt -- the host's several prompt
  *                 files, concatenated inside the Node process, from sources
  *                 the Python SDK never opens.
  *                 Reading those files ourselves would re-implement the host's
  *                 assembly order and drift from it silently.
- *   tools         the real tool list AS SENT TO THE MODEL. Not the config,
- *                 not the plugin registry -- the actual universe the agent
- *                 could act in on this turn. Nothing else in the host is
- *                 both complete and true at the same moment.
  *   provider,model the model config, resolved after all overrides.
+ *
+ * IMPORTANT ABSENCE. OpenClaw's current PluginHookLlmInputEvent does NOT
+ * contain tools. Older code and tests invented that field and claimed an exact
+ * catalogue the real host could never supply. `buildRecord` still accepts an
+ * adapter-augmented `tools` array for forward compatibility, but the current
+ * host honestly writes `tool_definitions:null` plus an incomplete marker.
  *
  * WHY *THIS FILE* OBSERVES ONLY. The sibling recorder chose `after_tool_call`
  * over `registerAgentToolResultMiddleware` on one rule: capturing evidence
@@ -117,8 +119,8 @@ export const FRAMEWORK = "openclaw";
  * uncaught 500 on registration, 100% of the time, for that agent.
  *
  * This matters here specifically because the payload is not ours. The system
- * prompt is a concatenation of customer-authored markdown files, and
- * `event.tools` is typed `unknown[]` -- arbitrary provider-shaped JSON. A
+ * prompt is a concatenation of customer-authored markdown files, and an
+ * adapter-augmented tool array is arbitrary provider-shaped JSON. A
  * description that cannot be stored is worth less than one missing a field,
  * so we scrub rather than let the registration fail.
  */
@@ -161,9 +163,8 @@ function scrubDeep(value) {
  * then drops entirely. Forward `event.tools` verbatim and the launch gate still
  * opens (the list is truthy) while the catalogue is empty or nameless.
  *
- * `event.tools` is `unknown[]` by contract, so all three shapes are possible
- * from one host depending on provider, and we handle all three rather than
- * betting on the one we saw first.
+ * An optional adapter may supply any of these common shapes, so handle all
+ * three rather than betting on one provider envelope.
  *
  * @returns {{name:string,description:string,input_schema:object,original_format:string}|null}
  */
@@ -261,9 +262,9 @@ export function buildRecord(event, ctx = {}) {
 /**
  * A describer bound to a directory, or an inert one when none is set.
  *
- * WRITE POLICY. `llm_input` fires on every model call, and the tool universe
- * is not constant across them: a sub-agent turn or a post-compaction turn can
- * carry a SUBSET. So we keep the richest catalogue seen rather than the
+ * WRITE POLICY. `llm_input` fires at each host run's assembled model boundary.
+ * If a host adapter supplies tools, its universe may vary across runs: a
+ * sub-agent turn can carry a subset. So we keep the richest catalogue rather than the
  * newest -- last-write-wins would let a narrow sub-agent turn overwrite the
  * agent's real catalogue with a fraction of it, and the result would look
  * perfectly healthy at every layer downstream.
@@ -322,7 +323,7 @@ export function createDescriber({ dir = null, onError = null } = {}) {
  * refusal is a diagnostic on ITS side and our handler simply never fires --
  * so the caller warns at startup instead.
  */
-export function registerDescriber(api, { logger = null } = {}) {
+export function registerDescriber(api, { logger = null, onObservation = null } = {}) {
   if (typeof api?.on !== "function") return null;
 
   const describer = createDescriber({
@@ -334,6 +335,12 @@ export function registerDescriber(api, { logger = null } = {}) {
   });
 
   api.on(DESCRIBE_HOOK_NAME, (event, ctx) => {
+    try {
+      onObservation?.(event, ctx ?? {});
+    } catch {
+      // Identity is an independent projection. It may abstain without costing
+      // the advisory description written below.
+    }
     try {
       describer.handle(event, ctx ?? {});
     } catch {

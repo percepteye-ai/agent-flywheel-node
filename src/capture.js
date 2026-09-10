@@ -69,7 +69,8 @@ import { AttachTransport } from "./transport.js";
 import { CONTRACT_VERSION } from "./wire.js";
 import {
   listTurnDirs, readConversationId, recordConversationId, recordTurnText,
-  safeTurnId, turnDir, turnIndexOf, turnWire,
+  recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
+  turnDir, turnIndexOf, turnWire,
 } from "./turns.js";
 
 /** Turns between automatic upload attempts. The Python SDK's `_FLUSH_EVERY`. */
@@ -230,7 +231,17 @@ export function createTurnCapture({ root, logger = null }) {
     return runId ? turnDir(root, runId) : null;
   }
 
-  return { onMessageReceived, onAgentEnd, resolveToolDir };
+  /** Bind a reconciled identity to this exact host-declared turn. */
+  function onExecutionIdentity(event, ctx = {}, observation) {
+    const runId = event?.runId ?? ctx?.runId;
+    if (!runId || !observation) return false;
+    const dir = turnDir(root, runId);
+    if (observation.conflict) return recordExecutionFingerprintConflict(dir);
+    if (!observation.fingerprint) return false;
+    return recordExecutionFingerprint(dir, observation.fingerprint);
+  }
+
+  return { onMessageReceived, onAgentEnd, onExecutionIdentity, resolveToolDir };
 }
 
 /**

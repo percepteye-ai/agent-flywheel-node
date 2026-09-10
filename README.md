@@ -69,7 +69,7 @@ No container to build. No cluster to run. No GPU to provision. No inbound port t
 |:--|:--|
 | 🔁 **A continual-learning loop** | your agent runs graded tasks, its real outcomes go back, and the next model is trained on *this agent's* work — not a generic benchmark |
 | 🤖 **Autonomous post-training** | task generation, grading, dataset construction, training and promotion happen on our side. You build none of it |
-| 🧪 **Tasks from your real tool surface** | the plugin reads the system prompt your host actually assembled and the tool list actually sent to the model, so the work you're graded on is work you can actually do |
+| 🧪 **Honest discovery** | the plugin reads the assembled prompt and effective model; current OpenClaw does not expose tools on `llm_input`, so the catalogue stays explicitly incomplete instead of being invented |
 | 📈 **Honest telemetry on day one** | your agent's true tool-failure rate, recorded locally, with **no account and no network** |
 | 📡 **Production observability** | capture the turns you actually serve — the user's message, the tool calls, the answer — and turn live traffic into evidence |
 | ✅ **The approved pair, applied** | training co-optimizes a system prompt alongside the model. Once *a person on your side approves each*, your production install runs **both** — the prompt, and the checkpoint it was certified with. No redeploy; one switch each to stop |
@@ -131,7 +131,7 @@ export PERCEPTEYE_API_KEY=pefw_...        # optional — without it, nothing lea
 That setting does **three** jobs, and every one of them is dropped without it. It lets the plugin read your agent's answer (`agent_end`), describe your agent (`llm_input`), and **point your agent at the approved model** (`before_model_resolve`) — OpenClaw classes all three as conversation hooks and drops them for non-bundled plugins unless you opt in. The plugin **refuses to claim work without it** rather than half-working, and says once, at startup, which capability it is missing and why. Applying the approved *prompt* is the one thing that does **not** need it.
 
 > [!TIP]
-> Every setting has both an OpenClaw config key and an environment variable, and config wins over the environment — the full table is under [Configuration](#-configuration).
+> Scalar settings have both an OpenClaw config key and an environment variable, and config wins over the environment. Exact execution evidence is a nested, config-only adapter snapshot. The full table is under [Configuration](#-configuration).
 
 > [!NOTE]
 > **Set `agentId` to the OpenClaw agent this install serves** if your host runs more than one. That name is how the control plane knows the agent *and* how the plugin decides whose approved prompt and model to apply. On a host running a single agent — the ordinary install — there is nothing to disambiguate and you can leave it alone. On a host running several with none of them named, the plugin applies **nothing** and says so at startup, because guessing would swap a bystander's prompt.
@@ -147,11 +147,11 @@ That setting does **three** jobs, and every one of them is dropped without it. I
 
 | beat | what happens | who does the work |
 |:--|:--|:--|
-| **⓪ Describe** | the plugin reads the fully assembled system prompt and the real tool list, and writes `discovered_agent.json` into the rollout's trajectory | automatic |
+| **⓪ Describe** | the plugin records the assembled prompt and effective model; tools remain `null` on the current host API unless an adapter supplies them | automatic, honestly incomplete |
 | **① Claim** | training mode claims one graded task at a time from the control plane | you dial out — no inbound port |
 | **② Run** | the task is delivered into your agent's context, in a dedicated `percepteye-rollout-*` session | your agent, unchanged |
 | **③ Record** | every executed tool call lands as `ok` / `failed` / **`unknown`** | the `after_tool_call` hook |
-| **④ Report** | the trajectory and the agent's answer go back | the plugin |
+| **④ Report** | the trajectory and answer go back; unsupported evidence stays absent | the plugin |
 | **⑤ Train** | tasks generated, rollouts graded, dataset built, policy trained and promoted | **Percepteye — you build none of it** |
 | **⑥ Serve** | the approved system prompt **and** the model it was certified with are applied to your production install automatically, once a person has approved each | the plugin |
 
@@ -172,6 +172,8 @@ That last beat is what makes it a flywheel rather than a pipeline: **the better 
 | **DeepSeek Harness** | ✅ `tools/result` | — | — | — | — |
 
 **Rollouts are the OpenClaw lane.** DeepSeek Harness exposes no seam for handing a task to a running agent, so on dsh this plugin records outcomes and nothing else, in every mode — it writes to `PERCEPTEYE_TRAJECTORY_DIR` and with that unset it writes nothing.
+
+**This OpenClaw adapter does not claim `llm_call_count`.** The host's public `llm_input` / `llm_output` hooks bracket a whole attempt and expose no provider-call id; one attempt may contain tool loops, retries, or compaction and therefore several provider calls. Counting those hooks or assistant messages would be a guess. The plugin reports no count, and Mission Control excludes the rollout from verified on-policy training even when its gateway has its own count. A future host adapter may use the framework-neutral counter only when its host exposes independently identified per-call start and terminal evidence. DeepSeek Harness also makes no model-call-count claim.
 
 **Every recording hook is structurally incapable of altering a run**: OpenClaw's `after_tool_call` returns `void`, and dsh's `tools/result` is `@mode emit` over deep-frozen objects. The tool-result mutation seams both harnesses expose — result middleware, `tools/post` — are deliberately unused, in every mode. A collector that can corrupt the run it is measuring is worse than no collector.
 
@@ -306,7 +308,7 @@ That line is real output from a live OpenClaw run, and it is the same format the
 
 ## ⚙️ Configuration
 
-Everything is settable two ways: in your OpenClaw config under `plugins.entries.percepteye-agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch.
+Scalar settings are settable two ways: in your OpenClaw config under `plugins.entries.percepteye-agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch. The nested execution snapshot is config-only so component names and completeness remain typed rather than being parsed from a shell string.
 
 | config key | environment variable | default | what it decides |
 |:--|:--|:--|:--|
@@ -317,6 +319,9 @@ Everything is settable two ways: in your OpenClaw config under `plugins.entries.
 | `capture` | `PERCEPTEYE_CAPTURE` | on | `0`/`false`/`no`/`off` registers no hooks and records nothing, in either mode |
 | `applyPrompt` | `PERCEPTEYE_APPLY_PROMPT` | on | `0` subscribes no prompt hook and does not fetch the prompt text |
 | `applyModel` | `PERCEPTEYE_APPLY_MODEL` | on | `0` subscribes no model hook and registers no provider |
+| `executionSnapshot` | *(config only)* | *(none)* | opaque SHA-256 components from the host adapter, plus its explicit completeness assertion. The SDK requires an exact prompt/tool/model observation; current OpenClaw omits tools, so it abstains. Missing, invalid, lossy, or conflicting evidence emits no `execution_sha256` |
+
+The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. Component names belong to the adapter; the SDK does not assign them meaning. Do not put `execution_sha256` in that object—the final digest is authored only by SDK reconciliation. It identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`); `PERCEPTEYE_CAPTURE_DIR` overrides just the production turn capture (default `$PERCEPTEYE_HOME/captured`); and `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's outcomes go, which the rollout driver sets per rollout.
 
@@ -354,7 +359,7 @@ One host setting is not ours and has no environment form: `plugins.entries.perce
 ## 🛠 Develop
 
 ```bash
-npm test     # 373 tests, no install step — node:test, zero dependencies
+npm test     # 392 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

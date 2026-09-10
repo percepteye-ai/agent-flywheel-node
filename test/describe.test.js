@@ -25,8 +25,8 @@ function recordIn(dir) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
-/** An `llm_input` event in the shape the host actually emits. */
-const EVENT = {
+/** The exact current OpenClaw PluginHookLlmInputEvent shape. */
+const ACTUAL_EVENT = {
   runId: "run_1",
   sessionId: "sess_1",
   provider: "anthropic",
@@ -35,6 +35,11 @@ const EVENT = {
   prompt: "why is bgp down",
   historyMessages: [],
   imagesCount: 0,
+};
+
+/** A future or customer adapter may augment the event with exact tools. */
+const EVENT = {
+  ...ACTUAL_EVENT,
   tools: [
     { name: "glob", label: "Glob", description: "Find files", parameters: { type: "object", properties: { pattern: { type: "string" } } } },
     { name: "read", description: "Read a file", parameters: { type: "object", properties: {} } },
@@ -119,6 +124,16 @@ describe("null tools means NOT OBSERVED, [] means observed and empty", () => {
     const rec = buildRecord({ systemPrompt: "p" }, {});
     assert.equal(rec.tool_definitions, null);
     assert.ok(rec.incomplete.includes("tool_definitions"));
+  });
+
+  it("keeps the current OpenClaw hook shape explicitly incomplete", () => {
+    const rec = buildRecord(ACTUAL_EVENT, { agentId: "triage-agent" });
+    assert.equal(rec.tool_definitions, null);
+    assert.ok(rec.incomplete.includes("tool_definitions"));
+    assert.deepEqual(rec.discovered_model_config, {
+      provider: "anthropic",
+      model_name: "claude-opus-5",
+    });
   });
 
   it("emits [] when the host sent an empty list", () => {
@@ -241,7 +256,7 @@ describe("the richest catalogue wins, not the newest", () => {
 // calls. Assert the plugin actually subscribes the hook.
 
 describe("the plugin registers the describer", () => {
-  it("subscribes llm_input and writes on it", () => {
+  it("subscribes llm_input and writes honest absence on the current host shape", () => {
     const dir = scratch();
     const handlers = new Map();
     const api = { on: (name, fn) => handlers.set(name, fn), logger: { warn() {} } };
@@ -254,10 +269,11 @@ describe("the plugin registers the describer", () => {
     const saved = process.env.PERCEPTEYE_TRAJECTORY_DIR;
     process.env.PERCEPTEYE_TRAJECTORY_DIR = dir;
     try {
-      handlers.get(DESCRIBE_HOOK_NAME)(EVENT, { agentId: "triage-agent" });
+      handlers.get(DESCRIBE_HOOK_NAME)(ACTUAL_EVENT, { agentId: "triage-agent" });
       const rec = recordIn(dir);
       assert.ok(rec, "no discovered_agent.json was written");
-      assert.deepEqual(rec.tool_definitions.map((t) => t.name), ["glob", "read"]);
+      assert.equal(rec.tool_definitions, null);
+      assert.ok(rec.incomplete.includes("tool_definitions"));
     } finally {
       if (saved === undefined) delete process.env.PERCEPTEYE_TRAJECTORY_DIR;
       else process.env.PERCEPTEYE_TRAJECTORY_DIR = saved;

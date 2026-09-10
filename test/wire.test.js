@@ -55,6 +55,24 @@ describe("null is not an empty list", () => {
   });
 });
 
+describe("model-call count is an attestation", () => {
+  it("preserves an independently observed nonnegative integer", () => {
+    assert.equal(
+      rolloutOutputToWire({ finalText: "done", llmCallCount: 3 }).llm_call_count,
+      3,
+    );
+  });
+
+  it("refuses coercion, fractions, and negative counts", () => {
+    for (const value of ["1", true, 1.5, -1, Number.NaN]) {
+      assert.throws(
+        () => rolloutOutputToWire({ finalText: "done", llmCallCount: value }),
+        /llm_call_count must be a nonnegative integer or null/,
+      );
+    }
+  });
+});
+
 describe("an unknown outcome asserts nothing", () => {
   it("scrubs status_code and body from an unknown call", () => {
     // Leaving either would let a reward function read success out of a field

@@ -24,7 +24,9 @@ import {
 // lanes. Narrowing the list does NOT weaken the claim -- "the driver is never
 // constructed in production" is asserted directly by the production-branch
 // test below, which is the assertion that actually caught a deleted split.
-const ROLLOUT_HOOKS = ["session_start", "session_end", "gateway_start"];
+const ROLLOUT_HOOKS = [
+  "session_start", "session_end", "gateway_start",
+];
 
 /** A host api that records what was subscribed. */
 function fakeApi({ conversationAccess = true, enqueue } = {}) {

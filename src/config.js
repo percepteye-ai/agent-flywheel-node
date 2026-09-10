@@ -91,6 +91,26 @@ export const CONFIG_SCHEMA = {
         "PERCEPTEYE_APPLY_MODEL, then on. Needs " +
         "hooks.allowConversationAccess=true to take effect at all.",
     },
+    executionSnapshot: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "adapterName", "executionIdentityComplete", "executionComponents",
+      ],
+      properties: {
+        adapterName: { type: "string", minLength: 1 },
+        executionIdentityComplete: { type: "boolean" },
+        executionComponents: {
+          type: "object",
+          minProperties: 1,
+          propertyNames: { type: "string", minLength: 1 },
+          additionalProperties: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        },
+      },
+      description:
+        "Host-adapter evidence for exact execution identity. Component names " +
+        "are opaque to the SDK; incomplete or invalid evidence emits no identity.",
+    },
     mode: {
       type: "string",
       enum: [
@@ -182,6 +202,9 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     applyModelEnabled: enabledUnlessOff(
       pluginConfig.applyModel, env.PERCEPTEYE_APPLY_MODEL,
     ),
+    // Adapter-owned opaque evidence. Validation and fail-closed reconciliation
+    // live with the identity code; configuration only transports the snapshot.
+    executionSnapshot: pluginConfig.executionSnapshot ?? null,
     contributing: Boolean(apiKey),
   };
 }

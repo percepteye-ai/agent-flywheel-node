@@ -84,6 +84,7 @@ import { conversationAccessGranted } from "./host.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
 } from "./capture.js";
+import { createExecutionIdentityTracker } from "./execution-identity.js";
 
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
@@ -163,6 +164,18 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
     return null;
   }
+  const executionIdentity = createExecutionIdentityTracker({
+    executionSnapshot: config.executionSnapshot,
+    mode: config.mode,
+    agentId: config.agentId,
+  });
+  if (config.executionSnapshot !== null && !executionIdentity.enabled) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] exact execution identity is disabled: ` +
+      `${executionIdentity.refusal}. Capture continues without an affirmative ` +
+      `execution fingerprint.`,
+    );
+  }
   // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
   //
   // In TRAINING mode a trajectory belongs to one ROLLOUT, and the rollout
@@ -230,6 +243,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
             { agentId: config.agentId },
           )
           : null,
+        executionIdentity,
       });
     } catch (err) {
       logger?.warn?.(
@@ -298,7 +312,18 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // did this call do" but "what IS this agent". See describe.js -- it is the
   // only way a CLI agent can reach `introspection_state = described`, because
   // Python reflection cannot cross a process and a language boundary.
-  const describer = registerDescriber(api, { logger });
+  const describer = registerDescriber(api, {
+    logger,
+    // Identity rides the same observer hook but is independent of description
+    // persistence: it must work in production, where the trajectory env var
+    // is normally absent and the describer writes nothing.
+    onObservation: (event, ctx) => {
+      const observation = executionIdentity.observe(event, ctx ?? {});
+      if (turns && observation) {
+        turns.onExecutionIdentity(event, ctx ?? {}, observation);
+      }
+    },
+  });
 
   // `llm_input` is a CONVERSATION hook, and the host REFUSES to register it
   // for a non-bundled plugin unless the operator sets
@@ -319,7 +344,8 @@ export function register(api, pluginConfig = {}, env = process.env) {
   }
 
   return {
-    recorder, writer, describer, rollouts, capture, serving, mode: config.mode,
+    recorder, writer, describer, rollouts, capture, serving, executionIdentity,
+    mode: config.mode,
   };
 }
 

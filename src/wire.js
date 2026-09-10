@@ -86,9 +86,18 @@ export function rolloutOutputToWire(output) {
   // reader must be able to tell "none omitted" from "the field was missing".
   wire.tool_calls_omitted_count = Number(output.toolCallsOmittedCount ?? 0) || 0;
 
+  if (output.llmCallCount !== undefined && output.llmCallCount !== null) {
+    if (!Number.isInteger(output.llmCallCount) || output.llmCallCount < 0) {
+      throw new ContractError(
+        "llm_call_count must be a nonnegative integer or null",
+      );
+    }
+    wire.llm_call_count = output.llmCallCount;
+  }
+
   for (const [key, value] of [
     ["artifacts", output.artifacts], ["events", output.events],
-    ["timing", output.timing], ["llm_call_count", output.llmCallCount],
+    ["timing", output.timing],
     ["reward", output.reward], ["success", output.success],
     ["agent_fingerprint", output.agentFingerprint],
     ["exclusion", output.exclusion],
