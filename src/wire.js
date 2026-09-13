@@ -10,6 +10,42 @@
  */
 export const CONTRACT_VERSION = "flywheel/1";
 
+/** Runtime mirrors of the production-turn limits published by the schema. */
+export const PRODUCTION_IDENTIFIER_MAX_CHARS = 255;
+export const PRODUCTION_TURN_BATCH_MAX_ITEMS = 64;
+
+const PRODUCTION_IDENTIFIER_RE = /^(?!\s)(?!.*\s$)[^\u0000-\u001F\u007F-\u009F]+$/u;
+const PRODUCTION_TURN_IDENTIFIER_RE = /^(?!\.{1,2}$)(?!\s)(?!.*\s$)(?!.*[\\/])[^\u0000-\u001F\u007F-\u009F]+$/u;
+
+function withinProductionIdentifierLimit(value) {
+  // Python's len() and JSON Schema's maxLength count Unicode code points,
+  // whereas JavaScript's String.length counts UTF-16 code units.
+  return [...value].length <= PRODUCTION_IDENTIFIER_MAX_CHARS;
+}
+
+/** Return an exact opaque production correlation id, or null. Never rewrite. */
+export function productionIdentifier(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && withinProductionIdentifierLimit(value)
+    && PRODUCTION_IDENTIFIER_RE.test(value)
+    ? value
+    : null;
+}
+
+/** Return an exact production id that is also one safe path segment. */
+export function productionTurnIdentifier(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && withinProductionIdentifierLimit(value)
+    && PRODUCTION_TURN_IDENTIFIER_RE.test(value)
+    ? value
+    : null;
+}
+
+/** Agent ids share the turn-id grammar because they also enter URL paths. */
+export const productionAgentIdentifier = productionTurnIdentifier;
+
 /**
  * Every key a report may carry. A CLOSED set, mirroring
  * `contract.py:292 WIRE_KEYS`.
@@ -46,6 +82,7 @@ export function rolloutRequestFromWire(raw) {
   }
   const rolloutId = raw.rollout_id ?? raw.rolloutId;
   if (!rolloutId) throw new ContractError("rollout payload has no rollout_id");
+  const leaseExpiresTs = raw.lease_expires_ts ?? raw.leaseExpiresTs;
   return {
     rolloutId: String(rolloutId),
     turnInput: String(raw.turn_input ?? ""),
@@ -54,6 +91,14 @@ export function rolloutRequestFromWire(raw) {
     artifactsDir: raw.artifacts_dir ?? null,
     deadlineTs: Number(raw.deadline_ts ?? 0) || 0,
     leaseToken: raw.lease_token ?? null,
+    leaseExpiresTs: leaseExpiresTs !== null && leaseExpiresTs !== undefined
+      && Number.isFinite(Number(leaseExpiresTs))
+      ? Number(leaseExpiresTs)
+      : null,
+    metadata: raw.metadata && typeof raw.metadata === "object"
+      && !Array.isArray(raw.metadata)
+      ? raw.metadata
+      : {},
   };
 }
 

@@ -2,6 +2,7 @@
  * The transport, with emphasis on the ONE call that must never be replayed.
  */
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import {
   mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from "node:fs";
@@ -46,7 +47,45 @@ describe("claiming is not replayable", () => {
     const { tx, calls } = t();
     await tx.report({ rolloutId: "r1" }, { finalText: "done" });
     assert.notEqual(calls[0].retryIfAmbiguous, false);
-    assert.equal(calls[0].idempotencyKey, "result-r1");
+    assert.equal(
+      calls[0].idempotencyKey,
+      `result-${createHash("sha256").update("r1").digest("hex")}`,
+    );
+  });
+
+  it("encodes opaque rollout ids in paths and hashes them in headers", async () => {
+    const { tx, calls } = t();
+    const rollout = { rolloutId: "case/a?b% c\n", leaseToken: "lease" };
+    await tx.heartbeat(rollout);
+    await tx.report(rollout, { finalText: "done" });
+    await tx.abandon(rollout, { reason: "cancelled" });
+    assert.deepEqual(calls.map((call) => call.path), [
+      "/rollouts/case%2Fa%3Fb%25%20c%0A/heartbeat",
+      "/rollouts/case%2Fa%3Fb%25%20c%0A/result",
+      "/rollouts/case%2Fa%3Fb%25%20c%0A/abandon",
+    ]);
+    for (const call of calls.slice(1)) {
+      assert.match(call.idempotencyKey, /^(result|abandon)-[0-9a-f]{64}$/);
+      assert.equal(call.idempotencyKey.includes("\n"), false);
+    }
+  });
+
+  it("carries the current lease outside the agent-authored result body", async () => {
+    const { tx, calls } = t();
+    await tx.report(
+      { rolloutId: "r1", leaseToken: "lease-1" },
+      { finalText: "done", agentFingerprint: { execution_sha256: "a".repeat(64) } },
+    );
+    assert.deepEqual(calls[0].headers, {
+      "X-Percepteye-Lease-Token": "lease-1",
+    });
+    assert.equal("lease_token" in calls[0].jsonBody, false);
+  });
+
+  it("keeps ordinary reports without a server lease compatible", async () => {
+    const { tx, calls } = t();
+    await tx.report({ rolloutId: "r1" }, { finalText: "done" });
+    assert.equal(calls[0].headers, null);
   });
 
   it("clamps the batch size to the server's bounds", async () => {
@@ -55,6 +94,25 @@ describe("claiming is not replayable", () => {
     assert.equal(calls[0].jsonBody.max, 16);
     await tx.claim(0);
     assert.equal(calls[1].jsonBody.max, 1);
+  });
+
+  it("clamps requested wait and lease durations to the server contract", async () => {
+    const calls = [];
+    const low = new AttachTransport(
+      { request: (_m, _p, opts) => { calls.push(opts); return { rollouts: [] }; } },
+      { agentId: "goose", waitMs: -1, leaseMs: 1 },
+    );
+    await low.claim(1);
+    assert.equal(calls[0].jsonBody.wait_ms, 0);
+    assert.equal(calls[0].jsonBody.lease_ms, 1_000);
+
+    const high = new AttachTransport(
+      { request: (_m, _p, opts) => { calls.push(opts); return { rollouts: [] }; } },
+      { agentId: "goose", waitMs: 90_000, leaseMs: 9_000_000 },
+    );
+    await high.claim(1);
+    assert.equal(calls[1].jsonBody.wait_ms, 25_000);
+    assert.equal(calls[1].jsonBody.lease_ms, 1_800_000);
   });
 
   it("parses rollouts through the wire contract", async () => {
@@ -117,6 +175,33 @@ describe("registration", () => {
   it("requires an agentId at construction", () => {
     assert.throws(() => new AttachTransport({}, {}));
   });
+
+  it("binds later claims only after an exact registration succeeds", async () => {
+    const { tx, calls } = t({ "/rollouts/claim": { rollouts: [] } });
+    const execution = "a".repeat(64);
+    await tx.register({
+      agent_id: "goose", mode: "rollout", agent_execution_sha256: execution,
+    });
+    await tx.claim(1);
+    assert.equal(calls[1].jsonBody.agent_execution_sha256, execution);
+  });
+
+  it("does not invent an identity for a legacy registration", async () => {
+    const { tx, calls } = t({ "/rollouts/claim": { rollouts: [] } });
+    await tx.register({ agent_id: "goose", mode: "rollout" });
+    await tx.claim(1);
+    assert.equal("agent_execution_sha256" in calls[1].jsonBody, false);
+  });
+
+  it("does not activate identity when registration fails", async () => {
+    const { tx } = t({ "/agents": new Error("registration refused") });
+    await assert.rejects(() => tx.register({
+      agent_id: "goose",
+      mode: "rollout",
+      agent_execution_sha256: "a".repeat(64),
+    }));
+    assert.equal(tx.agentExecutionSha256, null);
+  });
 });
 
 describe("the turn-upload wire", () => {
@@ -156,12 +241,53 @@ describe("the turn-upload wire", () => {
       return calls[0].idempotencyKey;
     };
     // Key order must not matter: Python sorts.
-    assert.equal(await key([{ b: 1, a: 2 }]), await key([{ a: 2, b: 1 }]));
+    assert.equal(
+      await key([{ turn_id: "t1", b: 1, a: 2 }]),
+      await key([{ turn_id: "t1", a: 2, b: 1 }]),
+    );
     // Non-ASCII must fold to \uXXXX, so these differ from their escaped forms
     // only if the folding is absent. Assert against a KNOWN Python digest.
     const nonAscii = await key([{ turn_id: "t1", final_text: "mañana — 📦" }]);
     assert.equal(nonAscii, PY_NON_ASCII_KEY,
       "the non-ASCII digest no longer matches json.dumps(ensure_ascii=True)");
+  });
+
+  it("refuses wire-invalid identifiers and batch sizes before sending", () => {
+    const calls = [];
+    const tx = new AttachTransport(
+      { request: (...args) => calls.push(args) },
+      { agentId: "a1" },
+    );
+    assert.throws(
+      () => tx.reportTurns("customer/team", [{ turn_id: "t1" }]),
+      /agent_id/,
+    );
+    assert.throws(
+      () => tx.reportTurns("a1", [{ turn_id: "../escape" }]),
+      /turn_id/,
+    );
+    assert.throws(
+      () => tx.reportTurns("a1", [{ turn_id: "t1", task_id: " padded" }]),
+      /task_id/,
+    );
+    assert.throws(
+      () => tx.reportTurns("a1", []),
+      /between 1 and 64/,
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("escapes opaque agent ids in the idempotency key", async () => {
+    const calls = [];
+    const agentId = "customer team-über!";
+    await new AttachTransport(
+      { request: (_method, _path, opts) => calls.push(opts) },
+      { agentId },
+    ).reportTurns(agentId, [{ turn_id: "t1" }]);
+    assert.match(
+      calls[0].idempotencyKey,
+      /^turns-customer%20team-%C3%BCber%21-[0-9a-f]{32}$/,
+    );
   });
 });
 
@@ -334,11 +460,21 @@ describe("the capture verdict read", () => {
     assert.equal(out.capture.turns, true);
   });
 
-  it("escapes an agent id that would otherwise change the path", async () => {
+  it("does not send a verdict request for an invalid agent id", async () => {
+    const calls = [];
+    const out = await new AttachTransport(
+      { request: (m, p) => calls.push(p) }, { agentId: "a" },
+    )
+      .captureCurrent("a/../b");
+    assert.deepEqual(out, {});
+    assert.deepEqual(calls, []);
+  });
+
+  it("escapes a valid opaque agent id without changing the path", async () => {
     const calls = [];
     await new AttachTransport({ request: (m, p) => calls.push(p) }, { agentId: "a" })
-      .captureCurrent("a/../b");
-    assert.ok(!calls[0].includes("/../"), calls[0]);
+      .captureCurrent("agent 猫");
+    assert.equal(calls[0], "/agents/agent%20%E7%8C%AB/capture");
   });
 
   it("FAILS CLOSED when the control plane cannot be reached", async () => {

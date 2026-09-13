@@ -11,8 +11,11 @@
  *   tool_calls.jsonl   one JSON object per executed tool call  (already ours:
  *                      `trajectory.js` has written it since day one, and it is
  *                      why nothing here reimplements it)
- *   turns.jsonl        {kind:"task"|"answer", text, turn_id, conversation_id}
+ *   turns.jsonl        {kind:"task"|"answer", text, turn_id,
+ *                       conversation_id, task_id}
  *   conversation_id    the conversation this turn belongs to, as bare text
+ *   task_id            caller-authored case/work-item correlation, as text
+ *   task_id.conflict   monotonic abstention when two task bindings disagree
  *   agent_fingerprint.json  an exact, SDK-reconciled execution fingerprint
  *   agent_fingerprint.conflict  permanent abstention if writers disagree
  *
@@ -38,9 +41,14 @@ import { basename, join } from "node:path";
 
 import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
 import { isLowerSha256 } from "./execution-identity.js";
+import {
+  ContractError, productionIdentifier, productionTurnIdentifier,
+} from "./wire.js";
 
 export const TURNS_FILENAME = "turns.jsonl";
 export const CONVERSATION_ID_FILENAME = "conversation_id";
+export const TASK_ID_FILENAME = "task_id";
+export const TASK_ID_CONFLICT_FILENAME = "task_id.conflict";
 export const AGENT_FINGERPRINT_FILENAME = "agent_fingerprint.json";
 export const AGENT_FINGERPRINT_CONFLICT_FILENAME = "agent_fingerprint.conflict";
 
@@ -84,28 +92,22 @@ function truncateChars(text) {
 
 /** One turn's directory. The directory name IS the turn id. */
 export function turnDir(root, turnId) {
-  return join(root, safeTurnId(turnId));
+  const exact = safeTurnId(turnId);
+  if (exact === null) {
+    throw new ContractError("turn id does not match the production identifier grammar");
+  }
+  return join(root, exact);
 }
 
 /**
  * A turn id is host-supplied, and it becomes a path segment.
  *
- * Mirrors `session.js:safeSegment` in intent -- a `runId` that contained a
- * separator would write outside the root. Kept as its own function because
- * this one must never change shape: the segment IS the turn id on the wire,
- * so a rename here silently re-identifies turns.
+ * Valid opaque ids are preserved byte-for-byte. Invalid values return null;
+ * the host adapter can then mint a fresh id for that run rather than silently
+ * cleaning two different caller ids into the same directory name.
  */
 export function safeTurnId(value) {
-  const cleaned = [...String(value ?? "")]
-    .filter((c) => /[A-Za-z0-9_.-]/.test(c)).join("").slice(0, 200);
-  // A NAME OF ONLY DOTS IS NOT A NAME. `.` is in the allowed set so an id like
-  // `run.1` survives intact -- and that is exactly what let `..` through the
-  // filter unchanged, making `join(root, "..")` the PARENT of the capture
-  // root. `session.js:safeSegment` never had this hole because it does not
-  // allow dots at all; adding them here re-opened it, and a test asserting the
-  // property rather than probing the filesystem is what caught it.
-  if (/^\.*$/.test(cleaned)) return "unknown";
-  return cleaned || "unknown";
+  return productionTurnIdentifier(value);
 }
 
 /**
@@ -142,15 +144,52 @@ export function recordTurnText(dir, kind, text, ids = {}) {
 
 /** Record which conversation this turn belongs to. Idempotent, never throws. */
 export function recordConversationId(dir, conversationId) {
-  if (!conversationId) return false;
+  const exact = productionIdentifier(conversationId);
+  if (exact === null) return false;
   try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, CONVERSATION_ID_FILENAME),
-                  String(conversationId), "utf8");
+                  exact, "utf8");
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Persist one caller-authored task/case correlation without relabelling a
+ * mixed turn. This is neutral evidence only; it grants no training meaning.
+ */
+export function recordTaskId(dir, taskId) {
+  const exact = productionIdentifier(taskId);
+  if (exact === null) return false;
+  const sidecar = join(dir, TASK_ID_FILENAME);
+  const conflict = join(dir, TASK_ID_CONFLICT_FILENAME);
+  try {
+    mkdirSync(dir, { recursive: true });
+    if (existsSync(conflict)) return false;
+    try {
+      writeFileSync(sidecar, exact, { encoding: "utf8", flag: "wx" });
+      return true;
+    } catch (err) {
+      if (err?.code !== "EEXIST") return false;
+    }
+    let current = null;
+    try {
+      current = readFileSync(sidecar, "utf8");
+    } catch {
+      current = null;
+    }
+    if (current === exact) return true;
+    try {
+      writeFileSync(conflict, "", { encoding: "utf8", flag: "wx" });
+    } catch (err) {
+      if (err?.code !== "EEXIST") return false;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 /**
@@ -233,10 +272,24 @@ export function readExecutionFingerprint(dir) {
 /** The conversation this turn declared, or `null`. */
 export function readConversationId(dir) {
   try {
-    return readFileSync(join(dir, CONVERSATION_ID_FILENAME), "utf8").trim() || null;
+    const raw = readFileSync(join(dir, CONVERSATION_ID_FILENAME), "utf8");
+    return productionIdentifier(raw) === raw ? raw : null;
   } catch {
     return null;
   }
+}
+
+/** Read an exact, non-conflicting task binding, or null. */
+export function readTaskId(dir) {
+  const conflict = join(dir, TASK_ID_CONFLICT_FILENAME);
+  if (existsSync(conflict)) return null;
+  let raw;
+  try {
+    raw = readFileSync(join(dir, TASK_ID_FILENAME), "utf8");
+  } catch {
+    return null;
+  }
+  return productionIdentifier(raw) === raw && !existsSync(conflict) ? raw : null;
 }
 
 /**
@@ -294,17 +347,24 @@ export function readTurnText(dir) {
  *   file absent             -> null  (nothing was recorded for it)
  */
 export function turnWire(dir, { turnIndex = 0 } = {}) {
+  const turnId = productionTurnIdentifier(basename(dir));
+  if (turnId === null) {
+    throw new ContractError(
+      "captured turn id is not representable on the flywheel/1 wire",
+    );
+  }
   const text = readTurnText(dir) || {};
   const { calls, malformed } = readTrajectory(dir);
   const answer = text.answer ?? null;
   const task = text.task ?? null;
+  const taskId = readTaskId(dir);
 
   let toolCalls;
   if (calls && calls.length) toolCalls = calls;
   else if (existsSync(join(dir, TOOL_CALLS_FILENAME))) toolCalls = [];
   else toolCalls = null;
 
-  if (!task && !answer && !(toolCalls && toolCalls.length)) return null;
+  if (!task && !answer && !(toolCalls && toolCalls.length) && !taskId) return null;
 
   const wire = {
     // `basename`, not `split("/")`. The turn id is the DIRECTORY NAME, and on
@@ -313,7 +373,7 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
     // the wire as the turn id, and it could never match the bare `d.name` that
     // `createTurnUploader` writes into `.uploaded` -- so no turn was ever
     // considered uploaded and every flush re-sent the entire capture root.
-    turn_id: basename(dir),
+    turn_id: turnId,
     input_text: task,
     final_text: answer,
     tool_calls: toolCalls,
@@ -324,6 +384,7 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
     wire.conversation_id = cid;
     wire.turn_index = turnIndex;
   }
+  if (taskId) wire.task_id = taskId;
   const fingerprint = readExecutionFingerprint(dir);
   if (fingerprint !== null) wire.agent_fingerprint = fingerprint;
   return wire;

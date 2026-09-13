@@ -59,16 +59,18 @@
  * inventing the user's message from the model's prompt would be manufacturing
  * the one field we cannot observe.
  */
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
-import { percepteyeHome, safeSegment } from "./session.js";
+import { percepteyeHome } from "./session.js";
 import { AttachTransport } from "./transport.js";
-import { CONTRACT_VERSION } from "./wire.js";
+import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
 import {
-  listTurnDirs, readConversationId, recordConversationId, recordTurnText,
+  listTurnDirs, readConversationId, readTaskId, recordConversationId,
+  recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
   turnDir, turnIndexOf, turnWire,
 } from "./turns.js";
@@ -164,13 +166,40 @@ export function captureVerdict(registration) {
 /**
  * The turn store: three hooks in, turn directories out.
  *
- * Holds no per-turn state. Everything a turn needs is on the event that
- * carries it, keyed by `runId`, so there is no pending map to leak in a
- * long-lived gateway and nothing to lose if the process restarts mid-turn --
- * the directory is already on disk.
+ * Exact host ids need no in-memory state. An invalid host id gets a fresh
+ * storage-safe id instead of being rewritten; that one exceptional mapping is
+ * bounded and exists only to keep the same run's observer hooks joined.
  */
 export function createTurnCapture({ root, logger = null }) {
   let warned = false;
+  // Invalid host ids are never cleaned into a different caller id. They get a
+  // fresh safe id, retained only long enough to keep this run's hooks joined.
+  const generatedTurnIds = new Map();
+  const turnIdFor = (value) => {
+    const exact = safeTurnId(value);
+    if (exact !== null) return exact;
+    if (value === null || value === undefined || String(value).length === 0) {
+      return null;
+    }
+    // Map keys retain primitive value and object identity; stringifying an
+    // invalid host value would collapse every object to "[object Object]".
+    const key = value;
+    let generated = generatedTurnIds.get(key);
+    if (!generated) {
+      generated = `t_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+      generatedTurnIds.set(key, generated);
+      while (generatedTurnIds.size > 4096) {
+        generatedTurnIds.delete(generatedTurnIds.keys().next().value);
+      }
+    }
+    return generated;
+  };
+  const taskIdFrom = (event, ctx) => productionIdentifier(
+    event?.taskId ?? event?.task_id ?? ctx?.taskId ?? ctx?.task_id,
+  );
+  const conversationIdFrom = (event, ctx) => productionIdentifier(
+    event?.sessionKey ?? ctx?.sessionKey,
+  );
   const warnOnce = (err) => {
     if (warned) return;
     warned = true;
@@ -184,17 +213,22 @@ export function createTurnCapture({ root, logger = null }) {
   function onMessageReceived(event, ctx = {}) {
     const runId = event?.runId ?? ctx?.runId;
     const text = event?.content;
-    if (!runId || typeof text !== "string" || !text.trim()) return false;
-    const conversationId = safeSegment(event?.sessionKey ?? ctx?.sessionKey ?? "");
-    const dir = turnDir(root, runId);
+    const turnId = turnIdFor(runId);
+    if (turnId === null) return false;
+    const conversationId = conversationIdFrom(event, ctx);
+    const taskId = taskIdFrom(event, ctx);
+    const dir = turnDir(root, turnId);
     try {
-      if (conversationId && conversationId !== "unknown") {
-        recordConversationId(dir, conversationId);
-      }
-      return recordTurnText(dir, "task", text, {
-        turn_id: safeTurnId(runId),
-        conversation_id: conversationId,
+      const wroteConversation = conversationId
+        ? recordConversationId(dir, conversationId) : false;
+      const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
+      const effectiveTaskId = readTaskId(dir);
+      const wroteText = recordTurnText(dir, "task", text, {
+        turn_id: turnId,
+        conversation_id: conversationId ?? "",
+        task_id: effectiveTaskId ?? "",
       });
+      return wroteConversation || wroteTaskId || wroteText;
     } catch (err) {
       warnOnce(err);
       return false;
@@ -204,14 +238,23 @@ export function createTurnCapture({ root, logger = null }) {
   /** The agent's answer. */
   function onAgentEnd(event, ctx = {}) {
     const runId = event?.runId ?? ctx?.runId;
-    if (!runId) return false;
+    const turnId = turnIdFor(runId);
+    if (turnId === null) return false;
+    const dir = turnDir(root, turnId);
+    const conversationId = conversationIdFrom(event, ctx);
+    const taskId = taskIdFrom(event, ctx);
+    const wroteConversation = conversationId
+      ? recordConversationId(dir, conversationId) : false;
+    const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
     const text = lastAssistantText(event?.messages);
-    if (!text) return false;
+    if (!text) return wroteConversation || wroteTaskId;
     try {
-      return recordTurnText(turnDir(root, runId), "answer", text, {
-        turn_id: safeTurnId(runId),
-        conversation_id: readConversationId(turnDir(root, runId)) || "",
+      const wroteText = recordTurnText(dir, "answer", text, {
+        turn_id: turnId,
+        conversation_id: readConversationId(dir) ?? "",
+        task_id: readTaskId(dir) ?? "",
       });
+      return wroteConversation || wroteTaskId || wroteText;
     } catch (err) {
       warnOnce(err);
       return false;
@@ -228,14 +271,22 @@ export function createTurnCapture({ root, logger = null }) {
    */
   function resolveToolDir(callCtx) {
     const runId = callCtx?.runId;
-    return runId ? turnDir(root, runId) : null;
+    const turnId = turnIdFor(runId);
+    if (turnId === null) return null;
+    const dir = turnDir(root, turnId);
+    const taskId = taskIdFrom(null, callCtx);
+    if (taskId) recordTaskId(dir, taskId);
+    const conversationId = conversationIdFrom(null, callCtx);
+    if (conversationId) recordConversationId(dir, conversationId);
+    return dir;
   }
 
   /** Bind a reconciled identity to this exact host-declared turn. */
   function onExecutionIdentity(event, ctx = {}, observation) {
     const runId = event?.runId ?? ctx?.runId;
-    if (!runId || !observation) return false;
-    const dir = turnDir(root, runId);
+    const turnId = turnIdFor(runId);
+    if (turnId === null || !observation) return false;
+    const dir = turnDir(root, turnId);
     if (observation.conflict) return recordExecutionFingerprintConflict(dir);
     if (!observation.fingerprint) return false;
     return recordExecutionFingerprint(dir, observation.fingerprint);

@@ -140,4 +140,25 @@ describe("bodies", () => {
     assert.equal(seen[0].init.headers["Idempotency-Key"], "k1");
     assert.equal(seen[1].init.headers["Idempotency-Key"], undefined);
   });
+  it("adds per-request evidence without replacing client-owned headers", async () => {
+    const { c, seen } = client([{ status: 200, body: "{}" }]);
+    await c.request("POST", "/rollouts/r1/result", {
+      headers: { "X-Percepteye-Lease-Token": "lease-1" },
+    });
+    assert.equal(
+      seen[0].init.headers["X-Percepteye-Lease-Token"], "lease-1",
+    );
+    assert.equal(seen[0].init.headers.Authorization, "Bearer pefw_k");
+    assert.equal(seen[0].init.headers["Contract-Version"], "flywheel/1");
+  });
+  it("refuses case-insensitive overrides of client-owned headers", async () => {
+    const { c, seen } = client([{ status: 200, body: "{}" }]);
+    await assert.rejects(
+      () => c.request("GET", "/health", {
+        headers: { authorization: "Bearer attacker-selected" },
+      }),
+      /owned by the control-plane client/,
+    );
+    assert.equal(seen.length, 0, "an override reached fetch");
+  });
 });

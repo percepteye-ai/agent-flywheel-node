@@ -16,7 +16,12 @@
  */
 import { createHash } from "node:crypto";
 
-import { rolloutOutputToWire, rolloutRequestFromWire } from "./wire.js";
+import { isLowerSha256 } from "./execution-identity.js";
+import {
+  ContractError, PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
+  productionIdentifier, productionTurnIdentifier, rolloutOutputToWire,
+  rolloutRequestFromWire,
+} from "./wire.js";
 
 /**
  * `json.dumps(value, sort_keys=True)`, in JavaScript -- for STRINGS, BOOLEANS,
@@ -96,17 +101,51 @@ function pyStr(s) {
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
 
+/** `urllib.parse.quote(value, safe="-._~")`, for cross-SDK keys. */
+function quoteIdentifier(value) {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+/** One opaque, control-plane-authored rollout id as a safe URL segment. */
+function rolloutPath(rollout, suffix) {
+  const rolloutId = rollout?.rolloutId;
+  if (typeof rolloutId !== "string" || !rolloutId) {
+    throw new ContractError("rollout_id must be a non-empty string");
+  }
+  try {
+    return `/rollouts/${quoteIdentifier(rolloutId)}/${suffix}`;
+  } catch {
+    throw new ContractError("rollout_id contains invalid Unicode");
+  }
+}
+
+/** Bounded, header-safe idempotency identity for an opaque rollout id. */
+function rolloutOperationKey(operation, rollout) {
+  const rolloutId = rollout?.rolloutId;
+  if (typeof rolloutId !== "string" || !rolloutId) {
+    throw new ContractError("rollout_id must be a non-empty string");
+  }
+  const digest = createHash("sha256").update(rolloutId, "utf8").digest("hex");
+  return `${operation}-${digest}`;
+}
+
 export class AttachTransport {
   /**
    * @param {import("./http.js").ControlPlaneClient} client
    * @param {{agentId: string, waitMs?: number, leaseMs?: number}} opts
    */
-  constructor(client, { agentId, waitMs = 5000, leaseMs = 300_000 } = {}) {
+  constructor(client, { agentId, waitMs = 5000, leaseMs = 1_800_000 } = {}) {
     if (!agentId) throw new Error("agentId is required");
     this._c = client;
     this.agentId = agentId;
-    this.waitMs = waitMs;
-    this.leaseMs = leaseMs;
+    this.waitMs = clampInt(waitMs, 0, 25_000);
+    this.leaseMs = clampInt(leaseMs, 1_000, 1_800_000);
+    // Activated only after an authenticated registration succeeds. A failed
+    // or legacy registration cannot make this worker claim an exact identity.
+    this.agentExecutionSha256 = null;
   }
 
   health() {
@@ -122,11 +161,16 @@ export class AttachTransport {
    * The payload is built by its caller, `capture.js:enrol`, which is where
    * the three-state `discovered_agent` decision is made and explained.
    */
-  register(spec) {
-    return this._c.request("POST", "/agents", {
+  async register(spec) {
+    const response = await this._c.request("POST", "/agents", {
       jsonBody: spec,
-      idempotencyKey: `reg-${this.agentId}`,
+      idempotencyKey: `reg-${quoteIdentifier(this.agentId)}`,
     });
+    const executionSha = spec?.agent_execution_sha256;
+    this.agentExecutionSha256 = isLowerSha256(executionSha)
+      ? executionSha
+      : null;
+    return response;
   }
 
   /**
@@ -182,13 +226,17 @@ export class AttachTransport {
    * that provably never reached the server is retried.
    */
   async claim(maxRollouts) {
+    const jsonBody = {
+      agent_id: this.agentId,
+      max: clampInt(maxRollouts, 1, 16),
+      wait_ms: this.waitMs,
+      lease_ms: this.leaseMs,
+    };
+    if (this.agentExecutionSha256 !== null) {
+      jsonBody.agent_execution_sha256 = this.agentExecutionSha256;
+    }
     const body = await this._c.request("POST", "/rollouts/claim", {
-      jsonBody: {
-        agent_id: this.agentId,
-        max: clampInt(maxRollouts, 1, 16),
-        wait_ms: this.waitMs,
-        lease_ms: this.leaseMs,
-      },
+      jsonBody,
       idempotencyKey: crypto.randomUUID(),
       timeoutMs: this.waitMs + 10_000,
       retryIfAmbiguous: false,
@@ -221,6 +269,7 @@ export class AttachTransport {
    * says so.
    */
   async captureCurrent(agentId) {
+    if (productionAgentIdentifier(agentId) === null) return {};
     try {
       return (await this._c.request(
         "GET", `/agents/${encodeURIComponent(agentId)}/capture`)) || {};
@@ -246,13 +295,49 @@ export class AttachTransport {
    * the collapse for whichever customer happened to switch harnesses.
    */
   reportTurns(agentId, turns) {
+    if (productionAgentIdentifier(agentId) === null) {
+      throw new ContractError(
+        "production turn agent_id does not match the published production agent identifier grammar",
+      );
+    }
+    if (
+      !Array.isArray(turns)
+      || turns.length < 1
+      || turns.length > PRODUCTION_TURN_BATCH_MAX_ITEMS
+    ) {
+      throw new ContractError(
+        `production turn batches must contain between 1 and ${PRODUCTION_TURN_BATCH_MAX_ITEMS} turns`,
+      );
+    }
+    turns.forEach((turn, index) => {
+      if (!turn || typeof turn !== "object" || Array.isArray(turn)) {
+        throw new ContractError(`production turn ${index} must be an object`);
+      }
+      if (productionTurnIdentifier(turn.turn_id) === null) {
+        throw new ContractError(`production turn ${index} has an invalid turn_id`);
+      }
+      if (
+        Object.hasOwn(turn, "conversation_id")
+        && productionIdentifier(turn.conversation_id) === null
+      ) {
+        throw new ContractError(
+          `production turn ${index} has an invalid conversation_id`,
+        );
+      }
+      if (
+        Object.hasOwn(turn, "task_id")
+        && productionIdentifier(turn.task_id) === null
+      ) {
+        throw new ContractError(`production turn ${index} has an invalid task_id`);
+      }
+    });
     const digest = createHash("sha256")
       .update(stableStringify(turns))
       .digest("hex")
       .slice(0, 32);
     return this._c.request("POST", "/turns", {
       jsonBody: { agent_id: agentId, turns },
-      idempotencyKey: `turns-${agentId}-${digest}`,
+      idempotencyKey: `turns-${quoteIdentifier(agentId)}-${digest}`,
     });
   }
 
@@ -261,7 +346,7 @@ export class AttachTransport {
    *
    * A REQUIREMENT ON WHOEVER HOLDS THE ROLLOUT, not an optional ping. The
    * control plane reaps a lease that stops being renewed and requeues the work
-   * while attempts remain, so a rollout that outlives `leaseMs` -- 5 minutes by
+   * while attempts remain, so a rollout that outlives `leaseMs` -- 30 minutes by
    * default, routine for a multi-tool task -- is handed to somebody else while
    * this process is still working on it. The result then lands against a lease
    * this process no longer owns: `report` is answered for an attempt that was
@@ -280,7 +365,7 @@ export class AttachTransport {
     };
     if (progress) payload.progress = progress;
     return this._c.request(
-      "POST", `/rollouts/${rollout.rolloutId}/heartbeat`, { jsonBody: payload },
+      "POST", rolloutPath(rollout, "heartbeat"), { jsonBody: payload },
     );
   }
 
@@ -290,9 +375,12 @@ export class AttachTransport {
    * double-counted -- which is why this one keeps ambiguous retries ON.
    */
   report(rollout, output) {
-    return this._c.request("POST", `/rollouts/${rollout.rolloutId}/result`, {
+    return this._c.request("POST", rolloutPath(rollout, "result"), {
       jsonBody: rolloutOutputToWire(output),
-      idempotencyKey: `result-${rollout.rolloutId}`,
+      idempotencyKey: rolloutOperationKey("result", rollout),
+      headers: rollout.leaseToken
+        ? { "X-Percepteye-Lease-Token": rollout.leaseToken }
+        : null,
     });
   }
 
@@ -306,9 +394,9 @@ export class AttachTransport {
    */
   abandon(rollout, { reason, detail = "" }) {
     if (!reason) throw new Error("abandon requires a typed reason");
-    return this._c.request("POST", `/rollouts/${rollout.rolloutId}/abandon`, {
+    return this._c.request("POST", rolloutPath(rollout, "abandon"), {
       jsonBody: { lease_token: rollout.leaseToken, reason, detail },
-      idempotencyKey: `abandon-${rollout.rolloutId}`,
+      idempotencyKey: rolloutOperationKey("abandon", rollout),
     });
   }
 

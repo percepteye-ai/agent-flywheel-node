@@ -88,14 +88,19 @@
  * at report time -- and when it is missing the operator gets one line naming
  * the exact setting, instead of a queue that quietly stops moving.
  */
-import { ConfigurationError } from "./errors.js";
+import { ConfigurationError, LeaseLost } from "./errors.js";
+import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
+import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
+import { CONTRACT_VERSION } from "./wire.js";
 
 export const SESSION_START = "session_start";
 export const SESSION_END = "session_end";
 export const AGENT_END = "agent_end";
+export const BEFORE_AGENT_RUN = "before_agent_run";
+export const BEFORE_TOOL_CALL = "before_tool_call";
 export const GATEWAY_START = "gateway_start";
 export const GATEWAY_STOP = "gateway_stop";
 
@@ -159,16 +164,48 @@ export function taskText(rollout) {
  * `api.session.workflow.enqueueNextTurnInjection`.
  */
 export function createRolloutDriver({
-  transport, enqueue, logger = null, executionIdentity = null,
+  transport, enqueue, cancel = null, logger = null, executionIdentity = null,
   modelCalls = createModelCallCounter(),
+  heartbeatScheduler = (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  heartbeatCanceller = (timer) => clearTimeout(timer),
+  now = () => Date.now(),
 }) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
     throw new ConfigurationError("an enqueue function is required");
   }
+  if (cancel !== null && typeof cancel !== "function") {
+    throw new ConfigurationError("cancel must be a function when supplied");
+  }
 
   /** sessionKey -> the rollout this session is running. */
   const inFlight = new Map();
+  /** sessionKey -> fixed-cadence lease renewal for its current rollout. */
+  const heartbeats = new Map();
+  /** sessionKey -> host run id (or null), once the injected turn starts. */
+  const activeRuns = new Map();
+  /**
+   * sessionKey -> rollout whose terminal result request is in progress.
+   *
+   * A heartbeat is deliberately kept alive through that request. The result
+   * may close the lease just before an overlapping heartbeat reaches the
+   * server, in which case that heartbeat's 410 is completion, not revocation.
+   * Keeping this state separate prevents the completed turn from fencing the
+   * next unrelated run in the same session.
+   */
+  const reporting = new Map();
+  /**
+   * A lease lost before model submission. `agent_turn_prepare` drains the
+   * exactly-once injection before `before_agent_run`, so blocking that one run
+   * both prevents stale work and consumes the now-invalid injection.
+   */
+  const blockNextRun = new Set();
+  /** sessionKey -> revoked host run id (or null when the host omitted it). */
+  const revokedRuns = new Map();
   /**
    * Sessions with a claim in flight but not yet recorded.
    *
@@ -182,6 +219,110 @@ export function createRolloutDriver({
   const claiming = new Set();
   let warnedMissingModelCallCount = false;
 
+  function stopHeartbeat(sessionKey) {
+    const state = heartbeats.get(sessionKey);
+    if (!state) return;
+    state.stopped = true;
+    if (state.timer !== null) heartbeatCanceller(state.timer);
+    heartbeats.delete(sessionKey);
+  }
+
+  function heartbeatIntervalFor(rollout) {
+    // leaseExpiresTs is the absolute expiry the server actually granted.
+    // Measure the duration ONCE: recomputing against a shrinking absolute
+    // timestamp makes the interval collapse toward one second forever.
+    const grantedMs = Number.isFinite(rollout?.leaseExpiresTs)
+      ? rollout.leaseExpiresTs * 1000 - now()
+      : null;
+    const requestedMs = Number(transport?.leaseMs);
+    const leaseMs = grantedMs !== null && grantedMs > 0
+      ? grantedMs
+      : (Number.isFinite(requestedMs) && requestedMs > 0
+        ? requestedMs : 1_800_000);
+    // The server accepts at most a ten-minute extension. A 30-minute initial
+    // grant therefore cannot pace at 30m/3: that would schedule the next beat
+    // exactly when the renewed 10-minute lease expires. Pace against the
+    // smaller of the granted/requested duration and the renewal ceiling.
+    return Math.max(1_000, Math.min(leaseMs, 600_000) / 3);
+  }
+
+  function startHeartbeat(sessionKey, rollout) {
+    stopHeartbeat(sessionKey);
+    if (!rollout?.leaseToken || typeof transport?.heartbeat !== "function") return;
+    const state = {
+      rollout,
+      intervalMs: heartbeatIntervalFor(rollout),
+      stopped: false,
+      timer: null,
+    };
+    heartbeats.set(sessionKey, state);
+    const schedule = () => {
+      if (state.stopped) return;
+      state.timer = heartbeatScheduler(beat, state.intervalMs);
+    };
+    const beat = async () => {
+      if (state.stopped) return;
+      state.timer = null;
+      try {
+        await transport.heartbeat(rollout);
+      } catch (err) {
+        if (err instanceof LeaseLost || err?.name === "LeaseLost") {
+          state.stopped = true;
+          heartbeats.delete(sessionKey);
+          if (reporting.get(sessionKey) === rollout) {
+            // The terminal result request races this heartbeat. It owns the
+            // authoritative outcome now; a 410 here can simply mean that the
+            // result landed first and closed the lease. The agent run is
+            // already over, so there is nothing to cancel or fence.
+            return;
+          }
+          if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
+          try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
+          const runStarted = activeRuns.has(sessionKey);
+          const runId = activeRuns.get(sessionKey) ?? undefined;
+          activeRuns.delete(sessionKey);
+          if (!runStarted) blockNextRun.add(sessionKey);
+          else revokedRuns.set(sessionKey, runId ?? null);
+          let cancelled = false;
+          if (cancel) {
+            try {
+              cancelled = await cancel({ sessionKey, runId, rollout }) === true;
+              if (!cancelled && runStarted) {
+                logger?.warn?.(
+                  `[percepteye] lease lost for rollout ${rollout.rolloutId}, ` +
+                  `but the host did not confirm that its active run stopped.`,
+                );
+              }
+            } catch (cancelErr) {
+              logger?.warn?.(
+                `[percepteye] lease lost for rollout ${rollout.rolloutId}, and ` +
+                `the host could not stop its run: ${cancelErr?.message ?? cancelErr}`,
+              );
+            }
+          } else if (runStarted) {
+            logger?.warn?.(
+              `[percepteye] lease lost for rollout ${rollout.rolloutId}; this ` +
+              `host exposes no active-run cancellation seam, so every later ` +
+              `tool call from the revoked run will be blocked.`,
+            );
+          }
+          logger?.warn?.(
+            `[percepteye] lease lost for rollout ${rollout.rolloutId}; its ` +
+            `${cancelled ? "host run was cancelled and " : ""}result will not ` +
+            `be reported because the control plane requeued it.`,
+          );
+          return;
+        }
+        logger?.warn?.(
+          `[percepteye] could not renew rollout ${rollout.rolloutId}; the next ` +
+          `scheduled heartbeat will retry: ${err?.message ?? err}`,
+        );
+      }
+      schedule();
+    };
+    schedule();
+  }
+
   /**
    * Give the work back, typed, and stop tracking it.
    *
@@ -191,6 +332,7 @@ export function createRolloutDriver({
    * participated in.
    */
   async function giveBack(sessionKey, rollout, reason, detail) {
+    stopHeartbeat(sessionKey);
     inFlight.delete(sessionKey);
     try {
       modelCalls?.abandon?.(sessionKey);
@@ -210,6 +352,7 @@ export function createRolloutDriver({
   /** Record a rollout as running in `sessionKey`, so `onAgentEnd` reports it. */
   function track(sessionKey, rollout) {
     inFlight.set(sessionKey, rollout);
+    startHeartbeat(sessionKey, rollout);
     try {
       modelCalls?.begin?.(sessionKey);
     } catch {
@@ -235,9 +378,58 @@ export function createRolloutDriver({
     }
   }
 
+  /**
+   * Bind the host's active run to its lease, and stop a queued turn whose
+   * lease was revoked before it reached model submission.
+   */
+  function onBeforeAgentRun(_event, ctx = {}) {
+    const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
+    if (!sessionKey) return undefined;
+    if (blockNextRun.delete(sessionKey) || revokedRuns.has(sessionKey)) {
+      return {
+        outcome: "block",
+        reason: "the PerceptEye rollout lease was lost before this run started",
+        message: "This training rollout expired before it started. Please retry.",
+        category: "percepteye_lease_lost",
+      };
+    }
+    if (inFlight.has(sessionKey)) {
+      const runId = ctx?.runId;
+      activeRuns.set(
+        sessionKey,
+        typeof runId === "string" && runId ? runId : null,
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * OpenClaw does not expose a background active-run abort to ordinary
+   * plugins. Once a lease is revoked, fence all subsequent tool side effects
+   * from that run even when the model loop takes time to unwind.
+   */
+  function onBeforeToolCall(event, ctx = {}) {
+    const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
+    if (!sessionKey || !revokedRuns.has(sessionKey)) return undefined;
+    const revokedRunId = revokedRuns.get(sessionKey);
+    const observedRunId = event?.runId ?? ctx?.runId;
+    if (
+      revokedRunId && typeof observedRunId === "string" && observedRunId
+      && observedRunId !== revokedRunId
+    ) return undefined;
+    return {
+      block: true,
+      blockReason:
+        "PerceptEye rollout lease was revoked; post-revocation side effects are blocked",
+    };
+  }
+
   async function onSessionStart(event) {
     const sessionKey = event?.sessionKey ?? event?.sessionId;
-    if (!sessionKey || inFlight.has(sessionKey) || claiming.has(sessionKey)) {
+    if (
+      !sessionKey || blockNextRun.has(sessionKey)
+      || inFlight.has(sessionKey) || claiming.has(sessionKey)
+    ) {
       return null;
     }
     // Reserved SYNCHRONOUSLY, before the first await, so a second event for
@@ -337,6 +529,11 @@ export function createRolloutDriver({
   async function onAgentEnd(event, ctx) {
     const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
     const rollout = sessionKey ? inFlight.get(sessionKey) : null;
+    if (sessionKey && rollout) reporting.set(sessionKey, rollout);
+    if (sessionKey) {
+      activeRuns.delete(sessionKey);
+      revokedRuns.delete(sessionKey);
+    }
     if (!rollout) return null;
     inFlight.delete(sessionKey);
 
@@ -409,6 +606,11 @@ export function createRolloutDriver({
         `${err?.message ?? err}`,
       );
       return null;
+    } finally {
+      // Keep renewing through the result POST itself; stop only once it has
+      // either landed or failed, not merely when the agent produced an answer.
+      if (reporting.get(sessionKey) === rollout) reporting.delete(sessionKey);
+      stopHeartbeat(sessionKey);
     }
   }
 
@@ -432,6 +634,11 @@ export function createRolloutDriver({
   async function onSessionEnd(event) {
     const sessionKey = event?.sessionKey ?? event?.sessionId;
     const rollout = sessionKey ? inFlight.get(sessionKey) : null;
+    if (sessionKey) {
+      activeRuns.delete(sessionKey);
+      blockNextRun.delete(sessionKey);
+      revokedRuns.delete(sessionKey);
+    }
     if (!rollout) return null;
     await giveBack(
       sessionKey, rollout, "entrypoint_error",
@@ -446,9 +653,11 @@ export function createRolloutDriver({
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
   return {
-    onSessionStart, onAgentEnd, onSessionEnd,
+    onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
+    onBeforeToolCall,
     onModelCallStarted, onModelCallEnded,
-    inFlight, track, giveBack,
+    inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
+    revokedRuns, reporting,
   };
 }
 
@@ -477,8 +686,96 @@ export function registerRolloutDriver(api, {
     return null;
   }
 
+  // Registration starts without blocking because OpenClaw requires plugin
+  // registration itself to return synchronously. The first claim in either
+  // lane awaits this one cached attempt, so no rollout can be leased before
+  // compatibility was checked and the worker was authenticated and recorded.
+  const registrationFingerprint = executionIdentity?.registrationFingerprint;
+  const registrationDescription = executionIdentity?.registrationDescription;
+  const registrationSpec = {
+    agent_id: config.agentId,
+    mode: "rollout",
+    sdk: SDK_UA,
+    contract_version: CONTRACT_VERSION,
+    reports_tool_calls: true,
+    isolation: "inprocess",
+    concurrency: 1,
+    input_shape: "text",
+    entrypoint: "openclaw-plugin",
+    // A startup observation is optional. When an adapter can provide one, the
+    // same immutable exact evidence drives both discovery and the execution
+    // digest registration sends before the first claim. Otherwise null says
+    // discovery ran but was unreadable; it never invents a worker identity.
+    discovered_agent: registrationDescription ?? null,
+  };
+  if (isLowerSha256(registrationFingerprint?.execution_sha256)) {
+    registrationSpec.agent_execution_sha256 =
+      registrationFingerprint.execution_sha256;
+  }
+  let registration = null;
+  function ensureRegistered() {
+    if (registration !== null) return registration;
+    registration = (async () => {
+      if (typeof transport?.health !== "function") {
+        throw new ConfigurationError(
+          "the rollout transport cannot check control-plane compatibility",
+        );
+      }
+      const health = await transport.health();
+      const served = health?.contract_versions_supported
+        || [health?.contract_version];
+      if (
+        !Array.isArray(served)
+        || !served.filter(Boolean).includes(CONTRACT_VERSION)
+      ) {
+        throw new ConfigurationError(
+          `control plane speaks ${JSON.stringify(served)}, this SDK speaks ` +
+          `${CONTRACT_VERSION}. Upgrade percepteye-agent-flywheel-node.`,
+        );
+      }
+      if (typeof transport?.register !== "function") {
+        throw new ConfigurationError(
+          "the rollout transport cannot register this worker",
+        );
+      }
+      return transport.register(registrationSpec);
+    })()
+      .then(() => true)
+      .catch((err) => {
+        logger?.warn?.(
+          `[${pluginId}] rollouts are disabled for this run because worker ` +
+          `registration failed: ${err?.message ?? err}. Local capture is ` +
+          `unaffected.`,
+        );
+        return false;
+      });
+    return registration;
+  }
+
+  // Start now, without awaiting: host registration remains synchronous, while
+  // an incompatible or unreachable control plane is diagnosed at startup
+  // instead of waiting for a person's first session to reveal it. Every claim
+  // still awaits this exact cached promise.
+  void ensureRegistered();
+
+  // Both the attended hook and the unattended cron loop call this same claim
+  // method. A failed registration looks like an empty queue locally; it never
+  // reaches `/rollouts/claim`, and the warning above names the real cause once.
+  const registeredTransport = {
+    get leaseMs() { return transport.leaseMs; },
+    async claim(...args) {
+      if (!(await ensureRegistered())) {
+        return { rollouts: [], pollAfterMs: 5_000 };
+      }
+      return transport.claim(...args);
+    },
+    report: (...args) => transport.report(...args),
+    abandon: (...args) => transport.abandon(...args),
+    heartbeat: (...args) => transport.heartbeat(...args),
+  };
+
   const driver = createRolloutDriver({
-    transport,
+    transport: registeredTransport,
     enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
     logger,
     executionIdentity,
@@ -496,6 +793,35 @@ export function registerRolloutDriver(api, {
   api.on(SESSION_START, safe(driver.onSessionStart));
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));
+  // This gate MUST return its decision. The observation-only wrapper above
+  // deliberately fire-and-forgets, which would discard a block result and
+  // let a revoked rollout reach the model anyway.
+  api.on(BEFORE_AGENT_RUN, async (event, ctx) => {
+    try {
+      return await driver.onBeforeAgentRun(event, ctx);
+    } catch (err) {
+      logger?.warn?.(
+        `[${pluginId}] rollout run gate failed: ${err?.message ?? err}`,
+      );
+      return undefined;
+    }
+  });
+  // Like the run gate, this policy hook must return synchronously/through its
+  // promise. It is registered only in training mode and becomes active only
+  // after the control plane has revoked this exact rollout lease.
+  api.on(BEFORE_TOOL_CALL, (event, ctx) => {
+    try {
+      return driver.onBeforeToolCall(event, ctx);
+    } catch (err) {
+      logger?.warn?.(
+        `[${pluginId}] rollout tool fence failed: ${err?.message ?? err}`,
+      );
+      return {
+        block: true,
+        blockReason: "PerceptEye could not verify the active rollout lease",
+      };
+    }
+  });
 
   // ── RUNNING THE ROLLOUTS THIS LANE CLAIMS ─────────────────────────────
   //
@@ -528,7 +854,7 @@ export function registerRolloutDriver(api, {
     // reachable.
     let gatewayCtx = null;
     unattended = createUnattendedRunner({
-      transport,
+      transport: registeredTransport,
       driver,
       startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
       logger,
@@ -548,6 +874,9 @@ export function registerRolloutDriver(api, {
   }
 
   driver.unattended = unattended;
+  // Exposed for diagnostics and focused tests; invoking it performs the same
+  // single cached registration the first claim would perform.
+  driver.ensureRegistered = ensureRegistered;
   return driver;
 }
 

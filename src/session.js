@@ -32,8 +32,8 @@ export function percepteyeHome(env = process.env) {
  *
  * Allows no dots, deliberately: a name of `..` that survived a filter would
  * make `join(root, name)` the PARENT directory. `turns.js:safeTurnId` allows
- * dots -- so that a turn id like `run.1` survives intact -- and has to reject
- * all-dot names explicitly for exactly this reason.
+ * dots -- so that a turn id like `run.1` survives intact -- and rejects the
+ * two path-special dot segments explicitly for exactly this reason.
  */
 export function safeSegment(value) {
   const s = String(value ?? "");

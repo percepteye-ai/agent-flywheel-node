@@ -148,7 +148,7 @@ That setting does **three** jobs, and every one of them is dropped without it. I
 | beat | what happens | who does the work |
 |:--|:--|:--|
 | **⓪ Describe** | the plugin records the assembled prompt and effective model; tools remain `null` on the current host API unless an adapter supplies them | automatic, honestly incomplete |
-| **① Claim** | training mode claims one graded task at a time from the control plane | you dial out — no inbound port |
+| **① Claim** | training mode registers this exact worker, then claims one graded task at a time; an exact startup snapshot binds claims to that execution | you dial out — no inbound port |
 | **② Run** | the task is delivered into your agent's context, in a dedicated `percepteye-rollout-*` session | your agent, unchanged |
 | **③ Record** | every executed tool call lands as `ok` / `failed` / **`unknown`** | the `after_tool_call` hook |
 | **④ Report** | the trajectory and answer go back; unsupported evidence stays absent | the plugin |
@@ -177,7 +177,16 @@ That last beat is what makes it a flywheel rather than a pipeline: **the better 
 
 **Every recording hook is structurally incapable of altering a run**: OpenClaw's `after_tool_call` returns `void`, and dsh's `tools/result` is `@mode emit` over deep-frozen objects. The tool-result mutation seams both harnesses expose — result middleware, `tools/post` — are deliberately unused, in every mode. A collector that can corrupt the run it is measuring is worse than no collector.
 
-**Two seams are used, and neither is a recording one.** OpenClaw's `before_prompt_build` returns the approved system prompt and `before_model_resolve` returns the approved provider and model, in production mode — beat ⑥ of the loop rather than telemetry. Both are feature-detected and fail open: if a host version never calls them, or ignores what they return, your agent runs exactly as it does today.
+**The behavior-changing seams are separate from recording.** In production,
+`before_prompt_build` returns the approved system prompt and
+`before_model_resolve` returns the approved provider and model — beat ⑥ of the
+loop rather than telemetry. In training, `before_agent_run` blocks a queued
+turn if its lease expired before model submission, and `before_tool_call`
+blocks any later side effects after an active lease is revoked. OpenClaw does
+not expose an ordinary-plugin API for aborting an already-active model loop,
+so that loop may wind down, but it cannot start another tool call or report a
+stale result. None of these gates is registered by the production rollout
+lane, because that lane does not exist in production mode.
 
 **The registered provider answers for its own id and nothing else.** OpenClaw asks every registered provider plugin to normalise a transport when the matched one declines, so a provider that answered unconditionally would silently redirect your Anthropic or OpenAI traffic. This one returns nothing unless the provider being assembled is `percepteye-flywheel` — the id it registers, and the id it names in `before_model_resolve`.
 
@@ -230,10 +239,18 @@ In `production` mode the plugin records the turns your agent is already serving 
 
 ```
 $PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured
-    turns.jsonl        {"kind":"task"|"answer","text","turn_id","conversation_id"}
+    turns.jsonl        {"kind":"task"|"answer","text","turn_id","conversation_id","task_id"}
     conversation_id
+    task_id            # optional caller-authored case/work-item correlation
+    task_id.conflict   # present only when writers disagreed; task_id is then omitted
     tool_calls.jsonl
 ```
+
+`task_id` is opaque correlation evidence only. The SDK never interprets it as
+success, reward, a hint, policy identity, or permission to train. OpenClaw host
+adapters may supply it as `taskId`/`task_id` on an event or hook context. Invalid
+or conflicting values are omitted rather than cleaned into another identifier;
+valid task-only turns still reach the control plane for downstream validation.
 
 **Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown.
 
@@ -319,9 +336,9 @@ Scalar settings are settable two ways: in your OpenClaw config under `plugins.en
 | `capture` | `PERCEPTEYE_CAPTURE` | on | `0`/`false`/`no`/`off` registers no hooks and records nothing, in either mode |
 | `applyPrompt` | `PERCEPTEYE_APPLY_PROMPT` | on | `0` subscribes no prompt hook and does not fetch the prompt text |
 | `applyModel` | `PERCEPTEYE_APPLY_MODEL` | on | `0` subscribes no model hook and registers no provider |
-| `executionSnapshot` | *(config only)* | *(none)* | opaque SHA-256 components from the host adapter, plus its explicit completeness assertion. The SDK requires an exact prompt/tool/model observation; current OpenClaw omits tools, so it abstains. Missing, invalid, lossy, or conflicting evidence emits no `execution_sha256` |
+| `executionSnapshot` | *(config only)* | *(none)* | opaque SHA-256 components from the host adapter, its completeness assertion, and optionally an exact startup prompt/tool/provider/model observation. Exact startup evidence binds registration and claims to the same SDK-authored execution identity later reported; missing, invalid, lossy, or conflicting evidence abstains |
 
-The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. Component names belong to the adapter; the SDK does not assign them meaning. Do not put `execution_sha256` in that object—the final digest is authored only by SDK reconciliation. It identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
+The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. An adapter that can resolve the full execution before work is claimed may also provide `startupObservation: {systemPrompt, tools, provider, model}`. Core runs startup and per-run evidence through the same canonical descriptor; it never accepts a caller-authored final digest. Component names belong to the adapter, and core does not assign them meaning. The resulting `execution_sha256` identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`); `PERCEPTEYE_CAPTURE_DIR` overrides just the production turn capture (default `$PERCEPTEYE_HOME/captured`); and `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's outcomes go, which the rollout driver sets per rollout.
 

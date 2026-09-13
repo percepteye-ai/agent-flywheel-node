@@ -139,9 +139,43 @@ export class ControlPlaneClient {
    * have been processed performs it twice.
    */
   async request(method, path, opts = {}) {
-    const { jsonBody, idempotencyKey, timeoutMs, retryIfAmbiguous = true } = opts;
+    const {
+      jsonBody, idempotencyKey, timeoutMs, retryIfAmbiguous = true,
+      headers: requestHeaders = null,
+    } = opts;
     const url = `${this.baseUrl}${path}`;
     const headers = { ...this._headers };
+
+    // Per-request evidence such as the current rollout lease belongs beside
+    // the client-owned authentication and contract headers, never in place of
+    // them. Header names are case-insensitive, so protect the whole set by its
+    // lowercase spelling rather than only the exact casing used above.
+    const protectedHeaders = new Set([
+      ...Object.keys(this._headers).map((name) => name.toLowerCase()),
+      "content-type",
+      "idempotency-key",
+    ]);
+    if (requestHeaders !== null && requestHeaders !== undefined) {
+      if (
+        typeof requestHeaders !== "object"
+        || Array.isArray(requestHeaders)
+      ) {
+        throw new TransportError("request headers must be an object");
+      }
+      for (const [name, value] of Object.entries(requestHeaders)) {
+        if (protectedHeaders.has(name.toLowerCase())) {
+          throw new TransportError(
+            `request header ${JSON.stringify(name)} is owned by the control-plane client`,
+          );
+        }
+        if (typeof value !== "string") {
+          throw new TransportError(
+            `request header ${JSON.stringify(name)} must be a string`,
+          );
+        }
+        headers[name] = value;
+      }
+    }
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
     if (jsonBody !== undefined) headers["Content-Type"] = "application/json";
 

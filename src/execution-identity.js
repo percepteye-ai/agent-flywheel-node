@@ -4,7 +4,10 @@
  * The host adapter supplies opaque SHA-256 components for implementation and
  * mutable state that no model-call hook can see. Core combines those with the
  * complete prompt/tool/model observation made at `llm_input`; it never knows
- * what a component means and never accepts a caller-authored final digest.
+ * what a component means and never accepts a caller-authored final digest. A
+ * host adapter may also supply that same exact observation at startup, before
+ * a rollout is claimed, so registration can bind the worker to the execution
+ * identity its later reports must carry.
  *
  * No component, incomplete discovery, or two different observations in one
  * run means no affirmative identity. That is an abstention, not an error and
@@ -20,6 +23,21 @@ const OBSERVATION_DOMAIN = "percepteye-agent-observation-v1\0";
 const EXECUTION_DOMAIN = "percepteye-agent-execution-v1\0";
 const LOWER_SHA256 = /^[0-9a-f]{64}$/;
 const MAX_PENDING_IDENTITIES = 4096;
+const STARTUP_OBSERVATION_KEYS = Object.freeze([
+  "systemPrompt", "tools", "provider", "model",
+]);
+const STARTUP_OBSERVATION_KEY_SET = new Set(STARTUP_OBSERVATION_KEYS);
+
+/** Recursively freeze an SDK-owned JSON tree before exposing it to callers. */
+function freezeJsonTree(value, seen = new Set()) {
+  if (
+    !value || typeof value !== "object" || Object.isFrozen(value)
+    || seen.has(value)
+  ) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) freezeJsonTree(child, seen);
+  return Object.freeze(value);
+}
 
 /** Unicode-code-point ordering, matching Python rather than UTF-16 sort. */
 function compareStrings(left, right) {
@@ -125,6 +143,38 @@ export const executionDescriptorSha256 = (value) =>
 export const isLowerSha256 = (value) =>
   typeof value === "string" && LOWER_SHA256.test(value);
 
+/**
+ * A startup observation is a closed, adapter-authored copy of the four host
+ * facts runtime observation reads. Invalid or lossy evidence abstains from a
+ * registration fingerprint without disabling exact runtime observations.
+ */
+function normalizeStartupObservation(raw) {
+  try {
+    if (raw === undefined || raw === null) return null;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const proto = Object.getPrototypeOf(raw);
+    if (proto !== Object.prototype && proto !== null) return null;
+    const keys = Object.keys(raw);
+    if (
+      keys.length !== STARTUP_OBSERVATION_KEYS.length
+      || keys.some((key) => !STARTUP_OBSERVATION_KEY_SET.has(key))
+    ) return null;
+    if (typeof raw.systemPrompt !== "string" || !raw.systemPrompt) return null;
+    if (!Array.isArray(raw.tools)) return null;
+    if (typeof raw.provider !== "string" || !raw.provider.trim()) return null;
+    if (typeof raw.model !== "string" || !raw.model.trim()) return null;
+    const copied = structuredClone({
+      systemPrompt: raw.systemPrompt,
+      tools: raw.tools,
+      provider: raw.provider,
+      model: raw.model,
+    });
+    return freezeJsonTree(copied);
+  } catch {
+    return null;
+  }
+}
+
 /** Validate adapter-owned evidence without assigning meaning to its names. */
 export function normalizeExecutionSnapshot(raw) {
   if (raw === undefined || raw === null) {
@@ -186,11 +236,13 @@ export function normalizeExecutionSnapshot(raw) {
       reason: "a complete execution snapshot needs at least one component digest",
     };
   }
+  const startupObservation = normalizeStartupObservation(raw.startupObservation);
   return {
     snapshot: Object.freeze({
       adapterName,
       executionComponents: Object.freeze(components),
       executionIdentityComplete: true,
+      startupObservation,
     }),
     reason: null,
   };
@@ -228,8 +280,8 @@ function exactObservation(event, ctx) {
 
 function runKey(event, ctx) {
   const runId = event?.runId ?? ctx?.runId;
-  return typeof runId === "string" && runId.trim()
-    ? `run:${runId.trim()}`
+  return typeof runId === "string" && runId.length > 0
+    ? `run:${runId}`
     : null;
 }
 
@@ -248,6 +300,60 @@ export function createExecutionIdentityTracker({
   const normalized = normalizeExecutionSnapshot(executionSnapshot);
   const byContext = new Map();
   const conflicted = new Set();
+
+  /**
+   * One canonical descriptor path for startup registration and runtime hooks.
+   */
+  function evidenceFromObservation(event, ctx = {}) {
+    if (normalized.snapshot === null) return null;
+    let observed;
+    try {
+      observed = exactObservation(event, ctx);
+    } catch {
+      // Host and adapter observations are untrusted. Cyclic or exotic tool
+      // schemas make exact identity unknowable; they remain an abstention.
+      return null;
+    }
+    if (observed === null) return null;
+    try {
+      const observation = canonicalObservationSha256(observed.full);
+      const execution = executionDescriptorSha256({
+        schema: "percepteye.agent_execution/v1",
+        sdk: SDK_UA,
+        contract_version: CONTRACT_VERSION,
+        entrypoint: {
+          kind: "host_plugin",
+          framework: "openclaw",
+          agent_id: agentId,
+          adapter: normalized.snapshot.adapterName,
+        },
+        configuration: {
+          mode,
+          reports_tool_calls: true,
+        },
+        discovered_agent: observed.discovered,
+        discovery_observation_sha256: observation,
+        attested_components: normalized.snapshot.executionComponents,
+      });
+      return Object.freeze({
+        fingerprint: Object.freeze({ execution_sha256: execution }),
+        description: freezeJsonTree(observed.discovered),
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  // Computed ONCE. A later config-object mutation cannot move the worker
+  // identity after registration, and callers receive only a frozen value.
+  const registrationContext = typeof agentId === "string" && agentId.trim()
+    ? { agentId }
+    : {};
+  const registrationEvidence = normalized.snapshot === null
+    ? null
+    : evidenceFromObservation(
+      normalized.snapshot.startupObservation, registrationContext,
+    );
 
   function bind(key, digestValue) {
     if (conflicted.has(key)) return;
@@ -283,44 +389,35 @@ export function createExecutionIdentityTracker({
   }
 
   function observe(event, ctx = {}) {
-    if (normalized.snapshot === null) return null;
-    let observed;
-    try {
-      observed = exactObservation(event, ctx);
-    } catch {
-      // Host hook payloads are untrusted. Cyclic or exotic tool schemas make
-      // exact identity unknowable; they must never escape into the agent run.
-      return null;
-    }
-    if (observed === null) return null;
     const key = runKey(event, ctx);
     if (key === null) return null;
-    let observation;
-    let execution;
-    try {
-      observation = canonicalObservationSha256(observed.full);
-      execution = executionDescriptorSha256({
-        schema: "percepteye.agent_execution/v1",
-        sdk: SDK_UA,
-        contract_version: CONTRACT_VERSION,
-        entrypoint: {
-          kind: "host_plugin",
-          framework: "openclaw",
-          agent_id: agentId,
-          adapter: normalized.snapshot.adapterName,
-        },
-        configuration: {
-          mode,
-          reports_tool_calls: true,
-        },
-        discovered_agent: observed.discovered,
-        discovery_observation_sha256: observation,
-        attested_components: normalized.snapshot.executionComponents,
-      });
-    } catch {
-      return null;
+    // Once a stable registration exists, every later observation must use its
+    // configured agent name rather than a run/session-shaped fallback. If
+    // startup evidence abstained, retain the legacy runtime descriptor path.
+    const observationContext = registrationEvidence !== null
+      && typeof agentId === "string" && agentId.trim()
+      ? { ...ctx, agentId }
+      : ctx;
+    // A startup-capable adapter owns the exact fields its host cannot expose
+    // per run. Reconcile, do not overwrite: every field the runtime does
+    // expose wins and therefore changes/conflicts the digest; only an absent
+    // field is supplied from the registered snapshot. Requiring at least one
+    // runtime field prevents a bare run id from inheriting a startup identity.
+    let observedEvent = event;
+    if (registrationEvidence !== null) {
+      const startup = normalized.snapshot.startupObservation;
+      const observedAny = STARTUP_OBSERVATION_KEYS.some(
+        (name) => event?.[name] !== undefined,
+      );
+      if (!observedAny) return null;
+      observedEvent = { ...event };
+      for (const name of STARTUP_OBSERVATION_KEYS) {
+        if (observedEvent[name] === undefined) observedEvent[name] = startup[name];
+      }
     }
-    bind(key, execution);
+    const candidate = evidenceFromObservation(observedEvent, observationContext);
+    if (candidate === null) return null;
+    bind(key, candidate.fingerprint.execution_sha256);
     const fingerprint = fingerprintFor(event, ctx);
     return {
       fingerprint,
@@ -335,6 +432,12 @@ export function createExecutionIdentityTracker({
     observe,
     fingerprintFor,
     consumeFingerprintFor,
+    get registrationFingerprint() {
+      return registrationEvidence?.fingerprint ?? null;
+    },
+    get registrationDescription() {
+      return registrationEvidence?.description ?? null;
+    },
     get enabled() { return normalized.snapshot !== null; },
     get refusal() { return normalized.reason; },
   };

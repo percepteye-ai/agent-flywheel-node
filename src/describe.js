@@ -37,15 +37,18 @@
  *
  * THAT IS A CLAIM ABOUT THIS FILE, NOT ABOUT THE PACKAGE, and it used to read
  * as both: "the mutation seams OpenClaw does expose -- `before_prompt_build`'s
- * `{systemPrompt}`, `before_tool_call`'s `{block:true}` -- remain unused,
+ * `{systemPrompt}`, `before_tool_call`'s `{block:true}` -- remain unused by
+ * this observer,
  * deliberately." Half of that is no longer true. `policy.js` DOES use
  * `before_prompt_build`, in production mode, to apply the system prompt the
  * control plane approved -- and `before_model_resolve` plus a registered
  * provider to point the agent at the model that prompt was certified with.
  * Both deliberately, both gated on a pair check and a per-agent scope, both
- * switchable off. `before_tool_call`'s `{block:true}` is still unused. The
- * describer is unaffected either way: a describer that could rewrite a prompt
- * would be measuring its own output.
+ * switchable off. Training mode now uses `before_tool_call` only as a lease
+ * revocation fence: after the control plane has requeued a rollout, later
+ * calls from the stale run are blocked from producing duplicate side effects.
+ * The describer is unaffected either way: a describer that could rewrite a
+ * prompt would be measuring its own output.
  *
  * The old wording also invited a wrong reading of that seam. `systemPrompt` is
  * a field on the hook's RESULT, not on its EVENT: the event is

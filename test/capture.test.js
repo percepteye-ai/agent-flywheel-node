@@ -23,7 +23,8 @@ import {
 import { SDK_UA } from "../src/http.js";
 import { CONTRACT_VERSION } from "../src/wire.js";
 import {
-  CONVERSATION_ID_FILENAME, MAX_TEXT_CHARS, TURNS_FILENAME, readTurnText,
+  CONVERSATION_ID_FILENAME, MAX_TEXT_CHARS, TASK_ID_CONFLICT_FILENAME,
+  TASK_ID_FILENAME, TURNS_FILENAME, readTaskId, readTurnText, recordTaskId,
   recordTurnText,
   turnDir, turnIndexOf, turnWire,
 } from "../src/turns.js";
@@ -32,10 +33,12 @@ import { register, PLUGIN_ID } from "../src/index.js";
 const tmp = () => mkdtempSync(join(tmpdir(), "percepteye-cap-"));
 
 /** Build a turn on disk the way the hooks would. */
-function makeTurn(root, runId, { task, answer, calls, conversation } = {}) {
+function makeTurn(root, runId, { task, answer, calls, conversation, taskId } = {}) {
   const cap = createTurnCapture({ root });
   if (task !== undefined) {
-    cap.onMessageReceived({ runId, content: task, sessionKey: conversation });
+    cap.onMessageReceived({
+      runId, content: task, sessionKey: conversation, taskId,
+    });
   }
   if (calls) {
     const dir = turnDir(root, runId);
@@ -45,7 +48,9 @@ function makeTurn(root, runId, { task, answer, calls, conversation } = {}) {
                   "utf8");
   }
   if (answer !== undefined) {
-    cap.onAgentEnd({ runId, messages: [{ role: "assistant", content: answer }] });
+    cap.onAgentEnd({
+      runId, taskId, messages: [{ role: "assistant", content: answer }],
+    });
   }
   return turnDir(root, runId);
 }
@@ -57,6 +62,7 @@ describe("the on-disk format is the Python SDK's", () => {
     // `percepteye_agent_flywheel.outcomes` opens these literal names.
     assert.equal(TURNS_FILENAME, "turns.jsonl");
     assert.equal(CONVERSATION_ID_FILENAME, "conversation_id");
+    assert.equal(TASK_ID_FILENAME, "task_id");
     assert.equal(MAX_TEXT_CHARS, 20_000);
   });
 
@@ -98,7 +104,7 @@ describe("the on-disk format is the Python SDK's", () => {
     assert.equal(readTurnText(turnDir(root, "r")).task.length, MAX_TEXT_CHARS);
   });
 
-  it("keeps a host-supplied turn id inside the root", () => {
+  it("preserves valid opaque ids and gives invalid host ids fresh safe ids", () => {
     // A PROPERTY OF THE FUNCTION, not a filesystem probe. This first asserted
     // that `<root>/../../escape` did not exist -- which a mutation then
     // CREATED, outside any temp directory, where it survived the restore and
@@ -106,16 +112,22 @@ describe("the on-disk format is the Python SDK's", () => {
     // runs on is a test that stops meaning anything.
     const root = tmp();
     for (const hostile of ["../../escape", "/etc/passwd", "a/b", "..", ""]) {
-      const dir = turnDir(root, hostile);
-      assert.ok(dir.startsWith(`${root}/`),
-        `turn id ${JSON.stringify(hostile)} escaped the root: ${dir}`);
-      assert.ok(!dir.slice(root.length + 1).includes("/"),
-        `turn id ${JSON.stringify(hostile)} became more than one segment: ${dir}`);
+      assert.throws(() => turnDir(root, hostile), /production identifier/);
     }
-    // ...and the sanitised name is what actually lands.
-    createTurnCapture({ root }).onMessageReceived(
-      { runId: "../../escape", content: "hi" });
-    assert.deepEqual(readdirSync(root), ["....escape"]);
+    const cap = createTurnCapture({ root });
+    cap.onMessageReceived({ runId: "../../escape", content: "hi" });
+    cap.onAgentEnd({
+      runId: "../../escape",
+      messages: [{ role: "assistant", content: "done" }],
+    });
+    const names = readdirSync(root);
+    assert.equal(names.length, 1, "one invalid host run split across two ids");
+    assert.match(names[0], /^t_[0-9a-f]{16}$/);
+    assert.equal(turnWire(join(root, names[0])).final_text, "done");
+
+    const opaque = "顧客 run #1";
+    cap.onMessageReceived({ runId: opaque, content: "hello" });
+    assert.equal(turnWire(turnDir(root, opaque)).turn_id, opaque);
   });
 
   it("refuses to record empty text at the writer, not only at the caller", () => {
@@ -199,6 +211,58 @@ describe("the wire shape", () => {
     const w = turnWire(dir);
     assert.ok(!("conversation_id" in w));
     assert.ok(!("turn_index" in w));
+  });
+
+  it("carries an exact caller task id as neutral correlation evidence", () => {
+    const root = tmp();
+    const dir = makeTurn(root, "r-task", {
+      task: "investigate", answer: "resolved", taskId: "INC-123",
+    });
+    assert.equal(readFileSync(join(dir, TASK_ID_FILENAME), "utf8"), "INC-123");
+    assert.equal(turnWire(dir).task_id, "INC-123");
+  });
+
+  it("uploads a valid task-id-only turn without inventing content", () => {
+    const root = tmp();
+    const cap = createTurnCapture({ root });
+    assert.equal(cap.onMessageReceived({
+      runId: "r-task-only", content: "", task_id: "CASE-9",
+    }), true);
+    assert.deepEqual(turnWire(turnDir(root, "r-task-only")), {
+      turn_id: "r-task-only",
+      input_text: null,
+      final_text: null,
+      tool_calls: null,
+      tool_calls_omitted_count: 0,
+      task_id: "CASE-9",
+    });
+  });
+
+  it("omits invalid or conflicting task bindings rather than rewriting them", () => {
+    const root = tmp();
+    const invalid = makeTurn(root, "invalid-task", {
+      task: "hi", taskId: " CASE-9 ",
+    });
+    assert.equal(readTaskId(invalid), null);
+    assert.ok(!("task_id" in turnWire(invalid)));
+
+    const dir = turnDir(root, "conflict");
+    assert.equal(recordTaskId(dir, "CASE-1"), true);
+    assert.equal(recordTaskId(dir, "CASE-1"), true);
+    assert.equal(readTaskId(dir), "CASE-1");
+    assert.equal(recordTaskId(dir, "CASE-2"), false);
+    assert.equal(existsSync(join(dir, TASK_ID_CONFLICT_FILENAME)), true);
+    assert.equal(readTaskId(dir), null);
+  });
+
+  it("omits an invalid conversation id without changing it", () => {
+    const root = tmp();
+    const dir = makeTurn(root, "r-cid", {
+      task: "hi", conversation: " conversation ",
+    });
+    const wire = turnWire(dir);
+    assert.ok(!("conversation_id" in wire));
+    assert.equal(existsSync(join(dir, CONVERSATION_ID_FILENAME)), false);
   });
 
   it("orders a conversation by mtime, so turns are not all index 0", () => {

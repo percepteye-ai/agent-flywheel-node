@@ -85,6 +85,48 @@ test("the schema accepts the settings the manifest tells customers to set", () =
       `${key} is documented in the manifest and must be accepted`,
     );
   }
+  const startup = plugin.configSchema.properties.executionSnapshot
+    .properties.startupObservation;
+  assert.deepEqual(
+    startup.required,
+    ["systemPrompt", "tools", "provider", "model"],
+  );
+  assert.equal(startup.additionalProperties, false);
+  assert.equal(
+    Object.hasOwn(startup.properties, "execution_sha256"), false,
+    "a caller-authored final digest is not a startup-observation input",
+  );
+});
+
+test("resolveConfig transports an optional startup observation without inventing one", () => {
+  assert.equal(resolveConfig({}).executionSnapshot, null);
+  const startupObservation = {
+    systemPrompt: "Use the registered tools.",
+    tools: [{ name: "lookup", parameters: { type: "object" } }],
+    provider: "gateway",
+    model: "policy",
+  };
+  const executionSnapshot = {
+    adapterName: "openclaw-exact",
+    executionIdentityComplete: true,
+    executionComponents: { host_code: "a".repeat(64) },
+    startupObservation,
+  };
+  assert.equal(
+    resolveConfig({ executionSnapshot }).executionSnapshot,
+    executionSnapshot,
+  );
+});
+
+test("agent ids are exact wire identifiers, never trimmed or path-cleaned", () => {
+  for (const agentId of [" agent ", "../agent", ".", "..", "bad\u0000id", "x".repeat(256)]) {
+    assert.throws(
+      () => resolveConfig({ agentId }),
+      /agentId must be a non-empty, control-free identifier/,
+    );
+  }
+  assert.equal(resolveConfig({ agentId: "顧客 agent #1" }).agentId, "顧客 agent #1");
+  assert.equal(resolveConfig({ agentId: "😀".repeat(255) }).agentId, "😀".repeat(255));
 });
 
 test("the plugin id is one value, not two", () => {
@@ -148,6 +190,13 @@ test("the transport calls no route the control plane does not serve", async () =
   // interpolations normalised back to the server's own path parameter.
   const calls = [...src.matchAll(/request\(\s*"(GET|POST)",\s*[`"]([^`"]+)[`"]/g)]
     .map(([, method, path]) => `${method} ${path.replace(/\$\{[^}]+\}/g, "{id}")}`);
+  // Opaque rollout ids are now encoded by one helper before they enter a URL;
+  // keep those helper-backed calls in the same complete route inventory.
+  for (const match of src.matchAll(
+    /request\(\s*"POST",\s*rolloutPath\([^,]+,\s*"(heartbeat|result|abandon)"\)/g,
+  )) {
+    calls.push(`POST /rollouts/{id}/${match[1]}`);
+  }
 
   assert.ok(calls.length >= 8, `expected the transport's calls, found ${calls.length}`);
   const unserved = calls.filter((c) => !SERVED.has(c));

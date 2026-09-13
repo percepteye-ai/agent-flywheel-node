@@ -15,6 +15,10 @@
  * launch and cannot be re-keyed without a restart.
  */
 import { resolveModeSource } from "./mode.js";
+import { ConfigurationError } from "./errors.js";
+import {
+  PRODUCTION_IDENTIFIER_MAX_CHARS, productionAgentIdentifier,
+} from "./wire.js";
 
 export const PLUGIN_ID = "percepteye-agent-flywheel";
 
@@ -61,6 +65,8 @@ export const CONFIG_SCHEMA = {
     agentId: {
       type: "string",
       minLength: 1,
+      maxLength: 255,
+      pattern: "^(?!\\.{1,2}$)(?!\\s)(?!.*\\s$)(?!.*[\\\\/])[^\\u0000-\\u001F\\u007F-\\u009F]+$",
       description:
         "The agent name this install reports as. Unset means " +
         'PERCEPTEYE_AGENT_ID, then "openclaw".',
@@ -106,10 +112,29 @@ export const CONFIG_SCHEMA = {
           propertyNames: { type: "string", minLength: 1 },
           additionalProperties: { type: "string", pattern: "^[0-9a-f]{64}$" },
         },
+        startupObservation: {
+          type: "object",
+          additionalProperties: false,
+          required: ["systemPrompt", "tools", "provider", "model"],
+          properties: {
+            systemPrompt: { type: "string", minLength: 1 },
+            tools: {
+              type: "array",
+              items: { type: "object" },
+            },
+            provider: { type: "string", minLength: 1 },
+            model: { type: "string", minLength: 1 },
+          },
+          description:
+            "Optional exact prompt/tool/provider/model observation available " +
+            "before the first claim. It lets registration carry the same " +
+            "SDK-authored execution fingerprint later reports must match.",
+        },
       },
       description:
         "Host-adapter evidence for exact execution identity. Component names " +
-        "are opaque to the SDK; incomplete or invalid evidence emits no identity.",
+        "are opaque to the SDK; incomplete or invalid evidence emits no identity. " +
+        "A startup observation enables pre-claim registration binding.",
     },
     mode: {
       type: "string",
@@ -151,6 +176,20 @@ const firstString = (...values) => {
   return null;
 };
 
+const agentIdentifier = (...values) => {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const exact = productionAgentIdentifier(value);
+    if (exact !== null) return exact;
+    throw new ConfigurationError(
+      "agentId must be a non-empty, control-free identifier without edge " +
+      "whitespace, path separators, or dot segments, with at most " +
+      `${PRODUCTION_IDENTIFIER_MAX_CHARS} characters`,
+    );
+  }
+  return null;
+};
+
 /**
  * @param {object} pluginConfig  `plugins.entries.<id>.config`, as OpenClaw hands it
  * @param {object} env           defaults to process.env
@@ -165,7 +204,7 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     apiKey,
     mode,
     modeSource,
-    agentId: firstString(
+    agentId: agentIdentifier(
       pluginConfig.agentId, env.PERCEPTEYE_AGENT_ID,
     ) ?? "openclaw",
     // ONE NAME FOR ONE QUESTION. This also read an unprefixed

@@ -6,7 +6,7 @@
  * Python end. A comment saying "keep these in sync" is not a mechanism.
  */
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
   CONTRACT_VERSION, ContractError, WIRE_KEYS,
@@ -32,6 +32,21 @@ describe("the vendored schema IS the contract", () => {
 
   it("agrees that final_text is the one required field", () => {
     assert.deepEqual(schema.$defs.RolloutOutput.required, ["final_text"]);
+  });
+
+  it("matches the Python authority for both production-turn definitions", () => {
+    const sibling = new URL(
+      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
+      import.meta.url,
+    );
+    assert.ok(schema.$defs.ProductionTurn);
+    assert.ok(schema.$defs.ProductionTurnBatch);
+    if (!existsSync(sibling)) return;
+
+    const authoritative = JSON.parse(readFileSync(sibling, "utf8"));
+    for (const name of ["ProductionTurn", "ProductionTurnBatch"]) {
+      assert.deepEqual(schema.$defs[name], authoritative.$defs[name]);
+    }
   });
 });
 
@@ -143,5 +158,18 @@ describe("reading a claimed rollout", () => {
 
   it("refuses a payload with no rollout_id", () => {
     assert.throws(() => rolloutRequestFromWire({ turn_input: "x" }), ContractError);
+  });
+
+  it("keeps the granted lease clock and metadata for the worker", () => {
+    const request = rolloutRequestFromWire({
+      rollout_id: "r1",
+      turn_input: "do it",
+      deadline_ts: 999,
+      lease_token: "lease-1",
+      lease_expires_ts: 123.5,
+      metadata: { suite: "held-out" },
+    });
+    assert.equal(request.leaseExpiresTs, 123.5);
+    assert.deepEqual(request.metadata, { suite: "held-out" });
   });
 });

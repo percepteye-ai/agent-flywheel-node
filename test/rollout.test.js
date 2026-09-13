@@ -13,9 +13,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { register, PLUGIN_ID } from "../src/index.js";
+import { LeaseLost } from "../src/errors.js";
 import {
   MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
-  driveVerdict, lastAssistantText, taskText,
+  driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
 } from "../src/rollout.js";
 
 // ROLLOUT-EXCLUSIVE hooks only. `agent_end` used to be in this list and had
@@ -25,7 +26,8 @@ import {
 // constructed in production" is asserted directly by the production-branch
 // test below, which is the assertion that actually caught a deleted split.
 const ROLLOUT_HOOKS = [
-  "session_start", "session_end", "gateway_start",
+  "session_start", "session_end", "gateway_start", "before_agent_run",
+  "before_tool_call",
 ];
 
 /** A host api that records what was subscribed. */
@@ -192,6 +194,117 @@ describe("driveVerdict names ONE cause", () => {
   });
 });
 
+describe("training worker registration gates every claim", () => {
+  function registrationHarness({
+    fail = false,
+    executionIdentity = null,
+    servedContracts = ["flywheel/1"],
+  } = {}) {
+    const order = [];
+    const registrations = [];
+    const api = fakeApi();
+    const transport = {
+      async health() {
+        order.push("health");
+        return { contract_versions_supported: servedContracts };
+      },
+      async register(spec) {
+        order.push("register");
+        registrations.push(spec);
+        if (fail) throw new Error("registration refused");
+        return { accepted: true };
+      },
+      async claim() {
+        order.push("claim");
+        return { rollouts: [] };
+      },
+      async report() {},
+      async abandon() {},
+      async heartbeat() {},
+    };
+    const driver = registerRolloutDriver(api, {
+      config: { mode: "training", apiKey: "key", agentId: "support" },
+      transport,
+      pluginId: PLUGIN_ID,
+      logger: api.logger,
+      executionIdentity,
+    });
+    return { api, driver, order, registrations };
+  }
+
+  it("registers the rollout worker before its first attended claim", async () => {
+    const h = registrationHarness();
+    assert.deepEqual(h.order, ["health"], "startup begins without a session");
+    await h.driver.onSessionStart({ sessionKey: "s1" });
+    assert.deepEqual(h.order, ["health", "register", "claim"]);
+    assert.equal(h.registrations.length, 1);
+    assert.deepEqual(h.registrations[0], {
+      agent_id: "support",
+      mode: "rollout",
+      sdk: "percepteye-agent-flywheel-node/0.1.0",
+      contract_version: "flywheel/1",
+      reports_tool_calls: true,
+      isolation: "inprocess",
+      concurrency: 1,
+      input_shape: "text",
+      entrypoint: "openclaw-plugin",
+      discovered_agent: null,
+    });
+  });
+
+  it("binds registration to the exact startup evidence before claiming", async () => {
+    const execution = "a".repeat(64);
+    const description = Object.freeze({
+      agent_name: "support",
+      framework: "openclaw",
+      tool_definitions: [],
+    });
+    const h = registrationHarness({
+      executionIdentity: {
+        registrationFingerprint: Object.freeze({
+          execution_sha256: execution,
+        }),
+        registrationDescription: description,
+      },
+    });
+
+    await h.driver.onSessionStart({ sessionKey: "bound" });
+    assert.deepEqual(h.order, ["health", "register", "claim"]);
+    assert.equal(h.registrations[0].agent_execution_sha256, execution);
+    assert.equal(h.registrations[0].discovered_agent, description);
+  });
+
+  it("never claims when registration is refused, and attempts it once", async () => {
+    const h = registrationHarness({ fail: true });
+    assert.equal(await h.driver.onSessionStart({ sessionKey: "s1" }), null);
+    assert.equal(await h.driver.onSessionStart({ sessionKey: "s2" }), null);
+    assert.deepEqual(h.order, ["health", "register"]);
+    assert.equal(h.registrations.length, 1);
+    assert.equal(
+      h.api.logs.filter((line) => line.includes("registration failed")).length,
+      1,
+    );
+  });
+
+  it("refuses an incompatible control plane before registration or claim", async () => {
+    const h = registrationHarness({ servedContracts: ["flywheel/0"] });
+    assert.equal(await h.driver.ensureRegistered(), false);
+    assert.equal(await h.driver.onSessionStart({ sessionKey: "s1" }), null);
+    assert.deepEqual(h.order, ["health"]);
+    assert.equal(h.registrations.length, 0);
+    assert.equal(
+      h.api.logs.filter((line) => line.includes("control plane speaks")).length,
+      1,
+    );
+  });
+
+  it("uses the same registration gate for unattended claims", async () => {
+    const h = registrationHarness();
+    await h.driver.unattended.tick();
+    assert.deepEqual(h.order, ["health", "register", "claim"]);
+  });
+});
+
 /** A transport that records calls instead of making them. */
 function fakeTransport(overrides = {}) {
   const calls = { claim: [], report: [], abandon: [] };
@@ -348,6 +461,232 @@ describe("the claim / deliver / report loop", () => {
     const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
     await d.onAgentEnd({ success: true, messages: [] }, { sessionKey: "other" });
     assert.equal(tx.calls.report.length, 0);
+  });
+
+  it("renews the granted lease at a fixed cadence until reporting finishes", async () => {
+    const scheduled = [];
+    const beats = [];
+    let finishReport;
+    const reportGate = new Promise((resolve) => { finishReport = resolve; });
+    const tx = {
+      leaseMs: 30_000,
+      async claim() {
+        return { rollouts: [{
+          rolloutId: "r-heartbeat", turnInput: "work", leaseToken: "lease-1",
+          leaseExpiresTs: 109,
+        }] };
+      },
+      async heartbeat(rollout) { beats.push(rollout.rolloutId); },
+      async report() { await reportGate; },
+      async abandon() {},
+    };
+    const d = createRolloutDriver({
+      transport: tx,
+      enqueue: async () => ({ enqueued: true }),
+      now: () => 100_000,
+      heartbeatScheduler: (callback, delayMs) => {
+        const token = { callback, delayMs, cancelled: false };
+        scheduled.push(token);
+        return token;
+      },
+      heartbeatCanceller: (token) => { token.cancelled = true; },
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    assert.equal(scheduled[0].delayMs, 3_000);
+    await scheduled[0].callback();
+    assert.deepEqual(beats, ["r-heartbeat"]);
+    assert.equal(scheduled[1].delayMs, 3_000,
+      "an absolute lease clock was incorrectly recomputed after each beat");
+
+    const reporting = d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1" },
+    );
+    await Promise.resolve();
+    assert.equal(d.heartbeats.size, 1, "renewal stopped before the result POST finished");
+    finishReport();
+    await reporting;
+    assert.equal(d.heartbeats.size, 0);
+    assert.equal(scheduled[1].cancelled, true);
+  });
+
+  it("does not treat a heartbeat racing a terminal report as revocation", async () => {
+    const scheduled = [];
+    let finishReport;
+    const reportGate = new Promise((resolve) => { finishReport = resolve; });
+    const d = createRolloutDriver({
+      transport: {
+        leaseMs: 3_000,
+        async claim() {
+          return { rollouts: [{
+            rolloutId: "r-report-race", turnInput: "work", leaseToken: "lease",
+          }] };
+        },
+        async heartbeat() { throw new LeaseLost("result already closed lease"); },
+        async report() { await reportGate; },
+        async abandon() {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+      heartbeatScheduler: (callback) => {
+        scheduled.push({ callback });
+        return scheduled.at(-1);
+      },
+      heartbeatCanceller() {},
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "host-run-1" });
+    const result = d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1", runId: "host-run-1" },
+    );
+    await Promise.resolve();
+    await scheduled[0].callback();
+    assert.equal(d.blockNextRun.has("s1"), false);
+    assert.equal(d.revokedRuns.has("s1"), false);
+    assert.equal(d.reporting.has("s1"), true);
+    assert.equal(d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "next" }), undefined);
+    finishReport();
+    await result;
+    assert.equal(d.reporting.has("s1"), false);
+  });
+
+  it("paces a long initial grant against the ten-minute renewal ceiling", async () => {
+    const scheduled = [];
+    const d = createRolloutDriver({
+      transport: {
+        leaseMs: 1_800_000,
+        async claim() {
+          return { rollouts: [{
+            rolloutId: "r-long", turnInput: "work", leaseToken: "lease",
+            leaseExpiresTs: 1_900,
+          }] };
+        },
+        async heartbeat() {}, async report() {}, async abandon() {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+      now: () => 100_000,
+      heartbeatScheduler: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return scheduled.at(-1);
+      },
+      heartbeatCanceller() {},
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    assert.equal(scheduled[0].delayMs, 200_000);
+  });
+
+  it("drops a result when the server says its lease was already lost", async () => {
+    const scheduled = [];
+    const cancelled = [];
+    let reports = 0;
+    const tx = {
+      leaseMs: 3_000,
+      async claim() {
+        return { rollouts: [{
+          rolloutId: "r-lost", turnInput: "work", leaseToken: "lease-1",
+        }] };
+      },
+      async heartbeat() { throw new LeaseLost("requeued"); },
+      async report() { reports += 1; },
+      async abandon() {},
+    };
+    const d = createRolloutDriver({
+      transport: tx,
+      enqueue: async () => ({ enqueued: true }),
+      cancel: async (request) => { cancelled.push(request); return true; },
+      heartbeatScheduler: (callback) => {
+        const token = { callback };
+        scheduled.push(token);
+        return token;
+      },
+      heartbeatCanceller() {},
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "host-run-1" });
+    await scheduled[0].callback();
+    assert.equal(d.inFlight.size, 0);
+    assert.equal(d.heartbeats.size, 0);
+    await d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "too late" }] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(reports, 0);
+    assert.equal(cancelled.length, 1);
+    assert.equal(cancelled[0].sessionKey, "s1");
+    assert.equal(cancelled[0].runId, "host-run-1");
+  });
+
+  it("fences later tool side effects when the host cannot abort an active run", async () => {
+    const scheduled = [];
+    const d = createRolloutDriver({
+      transport: {
+        leaseMs: 3_000,
+        async claim() {
+          return { rollouts: [{
+            rolloutId: "r-active", turnInput: "work", leaseToken: "lease",
+          }] };
+        },
+        async heartbeat() { throw new LeaseLost("requeued"); },
+        async report() {}, async abandon() {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+      heartbeatScheduler: (callback) => {
+        scheduled.push({ callback });
+        return scheduled.at(-1);
+      },
+      heartbeatCanceller() {},
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "host-run-1" });
+    await scheduled[0].callback();
+    assert.equal(
+      d.onBeforeToolCall(
+        { runId: "host-run-1", toolName: "write" },
+        { sessionKey: "s1", runId: "host-run-1" },
+      ).block,
+      true,
+    );
+    assert.equal(
+      d.onBeforeToolCall(
+        { runId: "other-run", toolName: "read" },
+        { sessionKey: "s1", runId: "other-run" },
+      ),
+      undefined,
+    );
+    await d.onAgentEnd(
+      { runId: "host-run-1", success: false, messages: [] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(d.revokedRuns.size, 0);
+  });
+
+  it("blocks and drains an injected turn whose lease was lost before it ran", async () => {
+    const scheduled = [];
+    const d = createRolloutDriver({
+      transport: {
+        leaseMs: 3_000,
+        async claim() {
+          return { rollouts: [{
+            rolloutId: "r-queued", turnInput: "work", leaseToken: "lease",
+          }] };
+        },
+        async heartbeat() { throw new LeaseLost("requeued"); },
+        async report() {}, async abandon() {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+      cancel: async () => false,
+      heartbeatScheduler: (callback) => {
+        scheduled.push({ callback });
+        return scheduled.at(-1);
+      },
+      heartbeatCanceller() {},
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    await scheduled[0].callback();
+    assert.equal(d.blockNextRun.has("s1"), true);
+    const decision = d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "late" });
+    assert.equal(decision.outcome, "block");
+    assert.equal(d.blockNextRun.has("s1"), false);
   });
 });
 

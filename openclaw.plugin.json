@@ -18,6 +18,8 @@
       "agentId": {
         "type": "string",
         "minLength": 1,
+        "maxLength": 255,
+        "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*\\s$)(?!.*[\\\\/])[^\\u0000-\\u001F\\u007F-\\u009F]+$",
         "description": "The agent name this install reports as. Unset means PERCEPTEYE_AGENT_ID, then \"openclaw\"."
       },
       "controlPlaneUrl": {
@@ -73,9 +75,40 @@
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
             }
+          },
+          "startupObservation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "systemPrompt",
+              "tools",
+              "provider",
+              "model"
+            ],
+            "properties": {
+              "systemPrompt": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tools": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "provider": {
+                "type": "string",
+                "minLength": 1
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "description": "Optional exact prompt/tool/provider/model observation available before the first claim. It lets registration carry the same SDK-authored execution fingerprint later reports must match."
           }
         },
-        "description": "Host-adapter evidence for exact execution identity. Component names are opaque to the SDK; incomplete or invalid evidence emits no identity."
+        "description": "Host-adapter evidence for exact execution identity. Component names are opaque to the SDK; incomplete or invalid evidence emits no identity. A startup observation enables pre-claim registration binding."
       },
       "mode": {
         "type": "string",

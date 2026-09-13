@@ -34,6 +34,13 @@ const SNAPSHOT = {
   executionComponents: { customer_agent_code: "a".repeat(64) },
 };
 
+const STARTUP_OBSERVATION = {
+  systemPrompt: EVENT.systemPrompt,
+  tools: EVENT.tools,
+  provider: EVENT.provider,
+  model: EVENT.model,
+};
+
 const tracker = (snapshot = SNAPSHOT) => createExecutionIdentityTracker({
   executionSnapshot: snapshot,
   mode: "training",
@@ -41,6 +48,80 @@ const tracker = (snapshot = SNAPSHOT) => createExecutionIdentityTracker({
 });
 
 describe("generic execution reconciliation", () => {
+  it("exposes one immutable pre-claim fingerprint from the runtime descriptor path", () => {
+    const value = tracker({
+      ...SNAPSHOT,
+      startupObservation: STARTUP_OBSERVATION,
+    });
+    const registered = value.registrationFingerprint;
+    assert.match(registered.execution_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(Object.isFrozen(registered), true);
+    const description = value.registrationDescription;
+    assert.equal(description.agent_name, "support");
+    assert.equal(description.system_prompt, STARTUP_OBSERVATION.systemPrompt);
+    assert.equal(description.tool_definitions[0].name, "lookup");
+    assert.equal(Object.isFrozen(description), true);
+    assert.equal(Object.isFrozen(description.tool_definitions), true);
+    assert.equal(Object.isFrozen(description.tool_definitions[0]), true);
+
+    const runtime = value.observe(EVENT, { runId: "run-1" });
+    assert.deepEqual(runtime.fingerprint, registered);
+    assert.throws(() => {
+      registered.execution_sha256 = "b".repeat(64);
+    }, TypeError);
+    assert.throws(() => {
+      description.tool_definitions[0].name = "caller-rewrite";
+    }, TypeError);
+    assert.deepEqual(value.registrationFingerprint, runtime.fingerprint);
+  });
+
+  it("reconciles fields a host omits per run from exact startup evidence", () => {
+    const value = tracker({
+      ...SNAPSHOT,
+      startupObservation: STARTUP_OBSERVATION,
+    });
+    const currentOpenClawEvent = { ...EVENT };
+    delete currentOpenClawEvent.tools;
+    const observed = value.observe(currentOpenClawEvent, { runId: "run-1" });
+    assert.deepEqual(observed.fingerprint, value.registrationFingerprint);
+
+    const drifted = value.observe({
+      ...currentOpenClawEvent, runId: "run-2", model: "different-model",
+    }, {});
+    assert.notDeepEqual(drifted.fingerprint, value.registrationFingerprint);
+    assert.equal(
+      value.observe({ runId: "bare" }, {}), null,
+      "a run id alone must not inherit the registered execution",
+    );
+  });
+
+  it("keeps startup evidence optional and runtime reconciliation backward compatible", () => {
+    const value = tracker();
+    assert.equal(value.registrationFingerprint, null);
+    assert.equal(value.registrationDescription, null);
+    assert.match(
+      value.observe(EVENT, { runId: "run-1" }).fingerprint.execution_sha256,
+      /^[0-9a-f]{64}$/,
+    );
+  });
+
+  it("abstains on lossy startup evidence without disabling exact runtime evidence", () => {
+    const cases = [
+      { ...STARTUP_OBSERVATION, tools: undefined },
+      { ...STARTUP_OBSERVATION, tools: [...EVENT.tools, { description: "nameless" }] },
+      { ...STARTUP_OBSERVATION, provider: "" },
+      // The closed observation has no caller-authored final-digest field.
+      { ...STARTUP_OBSERVATION, execution_sha256: "b".repeat(64) },
+    ];
+    for (const startupObservation of cases) {
+      const value = tracker({ ...SNAPSHOT, startupObservation });
+      assert.equal(value.enabled, true);
+      assert.equal(value.registrationFingerprint, null);
+      assert.equal(value.registrationDescription, null);
+      assert.ok(value.observe(EVENT, { runId: "run-1" }).fingerprint);
+    }
+  });
+
   it("emits only from complete adapter evidence plus an exact observation", () => {
     const enabled = tracker();
     const observed = enabled.observe(EVENT, { runId: "run-1" });
@@ -89,6 +170,11 @@ describe("generic execution reconciliation", () => {
       ...SNAPSHOT,
       executionComponents: { ["bad\ud800name"]: "b".repeat(64) },
     }).snapshot, null);
+    const normalized = normalizeExecutionSnapshot({
+      ...SNAPSHOT,
+      startupObservation: STARTUP_OBSERVATION,
+    });
+    assert.deepEqual(normalized.snapshot.startupObservation, STARTUP_OBSERVATION);
   });
 
   it("matches the Python canonical vector and rejects lossy JSON values", () => {
