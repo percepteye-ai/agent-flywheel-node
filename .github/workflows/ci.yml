@@ -77,7 +77,7 @@ jobs:
       - name: the tarball carries what it claims
         run: |
           npm pack --silent >/dev/null
-          tar -tzf percepteye-agent-flywheel-*.tgz | sed 's|^package/||' | sort > /tmp/shipped.txt
+          tar -tzf agent-flywheel-*.tgz | sed 's|^package/||' | sort > /tmp/shipped.txt
           echo "--- shipped ---"; cat /tmp/shipped.txt
           # LICENSE is the one npm will NOT add for you from a parent
           # directory, and package.json declares MIT. A tarball asserting a

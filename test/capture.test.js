@@ -59,7 +59,7 @@ const OK_CALL = { name: "lookup", arguments: { id: "1" }, outcome: "ok", status_
 
 describe("the on-disk format is the Python SDK's", () => {
   it("names the files exactly as the other end reads them", () => {
-    // `percepteye_agent_flywheel.outcomes` opens these literal names.
+    // `agent_flywheel.outcomes` opens these literal names.
     assert.equal(TURNS_FILENAME, "turns.jsonl");
     assert.equal(CONVERSATION_ID_FILENAME, "conversation_id");
     assert.equal(TASK_ID_FILENAME, "task_id");

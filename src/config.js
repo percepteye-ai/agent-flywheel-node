@@ -20,7 +20,7 @@ import {
   PRODUCTION_IDENTIFIER_MAX_CHARS, productionAgentIdentifier,
 } from "./wire.js";
 
-export const PLUGIN_ID = "percepteye-agent-flywheel";
+export const PLUGIN_ID = "agent-flywheel";
 
 /**
  * The settings this plugin accepts, declared ONCE.

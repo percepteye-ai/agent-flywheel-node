@@ -184,7 +184,7 @@ export function createUnattendedRunner({
         claimed = await transport.claim(1);
       } catch (err) {
         logger?.warn?.(
-          `[percepteye] could not claim a rollout: ${err?.message ?? err}`);
+          `[agent-flywheel] could not claim a rollout: ${err?.message ?? err}`);
         return null;
       }
       const rollout = claimed?.rollouts?.[0];
@@ -198,7 +198,7 @@ export function createUnattendedRunner({
       });
       if (result.started) {
         logger?.info?.(
-          `[percepteye] rollout ${rollout.rolloutId} started unattended in ` +
+          `[agent-flywheel] rollout ${rollout.rolloutId} started unattended in ` +
           `session ${sessionKey}.`);
         return rollout;
       }
@@ -213,7 +213,7 @@ export function createUnattendedRunner({
         // spends one rollout's attempt per poll on a turn that cannot start.
         stopTimer();
         logger?.warn?.(
-          `[percepteye] unattended rollouts are configured but ${result.reason}. ` +
+          `[agent-flywheel] unattended rollouts are configured but ${result.reason}. ` +
           `Falling back to the default lane: this plugin has stopped polling ` +
           `for rollouts and tasks are delivered into the next turn you start. ` +
           `Nothing else changes.`);

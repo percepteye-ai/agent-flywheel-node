@@ -3,16 +3,16 @@
 Generated, not drawn — and **not** by this repo. The renderers live in the
 sibling Python package, which owns the frame pipeline (Pillow + ffmpeg):
 
-    ../../percepteye-agent-flywheel/docs/assets/render.sh node      # these two
-    ../../percepteye-agent-flywheel/docs/assets/render.sh spinner   # the title mark
+    ../../agent-flywheel/docs/assets/render.sh node      # these two
+    ../../agent-flywheel/docs/assets/render.sh spinner   # the title mark
 
 `render.sh node` writes `flywheel-{overview,loop}-node.*` over there; they are
 copied here under their plain names because this repo carries only one flavour.
 
 **Why a flavour exists at all.** The two diagrams show what a customer would
 actually type, and that differs per package. The first cut of this README
-shipped the PYTHON frames — `pip install percepteye-agent-flywheel`,
-`import percepteye_agent_flywheel as fw`, `fw.serve(...)`, and a
+shipped the PYTHON frames — `pip install agent-flywheel`,
+`import agent_flywheel as fw`, `fw.serve(...)`, and a
 `LangChain · ADK · a CLI` chip — to people installing a harness plugin. A
 figure that advertises the wrong SDK is worse than no figure.
 

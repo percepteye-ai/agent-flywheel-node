@@ -1,5 +1,5 @@
 /**
- * percepteye-agent-flywheel — a DeepSeek Harness (Cordis) plugin.
+ * agent-flywheel — a DeepSeek Harness (Cordis) plugin.
  *
  * Records tool-call outcomes into the active rollout's trajectory. Observes
  * only, and here that is guaranteed by the harness rather than merely intended.
@@ -38,7 +38,7 @@ import { extractEntityIds } from "./evidence.js";
 import { createWriter, toWire, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 
 /** Display metadata; labels the plugin in Cordis diagnostics. */
-export const name = "percepteye-agent-flywheel";
+export const name = "agent-flywheel";
 
 export const HOOK_NAME = "tools/result";
 

@@ -289,32 +289,32 @@ export function createRolloutDriver({
               cancelled = await cancel({ sessionKey, runId, rollout }) === true;
               if (!cancelled && runStarted) {
                 logger?.warn?.(
-                  `[percepteye] lease lost for rollout ${rollout.rolloutId}, ` +
+                  `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, ` +
                   `but the host did not confirm that its active run stopped.`,
                 );
               }
             } catch (cancelErr) {
               logger?.warn?.(
-                `[percepteye] lease lost for rollout ${rollout.rolloutId}, and ` +
+                `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, and ` +
                 `the host could not stop its run: ${cancelErr?.message ?? cancelErr}`,
               );
             }
           } else if (runStarted) {
             logger?.warn?.(
-              `[percepteye] lease lost for rollout ${rollout.rolloutId}; this ` +
+              `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; this ` +
               `host exposes no active-run cancellation seam, so every later ` +
               `tool call from the revoked run will be blocked.`,
             );
           }
           logger?.warn?.(
-            `[percepteye] lease lost for rollout ${rollout.rolloutId}; its ` +
+            `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; its ` +
             `${cancelled ? "host run was cancelled and " : ""}result will not ` +
             `be reported because the control plane requeued it.`,
           );
           return;
         }
         logger?.warn?.(
-          `[percepteye] could not renew rollout ${rollout.rolloutId}; the next ` +
+          `[agent-flywheel] could not renew rollout ${rollout.rolloutId}; the next ` +
           `scheduled heartbeat will retry: ${err?.message ?? err}`,
         );
       }
@@ -343,7 +343,7 @@ export function createRolloutDriver({
       await transport.abandon(rollout, { reason, detail });
     } catch (err) {
       logger?.warn?.(
-        `[percepteye] could not abandon rollout ${rollout.rolloutId}; its ` +
+        `[agent-flywheel] could not abandon rollout ${rollout.rolloutId}; its ` +
         `lease will lapse on its own: ${err?.message ?? err}`,
       );
     }
@@ -450,7 +450,7 @@ export function createRolloutDriver({
       // A control plane that cannot be reached must never break the agent.
       // No rollout is delivered and the session runs as an ordinary one.
       logger?.warn?.(
-        `[percepteye] could not claim a rollout: ${err?.message ?? err}`,
+        `[agent-flywheel] could not claim a rollout: ${err?.message ?? err}`,
       );
       return null;
     }
@@ -498,13 +498,13 @@ export function createRolloutDriver({
         sessionKey, rollout, "entrypoint_error",
         "the host declined to queue the task for the next turn, so the agent " +
         "never received it (check " +
-        "plugins.entries.percepteye-agent-flywheel.hooks.allowPromptInjection)",
+        "plugins.entries.agent-flywheel.hooks.allowPromptInjection)",
       );
       return null;
     }
 
     logger?.info?.(
-      `[percepteye] rollout ${rollout.rolloutId} delivered to session ` +
+      `[agent-flywheel] rollout ${rollout.rolloutId} delivered to session ` +
       `${sessionKey}; it runs on the next turn.`,
     );
     return rollout;
@@ -543,7 +543,7 @@ export function createRolloutDriver({
       // opposite handling and sharing one label is how a real failure gets
       // triaged as a substrate fault.
       logger?.info?.(
-        `[percepteye] rollout ${rollout.rolloutId} ran and failed; reporting it.`,
+        `[agent-flywheel] rollout ${rollout.rolloutId} ran and failed; reporting it.`,
       );
     }
 
@@ -574,7 +574,7 @@ export function createRolloutDriver({
     if (modelCallMeasurement.count === null && !warnedMissingModelCallCount) {
       warnedMissingModelCallCount = true;
       logger?.warn?.(
-        `[percepteye] rollout ${rollout.rolloutId} has no exact, independently ` +
+        `[agent-flywheel] rollout ${rollout.rolloutId} has no exact, independently ` +
         `observed model-call count (${modelCallMeasurement.reason}); it will be ` +
         `reported without llm_call_count and is ineligible for verified ` +
         `on-policy training.`,
@@ -602,7 +602,7 @@ export function createRolloutDriver({
       return rollout;
     } catch (err) {
       logger?.warn?.(
-        `[percepteye] could not report rollout ${rollout.rolloutId}: ` +
+        `[agent-flywheel] could not report rollout ${rollout.rolloutId}: ` +
         `${err?.message ?? err}`,
       );
       return null;
@@ -730,7 +730,7 @@ export function registerRolloutDriver(api, {
       ) {
         throw new ConfigurationError(
           `control plane speaks ${JSON.stringify(served)}, this SDK speaks ` +
-          `${CONTRACT_VERSION}. Upgrade percepteye-agent-flywheel-node.`,
+          `${CONTRACT_VERSION}. Upgrade agent-flywheel.`,
         );
       }
       if (typeof transport?.register !== "function") {

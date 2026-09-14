@@ -35,13 +35,15 @@ describe("the vendored schema IS the contract", () => {
   });
 
   it("matches the Python authority for both production-turn definitions", () => {
-    const sibling = new URL(
+    // The Python checkout beside this one: `agent-flywheel` is what a clone
+    // of the repo is called, the prefixed name what older checkouts carry.
+    const sibling = [
+      "../../agent-flywheel/schema/flywheel-1.json",
       "../../percepteye-agent-flywheel/schema/flywheel-1.json",
-      import.meta.url,
-    );
+    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
     assert.ok(schema.$defs.ProductionTurn);
     assert.ok(schema.$defs.ProductionTurnBatch);
-    if (!existsSync(sibling)) return;
+    if (!sibling) return;
 
     const authoritative = JSON.parse(readFileSync(sibling, "utf8"));
     for (const name of ["ProductionTurn", "ProductionTurnBatch"]) {

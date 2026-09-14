@@ -59,7 +59,7 @@
  * (`CONVERSATION_HOOK_NAMES`, dist/hook-types-DQ9eTy2x.d.ts:386). The host
  * REFUSES to register it for a non-bundled plugin unless the operator opts in
  * with
- * `plugins.entries.percepteye-agent-flywheel.hooks.allowConversationAccess=true`
+ * `plugins.entries.agent-flywheel.hooks.allowConversationAccess=true`
  * (dist/registry-B8eQDFB4.js:4226-4241). That refusal is a warn-level
  * diagnostic, not a throw, so a missing opt-in looks exactly like a working
  * install that never fires. `register()` below says so out loud at startup
@@ -331,7 +331,7 @@ export function registerDescriber(api, { logger = null, onObservation = null } =
 
   const describer = createDescriber({
     onError: (err) => logger?.warn?.(
-      `[percepteye-agent-flywheel] agent description write failed; this agent ` +
+      `[agent-flywheel] agent description write failed; this agent ` +
       `will register as introspection_state=unreadable and no workflows will ` +
       `be generated for it: ${err?.message ?? err}`,
     ),

@@ -241,7 +241,7 @@ describe("training worker registration gates every claim", () => {
     assert.deepEqual(h.registrations[0], {
       agent_id: "support",
       mode: "rollout",
-      sdk: "percepteye-agent-flywheel-node/0.1.0",
+      sdk: "agent-flywheel-node/0.1.0",
       contract_version: "flywheel/1",
       reports_tool_calls: true,
       isolation: "inprocess",

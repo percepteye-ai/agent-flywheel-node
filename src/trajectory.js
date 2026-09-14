@@ -3,7 +3,7 @@
  *
  * This file is the wire format, not an implementation detail. The Python SDK
  * reads exactly `$PERCEPTEYE_TRAJECTORY_DIR/tool_calls.jsonl`, so this module
- * and `percepteye_agent_flywheel.outcomes` are two ends of one ABI. Anything
+ * and `agent_flywheel.outcomes` are two ends of one ABI. Anything
  * that can append a line can feed the flywheel -- that is why the format is a
  * file and not a function call.
  *

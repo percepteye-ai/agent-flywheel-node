@@ -33,7 +33,7 @@
  * genuinely missing, and it names WHICH. See `pairNote`: that conditional is
  * the whole point of the pair check.
  *
- * `percepteye_agent_flywheel.current_prompt()` (Python) hands the text back
+ * `agent_flywheel.current_prompt()` (Python) hands the text back
  * and stops, deliberately -- it is a library inside an arbitrary Python
  * process and has no idea where that process's prompt or model comes from.
  * Here we ARE the host's prompt and model seams, so the check that docstring

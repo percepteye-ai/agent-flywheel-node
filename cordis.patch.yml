@@ -7,5 +7,5 @@
 # in a profile permanently — it is a no-op in production and a recorder during
 # a rollout.
 - insert:
-    - id: percepteye-agent-flywheel
-      name: 'percepteye-agent-flywheel/dsh'
+    - id: agent-flywheel
+      name: 'agent-flywheel/dsh'

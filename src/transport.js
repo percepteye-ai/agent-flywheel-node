@@ -10,7 +10,7 @@
  * `request("METHOD", "<path>")` out of THIS SOURCE and asserts the control
  * plane serves it. A count restates that check without performing it.
  *
- * A port of `percepteye_agent_flywheel/transport.py`. Everything here is
+ * A port of `agent_flywheel/transport.py`. Everything here is
  * OUTBOUND-ONLY: there is no listening socket anywhere in this package, and a
  * customer's agent opens every connection.
  */
@@ -288,7 +288,7 @@ export class AttachTransport {
    * default retry behaviour ON.
    *
    * The idempotency key covers the BATCH, matching
-   * `percepteye_agent_flywheel.transport.report_turns`, so a network-level
+   * `agent_flywheel.transport.report_turns`, so a network-level
    * replay of the same bytes is collapsed before the per-turn rule is reached.
    * Both ends derive it the same way -- a sha256 over the turns, first 32 hex
    * characters -- because two SDKs deriving one key differently would defeat
