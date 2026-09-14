@@ -204,7 +204,7 @@ export function createTurnCapture({ root, logger = null }) {
     if (warned) return;
     warned = true;
     logger?.warn?.(
-      `[percepteye] could not write a captured turn; production capture is ` +
+      `[agent-flywheel] could not write a captured turn; production capture is ` +
       `not recording for this run: ${err?.message ?? err}`,
     );
   };
@@ -406,7 +406,7 @@ export function createTurnUploader({
           // Whole chunk unacknowledged: leave every marker unwritten so the
           // next flush retries it.
           logger?.warn?.(
-            `[percepteye] could not upload ${chunk.length} captured turn(s); ` +
+            `[agent-flywheel] could not upload ${chunk.length} captured turn(s); ` +
             `they stay on disk and are retried: ${err?.message ?? err}`);
           continue;
         }

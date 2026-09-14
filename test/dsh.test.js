@@ -160,7 +160,7 @@ describe("the plugin as Cordis loads it", () => {
     const mod = await import("../src/dsh.js");
     assert.equal(mod.default, undefined);
     assert.equal(typeof mod.apply, "function");
-    assert.equal(mod.name, "percepteye-agent-flywheel");
+    assert.equal(mod.name, "agent-flywheel");
   });
 
   it("subscribes to the observer hook and only that", () => {
@@ -223,7 +223,7 @@ describe("the plugin as Cordis loads it", () => {
     // The patch names the SUBPATH, because the bare package resolves to the
     // OpenClaw entry and its default export.
     const patch = readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8");
-    assert.ok(patch.includes("percepteye-agent-flywheel/dsh"), patch);
+    assert.ok(patch.includes("agent-flywheel/dsh"), patch);
     assert.equal(pkg.exports["./dsh"], "./src/dsh.js");
   });
 
@@ -232,6 +232,6 @@ describe("the plugin as Cordis loads it", () => {
     // the Cordis side must not have one; sharing a module is impossible.
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     assert.notEqual(pkg.openclaw.extensions[0], pkg.exports["./dsh"]);
-    assert.equal(name, "percepteye-agent-flywheel");
+    assert.equal(name, "agent-flywheel");
   });
 });

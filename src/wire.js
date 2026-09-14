@@ -1,7 +1,7 @@
 /**
  * The flywheel/1 wire types, and the rules that keep a report honest.
  *
- * Two ends of ONE contract: `percepteye_agent_flywheel/contract.py` is the
+ * Two ends of ONE contract: `agent_flywheel/contract.py` is the
  * other, and `schema/flywheel-1.json` ($id
  * https://schemas.percepteye.ai/flywheel/1.json) is the arbiter. A test in
  * this package asserts CONTRACT_VERSION equals that schema's

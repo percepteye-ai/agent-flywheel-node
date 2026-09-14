@@ -9,7 +9,7 @@
      the owner included. Verified 2026-09-06: all three returned HTTP 404.
 
      THE TRADE-OFF, so nobody has to rediscover it a third time: relative wins
-     while the repo is private and neither package is published, because GitHub
+     while the repo is private and this package is not on npm, because GitHub
      is the only surface anyone reads. Absolute wins on PyPI/npm — and only
      works once the repo is PUBLIC. The two flip together, never separately.
 
@@ -17,7 +17,9 @@
      <img> src is relative AND names a file that exists. Shields badges are
      markdown `![](https://…)`, not <img>, and are correctly absolute. -->
 
-# <img src="docs/assets/flywheel-spinner.gif" height="44" alt="" align="absmiddle"> percepteye-agent-flywheel — Node
+# <img src="docs/assets/flywheel-spinner.gif" height="44" alt="" align="absmiddle"> Agent Flywheel — Node
+
+Built and Maintained by **[PerceptEye](https://percepteye.ai)**
 
 ### **Your agent gets better at its own job, on its own work, without you writing a training pipeline.**
 
@@ -25,8 +27,8 @@
 One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
 <!-- BADGES — `npm` was a live shields.io version badge and rendered as a red
-     "package not found": percepteye-agent-flywheel is not published to npm
-     (verified against the live registry 2026-09-06). It is the only live-data
+     "package not found": agent-flywheel is not published to npm
+     (verified against the live registry 2026-09-14). It is the only live-data
      badge in this README — every other badge here is a hardcoded shields
      `/badge/` and renders fine — so there is no `ci` badge to fix, and none
      should be added while this repo is private: shields.io queries GitHub
@@ -34,17 +36,18 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
      ON PUBLISH restore this one verbatim. Do not hand-write a version into a
      static badge — that asserts a release nothing checks.
-       [![npm](https://img.shields.io/npm/v/percepteye-agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/percepteye-agent-flywheel)
+       [![npm](https://img.shields.io/npm/v/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/agent-flywheel)
 
      Separately: the `tests` badge below is hardcoded and nothing checks it
-     either; its 373 was true on 2026-09-06. Re-derive with `npm test` (prints
-     "tests 373" / "skipped 0") before trusting it — the Python SDK's equivalent
-     badge had drifted to 54 short. -->
+     either; its 434 was true on 2026-09-14 (it had drifted to 373 while the
+     suite grew). Re-derive with `npm test` (prints "tests 434" / "skipped 0")
+     before trusting it — the Python SDK's equivalent badge had drifted to 54
+     short. -->
 [![npm](https://img.shields.io/badge/npm-not_yet_published-64748b?style=for-the-badge&logo=npm&logoColor=white)](#-develop)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-373_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-434_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -83,12 +86,12 @@ No container to build. No cluster to run. No GPU to provision. No inbound port t
 One package, two harnesses. Pick your line:
 
 ```bash
-openclaw plugins install percepteye-agent-flywheel          # OpenClaw
-dsh plugin --profile <name> add percepteye-agent-flywheel   # DeepSeek Harness
+openclaw plugins install agent-flywheel          # OpenClaw
+dsh plugin --profile <name> add agent-flywheel   # DeepSeek Harness
 ```
 
 > [!WARNING]
-> **Not on npm yet.** Those two lines are what the install *will* be; today they end in a registry 404, because `percepteye-agent-flywheel` is not published. Until it is, install from a clone — no build step and no dependencies to fetch:
+> **Not on npm yet.** Those two lines are what the install *will* be; today they end in a registry 404, because `agent-flywheel` is not published. Until it is, install from a clone — no build step and no dependencies to fetch:
 >
 > ```bash
 > git clone https://github.com/percepteye-ai/agent-flywheel-node
@@ -104,7 +107,7 @@ Want it to start contributing? Add a key and one host setting:
 export PERCEPTEYE_API_KEY=pefw_...        # optional — without it, nothing leaves the machine
 ```
 
-**Where a `pefw_` key comes from:** it is issued by whoever operates your Percepteye control plane — ask them, or write to **support@percepteye.ai**. There is no self-service page to sign up on, and this README deliberately does not point you at one. Everything above the key — local recording of your agent's real tool-failure rate — works without one, forever.
+**Where a `pefw_` key comes from:** it is issued by whoever operates your PerceptEye control plane — ask them, or write to **support@percepteye.ai**. There is no self-service page to sign up on, and this README deliberately does not point you at one. Everything above the key — local recording of your agent's real tool-failure rate — works without one, forever.
 
 <!-- OWNER — A REAL KEY-REQUEST ROUTE IS STILL MISSING; DROP IT IN HERE.
      The paragraph above is the canonical wording for both SDKs: the Python
@@ -124,7 +127,7 @@ export PERCEPTEYE_API_KEY=pefw_...        # optional — without it, nothing lea
 
 ```jsonc
 // your OpenClaw config
-{ "plugins": { "entries": { "percepteye-agent-flywheel": {
+{ "plugins": { "entries": { "agent-flywheel": {
     "hooks": { "allowConversationAccess": true } } } } }
 ```
 
@@ -152,7 +155,7 @@ That setting does **three** jobs, and every one of them is dropped without it. I
 | **② Run** | the task is delivered into your agent's context, in a dedicated `percepteye-rollout-*` session | your agent, unchanged |
 | **③ Record** | every executed tool call lands as `ok` / `failed` / **`unknown`** | the `after_tool_call` hook |
 | **④ Report** | the trajectory and answer go back; unsupported evidence stays absent | the plugin |
-| **⑤ Train** | tasks generated, rollouts graded, dataset built, policy trained and promoted | **Percepteye — you build none of it** |
+| **⑤ Train** | tasks generated, rollouts graded, dataset built, policy trained and promoted | **PerceptEye — you build none of it** |
 | **⑥ Serve** | the approved system prompt **and** the model it was certified with are applied to your production install automatically, once a person has approved each | the plugin |
 
 That last beat is what makes it a flywheel rather than a pipeline: **the better agent generates the better evidence.**
@@ -229,7 +232,7 @@ export PERCEPTEYE_APPLY_PROMPT=0   # keep recording, but leave the system prompt
 export PERCEPTEYE_APPLY_MODEL=0    # keep recording, but leave the model alone
 ```
 
-All three are also OpenClaw config settings (`capture`, `applyPrompt`, `applyModel`), where config wins over the environment. `PERCEPTEYE_APPLY_PROMPT=0` subscribes no prompt hook at all and does not even fetch the prompt text; `PERCEPTEYE_APPLY_MODEL=0` subscribes no model hook and registers no provider. Your host can also block them from the outside: `plugins.entries.percepteye-agent-flywheel.hooks.allowPromptInjection: false` stops the prompt half, and simply not setting `allowConversationAccess` stops the model half.
+All three are also OpenClaw config settings (`capture`, `applyPrompt`, `applyModel`), where config wins over the environment. `PERCEPTEYE_APPLY_PROMPT=0` subscribes no prompt hook at all and does not even fetch the prompt text; `PERCEPTEYE_APPLY_MODEL=0` subscribes no model hook and registers no provider. Your host can also block them from the outside: `plugins.entries.agent-flywheel.hooks.allowPromptInjection: false` stops the prompt half, and simply not setting `allowConversationAccess` stops the model half.
 
 <br/>
 
@@ -325,7 +328,7 @@ That line is real output from a live OpenClaw run, and it is the same format the
 
 ## ⚙️ Configuration
 
-Scalar settings are settable two ways: in your OpenClaw config under `plugins.entries.percepteye-agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch. The nested execution snapshot is config-only so component names and completeness remain typed rather than being parsed from a shell string.
+Scalar settings are settable two ways: in your OpenClaw config under `plugins.entries.agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch. The nested execution snapshot is config-only so component names and completeness remain typed rather than being parsed from a shell string.
 
 | config key | environment variable | default | what it decides |
 |:--|:--|:--|:--|
@@ -342,7 +345,7 @@ The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a no
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`); `PERCEPTEYE_CAPTURE_DIR` overrides just the production turn capture (default `$PERCEPTEYE_HOME/captured`); and `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's outcomes go, which the rollout driver sets per rollout.
 
-One host setting is not ours and has no environment form: `plugins.entries.percepteye-agent-flywheel.hooks.allowConversationAccess`, which OpenClaw itself requires before it will deliver conversation hooks to a non-bundled plugin. See [Install](#-install-in-one-call).
+One host setting is not ours and has no environment form: `plugins.entries.agent-flywheel.hooks.allowConversationAccess`, which OpenClaw itself requires before it will deliver conversation hooks to a non-bundled plugin. See [Install](#-install-in-one-call).
 
 <br/>
 
@@ -363,10 +366,10 @@ One host setting is not ours and has no environment form: `plugins.entries.perce
 
 **Pick one.** Two implementations of the same flywheel for two different homes — install whichever matches the harness your agent already runs in, never both.
 
-| | this package | [`percepteye-agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) (Python) |
+| | this package | [`agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) (Python) |
 |---|---|---|
 | **you have** | an OpenClaw or DeepSeek Harness agent | a Python agent, or a CLI agent you launch yourself |
-| **you install** | a harness plugin | a pip package — **not on PyPI yet either**, so install it from its repository |
+| **you install** | a harness plugin | a pip package — `pip install agent-flywheel` |
 | **you change** | nothing — the harness loads it | nothing — one import, one call |
 | **the approved prompt** | applied for you — the plugin *is* your host's prompt seam | handed back by `current_prompt()` for you to apply; a library in someone else's process has nowhere to put it |
 | **the approved model** | applied for you — the plugin registers a provider and points the turn at it | handed back as an endpoint for you to call |
@@ -376,7 +379,7 @@ One host setting is not ours and has no environment form: `plugins.entries.perce
 ## 🛠 Develop
 
 ```bash
-npm test     # 392 tests, no install step — node:test, zero dependencies
+npm test     # 434 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

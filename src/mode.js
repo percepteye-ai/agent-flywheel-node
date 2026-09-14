@@ -58,7 +58,7 @@
  * `if (mode === "training")` inside each handler, where a missed call site is a
  * silent breach of the promise rather than a hook that is simply not there.
  *
- * The vocabulary is the PYTHON SDK's, verbatim (`percepteye_agent_flywheel`'s
+ * The vocabulary is the PYTHON SDK's, verbatim (`agent_flywheel`'s
  * `_MODE_ALIASES`). A customer switching harnesses must not have to learn a
  * second spelling of the same switch -- they deploy one package or the other,
  * never both, and `PERCEPTEYE_AGENT_MODE=prod` has to mean the same thing in

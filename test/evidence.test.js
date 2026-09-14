@@ -69,7 +69,7 @@ describe("extracting the identity a write produced", () => {
   });
 
   it("agrees with the Python field set", () => {
-    // Mirrors percepteye_agent_flywheel.evidence.IDENTITY_FIELDS exactly.
+    // Mirrors agent_flywheel.evidence.IDENTITY_FIELDS exactly.
     assert.deepEqual([...IDENTITY_FIELDS].sort(),
       ["gid", "id", "key", "sid", "uuid"]);
   });

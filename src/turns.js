@@ -19,7 +19,7 @@
  *   agent_fingerprint.json  an exact, SDK-reconciled execution fingerprint
  *   agent_fingerprint.conflict  permanent abstention if writers disagree
  *
- * The Python end is `percepteye_agent_flywheel.outcomes` (`record_turn_text`,
+ * The Python end is `agent_flywheel.outcomes` (`record_turn_text`,
  * `read_turn_text`, `read_conversation_id`) and `production.Attachment._turn_wire`.
  * The rules below are not restatements of that code; they are the same rules,
  * and where one is subtle the reason is given so the two do not drift apart by

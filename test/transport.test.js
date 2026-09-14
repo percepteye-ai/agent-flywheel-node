@@ -30,7 +30,7 @@ function recorder(bodies = {}) {
 
 const t = (bodies) => {
   const r = recorder(bodies);
-  return { tx: new AttachTransport(r.client, { agentId: "goose" }), calls: r.calls };
+  return { tx: new AttachTransport(r.client, { agentId: "my-agent" }), calls: r.calls };
 };
 
 describe("claiming is not replayable", () => {
@@ -100,7 +100,7 @@ describe("claiming is not replayable", () => {
     const calls = [];
     const low = new AttachTransport(
       { request: (_m, _p, opts) => { calls.push(opts); return { rollouts: [] }; } },
-      { agentId: "goose", waitMs: -1, leaseMs: 1 },
+      { agentId: "my-agent", waitMs: -1, leaseMs: 1 },
     );
     await low.claim(1);
     assert.equal(calls[0].jsonBody.wait_ms, 0);
@@ -108,7 +108,7 @@ describe("claiming is not replayable", () => {
 
     const high = new AttachTransport(
       { request: (_m, _p, opts) => { calls.push(opts); return { rollouts: [] }; } },
-      { agentId: "goose", waitMs: 90_000, leaseMs: 9_000_000 },
+      { agentId: "my-agent", waitMs: 90_000, leaseMs: 9_000_000 },
     );
     await high.claim(1);
     assert.equal(calls[1].jsonBody.wait_ms, 25_000);
@@ -169,8 +169,8 @@ describe("abandon is typed", () => {
 describe("registration", () => {
   it("is idempotent per agent", async () => {
     const { tx, calls } = t();
-    await tx.register({ agent_id: "goose" });
-    assert.equal(calls[0].idempotencyKey, "reg-goose");
+    await tx.register({ agent_id: "my-agent" });
+    assert.equal(calls[0].idempotencyKey, "reg-my-agent");
   });
   it("requires an agentId at construction", () => {
     assert.throws(() => new AttachTransport({}, {}));
@@ -180,7 +180,7 @@ describe("registration", () => {
     const { tx, calls } = t({ "/rollouts/claim": { rollouts: [] } });
     const execution = "a".repeat(64);
     await tx.register({
-      agent_id: "goose", mode: "rollout", agent_execution_sha256: execution,
+      agent_id: "my-agent", mode: "rollout", agent_execution_sha256: execution,
     });
     await tx.claim(1);
     assert.equal(calls[1].jsonBody.agent_execution_sha256, execution);
@@ -188,7 +188,7 @@ describe("registration", () => {
 
   it("does not invent an identity for a legacy registration", async () => {
     const { tx, calls } = t({ "/rollouts/claim": { rollouts: [] } });
-    await tx.register({ agent_id: "goose", mode: "rollout" });
+    await tx.register({ agent_id: "my-agent", mode: "rollout" });
     await tx.claim(1);
     assert.equal("agent_execution_sha256" in calls[1].jsonBody, false);
   });
@@ -196,7 +196,7 @@ describe("registration", () => {
   it("does not activate identity when registration fails", async () => {
     const { tx } = t({ "/agents": new Error("registration refused") });
     await assert.rejects(() => tx.register({
-      agent_id: "goose",
+      agent_id: "my-agent",
       mode: "rollout",
       agent_execution_sha256: "a".repeat(64),
     }));

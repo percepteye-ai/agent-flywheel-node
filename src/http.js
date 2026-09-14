@@ -1,7 +1,7 @@
 /**
  * The one HTTP client, with retry semantics that READ THE RESPONSE.
  *
- * A port of `percepteye_agent_flywheel/_http.py`, kept deliberately
+ * A port of `agent_flywheel/_http.py`, kept deliberately
  * line-for-line in behaviour because the two are one contract with one server.
  * Its docstring records what it was written against: a previous SDK whose
  * retry helper returned the response without reading its status -- so a 503
@@ -54,7 +54,7 @@ export const SDK_VERSION = JSON.parse(
   readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"),
 ).version;
 
-export const SDK_UA = `percepteye-agent-flywheel-node/${SDK_VERSION}`;
+export const SDK_UA = `agent-flywheel-node/${SDK_VERSION}`;
 
 function neverSent(err) {
   // An AbortError is our own timeout firing. The request was in flight; the

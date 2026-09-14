@@ -1,5 +1,5 @@
 /**
- * percepteye-agent-flywheel — an OpenClaw plugin that records tool-call outcomes.
+ * agent-flywheel — an OpenClaw plugin that records tool-call outcomes.
  *
  * WHY THIS HOOK. OpenClaw exposes three places to see a tool result, and only
  * one of them is both complete and incapable of changing the run:
@@ -86,7 +86,7 @@ import {
 } from "./capture.js";
 import { createExecutionIdentityTracker } from "./execution-identity.js";
 
-export const PLUGIN_ID = "percepteye-agent-flywheel";
+export const PLUGIN_ID = "agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
 

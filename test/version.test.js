@@ -43,7 +43,7 @@ describe("the package version has one source", () => {
 
   it("is what every request tells the control plane", () => {
     assert.equal(SDK_VERSION, pkg.version);
-    assert.equal(SDK_UA, `percepteye-agent-flywheel-node/${pkg.version}`);
+    assert.equal(SDK_UA, `agent-flywheel-node/${pkg.version}`);
   });
 
   it("the two hand-typed descriptions are the SAME description", () => {

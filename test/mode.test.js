@@ -67,7 +67,7 @@ describe("resolveMode", () => {
   });
 
   it("speaks the Python SDK's alias vocabulary exactly", () => {
-    // Kept in step with `percepteye_agent_flywheel/__init__.py:_MODE_ALIASES`.
+    // Kept in step with `agent_flywheel/__init__.py:_MODE_ALIASES`.
     assert.deepEqual(MODE_ALIASES, {
       training: "training",
       train: "training",
