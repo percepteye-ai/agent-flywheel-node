@@ -221,9 +221,12 @@ describe("the plugin as Cordis loads it", () => {
     assert.ok(pkg.files.includes("cordis.patch.yml"), "the patch must be published");
     assert.ok(existsSync(new URL("../cordis.patch.yml", import.meta.url)));
     // The patch names the SUBPATH, because the bare package resolves to the
-    // OpenClaw entry and its default export.
+    // OpenClaw entry and its default export. And it names it under the
+    // PUBLISHED package name, so the two can only move together: the loader
+    // resolves this string in the profile's node_modules, where a stale name
+    // is a plugin that installs and never mounts.
     const patch = readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8");
-    assert.ok(patch.includes("agent-flywheel/dsh"), patch);
+    assert.ok(patch.includes(`name: '${pkg.name}/dsh'`), patch);
     assert.equal(pkg.exports["./dsh"], "./src/dsh.js");
   });
 
