@@ -150,6 +150,27 @@ export const CONFIG_SCHEMA = {
         "PERCEPTEYE_AGENT_MODE, then training; a value here overrides the " +
         "environment.",
     },
+    introspect: {
+      type: ["string", "boolean"],
+      description:
+        "Set false/0/off to register this agent with no description at all; " +
+        "the control plane records that as your opt-out. " +
+        "PERCEPTEYE_INTROSPECT=0 refuses too, whatever this says. Unset " +
+        "means on.",
+    },
+    // Its contents are checked by declaration.js, not here: a host that
+    // refused a typo in this schema would fail the plugin load, and take local
+    // capture down with it.
+    describe: {
+      type: "object",
+      description:
+        "The agent's own description, for what this plugin cannot observe " +
+        "(OpenClaw's llm_input carries no tools): system_prompt, tools (the " +
+        "list the agent sends its model -- OpenAI function specs, Anthropic " +
+        "tools, or {name, description, input_schema, read_only}) and model " +
+        "(a name, or {model_name, provider, temperature, max_tokens}). What " +
+        "you declare wins where given; it anchors no execution identity.",
+    },
   },
 };
 
@@ -244,6 +265,18 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     // Adapter-owned opaque evidence. Validation and fail-closed reconciliation
     // live with the identity code; configuration only transports the snapshot.
     executionSnapshot: pluginConfig.executionSnapshot ?? null,
+    // CONSENT to describe this agent, asked as the Python SDK asks it and
+    // refusable from EITHER side: `introspect: false` here (Python's
+    // `serve(introspect=False)`) or PERCEPTEYE_INTROSPECT=0 (for an operator
+    // who cannot edit the config). Unlike the switches above, neither side
+    // overrides the other -- one refusal is enough, as it is in Python.
+    introspect:
+      enabledUnlessOff(pluginConfig.introspect, undefined) &&
+      enabledUnlessOff(undefined, env.PERCEPTEYE_INTROSPECT),
+    // The operator's own description, transported only. It is checked in
+    // index.js, where a bad one can be refused loudly without failing the
+    // plugin load; see declaration.js.
+    describe: pluginConfig.describe ?? null,
     contributing: Boolean(apiKey),
   };
 }

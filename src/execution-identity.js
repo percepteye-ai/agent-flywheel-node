@@ -442,3 +442,27 @@ export function createExecutionIdentityTracker({
     get refusal() { return normalized.reason; },
   };
 }
+
+/**
+ * `tracker` with every fingerprint withheld and its startup observation kept.
+ *
+ * For a DECLARED description (`describe`, see declaration.js): the declaration
+ * still merges over what was observed at startup, but it is the customer's
+ * word rather than an observation of what runs, so it anchors no execution
+ * identity -- not at registration, not on a rollout report, not on a
+ * production turn. The Python SDK withholds its digest the same way whenever
+ * `describe=` contributed.
+ */
+export function withholdFingerprints(tracker) {
+  return {
+    observe: () => null,
+    fingerprintFor: () => null,
+    consumeFingerprintFor: () => null,
+    get registrationFingerprint() { return null; },
+    get registrationDescription() { return tracker.registrationDescription; },
+    get enabled() { return false; },
+    get refusal() {
+      return "the description is declared with describe, not observed";
+    },
+  };
+}
