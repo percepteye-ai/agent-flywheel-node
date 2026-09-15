@@ -104,26 +104,16 @@ dsh plugin --profile <name> add agent-flywheel   # DeepSeek Harness
 Want it to start contributing? Add a key and one host setting:
 
 ```bash
-export PERCEPTEYE_API_KEY=pefw_...        # optional — without it, nothing leaves the machine
+export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch.percepteye.ai
 ```
 
-**Where a `pefw_` key comes from:** it is issued by whoever operates your PerceptEye control plane — ask them, or write to **support@percepteye.ai**. There is no self-service page to sign up on, and this README deliberately does not point you at one. Everything above the key — local recording of your agent's real tool-failure rate — works without one, forever.
+**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. Connect your agent there and you get its key — shown once, and scoped to that one agent. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
 
-<!-- OWNER — A REAL KEY-REQUEST ROUTE IS STILL MISSING; DROP IT IN HERE.
-     The paragraph above is the canonical wording for both SDKs: the Python
-     README says the same thing, and the two must not diverge again.
-
-     support@percepteye.ai is the best address either repo can offer, not a
-     verified one. security@percepteye.ai is the only address corroborated
-     anywhere (this README, the Python README, the Python site FAQ);
-     support@ appears nowhere else in either repo. percepteye.ai does have
-     Google Workspace MX, so mail to the domain is deliverable, but nothing
-     here proves a support mailbox or alias exists — please confirm it or
-     replace it.
-
-     There is no signup or key-request route anywhere in either repo, and
-     docs.percepteye.ai is still NXDOMAIN, so none was invented. When a real
-     one exists, add it here AND in the Python README's matching paragraph. -->
+<!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
+     control plane, and sign-in is free and self-serve at
+     https://launch.percepteye.ai (HTTP 200, "Mission Control · PerceptEye").
+     Connecting an agent there issues its key -- shown once, bound to that
+     agent. The Python README says the same; keep the two in step. -->
 
 ```jsonc
 // your OpenClaw config
