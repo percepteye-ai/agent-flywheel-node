@@ -9,9 +9,9 @@
      the owner included. Verified 2026-09-06: all three returned HTTP 404.
 
      THE TRADE-OFF, so nobody has to rediscover it a third time: relative wins
-     while the repo is private and this package is not on npm, because GitHub
-     is the only surface anyone reads. Absolute wins on PyPI/npm — and only
-     works once the repo is PUBLIC. The two flip together, never separately.
+     while the repo is private, because GitHub is the only surface that can
+     show these files at all. Absolute wins on PyPI/npm — and only works once
+     the repo is PUBLIC. The two flip together, never separately.
 
      Held by a test, not by this comment: `test/oss-boundary.test.js` asserts every
      <img> src is relative AND names a file that exists. Shields badges are
@@ -26,24 +26,20 @@ Built and Maintained by **[PerceptEye](https://percepteye.ai)**
 **It keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
 One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
-<!-- BADGES — `npm` was a live shields.io version badge and rendered as a red
-     "package not found": agent-flywheel is not published to npm
-     (verified against the live registry 2026-09-14). It is the only live-data
-     badge in this README — every other badge here is a hardcoded shields
-     `/badge/` and renders fine — so there is no `ci` badge to fix, and none
-     should be added while this repo is private: shields.io queries GitHub
-     anonymously and a private repo 404s regardless of what CI did.
+<!-- BADGES — `npm` is the only live-data badge in this README: it reads the
+     registry, so it cannot claim a release that never happened. Never swap it
+     for a static badge with a hand-written version — that asserts a release
+     nothing checks. Every other badge here is a hardcoded shields `/badge/`.
+     There is no `ci` badge, and none should be added while this repo is
+     private: shields.io queries GitHub anonymously and a private repo 404s
+     regardless of what CI did.
 
-     ON PUBLISH restore this one verbatim. Do not hand-write a version into a
-     static badge — that asserts a release nothing checks.
-       [![npm](https://img.shields.io/npm/v/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/agent-flywheel)
-
-     Separately: the `tests` badge below is hardcoded and nothing checks it
-     either; its 434 was true on 2026-09-14 (it had drifted to 373 while the
-     suite grew). Re-derive with `npm test` (prints "tests 434" / "skipped 0")
+     Separately: the `tests` badge below is hardcoded and nothing checks it;
+     its 434 was true on 2026-09-14 (it had drifted to 373 while the suite
+     grew). Re-derive with `npm test` (prints "tests 434" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
-[![npm](https://img.shields.io/badge/npm-not_yet_published-64748b?style=for-the-badge&logo=npm&logoColor=white)](#-develop)
+[![npm](https://img.shields.io/npm/v/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
@@ -89,15 +85,6 @@ One package, two harnesses. Pick your line:
 openclaw plugins install agent-flywheel          # OpenClaw
 dsh plugin --profile <name> add agent-flywheel   # DeepSeek Harness
 ```
-
-> [!WARNING]
-> **Not on npm yet.** Those two lines are what the install *will* be; today they end in a registry 404, because `agent-flywheel` is not published. Until it is, install from a clone — no build step and no dependencies to fetch:
->
-> ```bash
-> git clone https://github.com/percepteye-ai/agent-flywheel-node
-> openclaw plugins install ./agent-flywheel-node          # OpenClaw
-> dsh plugin --profile <name> add ./agent-flywheel-node   # DeepSeek Harness
-> ```
 
 **That's the integration.** No import, no wrapper process, no sidecar. Start your agent exactly the way you always did.
 
