@@ -64,6 +64,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { applyDeclaration } from "./declaration.js";
+import { FRAMEWORK } from "./describe.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { percepteyeHome } from "./session.js";
@@ -647,13 +648,6 @@ function defaultTransport(config) {
 function enrol({ transport, config, pluginId, logger = null, declaration = null }) {
   return Promise.resolve()
     .then(() => transport.register({
-      // See the docstring: omitted on a refusal, the declaration when there
-      // is one, and otherwise null -- never invented.
-      ...(config.introspect === false ? {} : {
-        discovered_agent: applyDeclaration(declaration, {
-          reflected: null, agentName: config.agentId,
-        }) ?? null,
-      }),
       agent_id: config.agentId,
       // The WIRE value, which is not this package's mode vocabulary. The
       // server accepts ("rollout", "production") only, so `config.mode` --
@@ -677,6 +671,15 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
       concurrency: 1,
       input_shape: "text",
       entrypoint: "openclaw-plugin",
+      // See the docstring: omitted on a refusal, the declaration when there
+      // is one, and otherwise null -- never invented. Last, where it always
+      // was, so an undeclared registration is the same bytes as before. The
+      // framework is the host's: this plugin knows it runs in OpenClaw.
+      ...(config.introspect === false ? {} : {
+        discovered_agent: applyDeclaration(declaration, {
+          reflected: null, agentName: config.agentId, framework: FRAMEWORK,
+        }) ?? null,
+      }),
     }))
     .then(() => true)
     .catch((err) => {
@@ -708,9 +711,10 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
  * writes -- re-asking costs a read and nothing else, which is the whole point
  * of the route -- but the row the verdict is computed from still has to be
  * created by somebody, and `enrol()` above is now the one that does it. When
- * that was left out, this read answered "not registered" forever. The explicit
- * `discovered_agent: null` it sends is no longer a workaround for a side
- * effect: it is the honest state, for the reasons `enrol()` gives.
+ * that was left out, this read answered "not registered" forever. What it
+ * sends as `discovered_agent` -- null, a declaration, or nothing under the
+ * customer's opt-out -- is no longer a workaround for a side effect: each is
+ * the honest state, for the reasons `enrol()` gives.
  */
 export function announce({ transport, uploader, config, pluginId, logger }) {
   return Promise.resolve()

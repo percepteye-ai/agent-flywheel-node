@@ -40,7 +40,8 @@ function freezeJsonTree(value, seen = new Set()) {
 }
 
 /** Unicode-code-point ordering, matching Python rather than UTF-16 sort. */
-function compareStrings(left, right) {
+/** Order by code point, as Python's `sorted()` orders `str`; not by UTF-16 unit. */
+export function compareStrings(left, right) {
   const a = [...left].map((c) => c.codePointAt(0));
   const b = [...right].map((c) => c.codePointAt(0));
   for (let i = 0; i < Math.min(a.length, b.length); i += 1) {

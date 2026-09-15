@@ -89,6 +89,7 @@
  * the exact setting, instead of a queue that quietly stops moving.
  */
 import { applyDeclaration } from "./declaration.js";
+import { FRAMEWORK } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
@@ -719,6 +720,8 @@ export function registerRolloutDriver(api, {
     registrationSpec.discovered_agent = applyDeclaration(declaration, {
       reflected: registrationDescription ?? null,
       agentName: config.agentId,
+      // With nothing observed, the host is still known: this is OpenClaw.
+      framework: FRAMEWORK,
     }) ?? null;
   }
   // The digest is derived from the description, so the same refusal covers it.

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { resolveConfig } from "../src/config.js";
+import { CONFIG_SCHEMA, resolveConfig } from "../src/config.js";
 import {
   applyDeclaration, MAX_PROMPT_CHARS, resolveDeclaration, SOURCE_TYPE,
 } from "../src/declaration.js";
@@ -132,24 +132,40 @@ describe("declared wins, and only where given", () => {
 
 describe("a bad declaration is refused, naming the cause", () => {
   const fn = (extra) => ({ type: "function", function: { name: "x", ...extra } });
+  const WHOLE = `describe['model']['max_tokens'] must be a whole number from 1 to ${Number.MAX_SAFE_INTEGER}`;
   const CASES = [
-    [{ prompt: "typo" }, "describe= got unknown key(s) ['prompt']; it accepts ['model', 'system_prompt', 'tools']"],
+    [{ prompt: "typo" }, 'describe= got unknown key(s) ["prompt"]; it accepts ["model", "system_prompt", "tools"]'],
+    // Key lists are JSON, sorted by code point, as Python renders and sorts
+    // them: a quote, a non-BMP key and U+FFFF each rendered or sorted
+    // differently before.
+    [{ "it's": 1, "\u{1F600}": 1, "\uffff": 1 },
+      'describe= got unknown key(s) ["it\'s", "\\uffff", "\\ud83d\\ude00"]'],
     [{ tools: [{ description: "no name" }] }, "describe['tools'][0] is not a tool"],
-    // Python's truthiness: an empty object is no name there, and must not
-    // become a tool called "[object Object]" here.
-    [{ tools: [{ name: {} }] }, "describe['tools'][0] is not a tool"],
+    // Python's str.strip(): U+0085 is whitespace there, so this is no name.
+    [{ tools: [{ name: "\u0085" }] }, "describe['tools'][0] is not a tool"],
+    // Coerced, a name or description became text no two languages agree on.
+    [{ tools: [{ name: {} }] }, "describe['tools'][0]: 'name' must be a string, got object"],
+    [{ tools: [{ name: 5 }] }, "describe['tools'][0]: 'name' must be a string, got number"],
+    [{ tools: [fn({ description: ["a"] })] }, "describe['tools'][0]: 'description' must be a string, got array"],
     [{ tools: "search" }, "describe['tools'] must be a list"],
-    [["not", "a", "mapping"], "describe= must be a mapping (or a callable returning one), got list"],
+    [["not", "a", "mapping"], "describe= must be a mapping (or a callable returning one), got array"],
+    [1.5, "describe= must be a mapping (or a callable returning one), got number"],
+    // An async describe resolves to a Promise, not a declaration.
+    [async () => ({ tools: [] }), "describe= must be a mapping (or a callable returning one), got Promise"],
     [{ system_prompt: 5 }, "describe['system_prompt'] must be a string"],
     [{ model: 5 }, "describe['model'] must be a model name"],
-    [{ model: { provider: "openai", model: "gpt-4.1" } }, "describe['model'] got unknown key(s) ['model']"],
+    [{ model: { provider: "openai", model: "gpt-4.1" } }, 'describe[\'model\'] got unknown key(s) ["model"]'],
     [{ model: { provider: "openai" } }, "describe['model'] needs a 'model_name' string"],
     [{ model: { model_name: "m", temperature: "0.2" } }, "describe['model']['temperature'] must be a number"],
-    [{ model: { model_name: "m", max_tokens: 1.5 } }, "describe['model']['max_tokens'] must be an integer"],
+    [{ model: { model_name: "m", temperature: Infinity } }, "describe['model']['temperature'] must be a finite number"],
+    [{ model: { model_name: "m", max_tokens: 1.5 } }, WHOLE],
+    [{ model: { model_name: "m", max_tokens: 0 } }, WHOLE],
+    [{ model: { model_name: "m", max_tokens: 2 ** 53 } }, WHOLE],
     [{ model: { model_name: "m", provider: 3 } }, "describe['model']['provider'] must be a string"],
     [{ model: " " }, "describe['model'] must not be empty"],
-    [{ tools: [{ name: "x", input_schema: "{}" }] }, "describe['tools'][0]: the schema must be a JSON-schema mapping, got str"],
-    [{ tools: [fn({ parameters: [] })] }, "describe['tools'][0]: the schema must be a JSON-schema mapping, got list"],
+    [{ model: "\u0085" }, "describe['model'] must not be empty"],
+    [{ tools: [{ name: "x", input_schema: "{}" }] }, "describe['tools'][0]: the schema must be a JSON-schema mapping, got string"],
+    [{ tools: [fn({ parameters: [] })] }, "describe['tools'][0]: the schema must be a JSON-schema mapping, got array"],
     [{ tools: [{ name: "x", read_only: "true" }] }, "describe['tools'][0]['read_only'] must be true or false"],
     [{ tools: [fn({ read_only: true })] }, "describe['tools'][0]: read_only goes beside 'function', not inside it"],
   ];
@@ -176,6 +192,34 @@ describe("consent is asked as the Python SDK asks it", () => {
     const spec = { tools: [] };
     assert.equal(resolveConfig({ describe: spec }, {}).describe, spec);
     assert.equal(resolveConfig({}, {}).describe, null);
+  });
+
+  it("reads a numeric 0 as off, for every switch the README says 0 turns off", () => {
+    const off = resolveConfig(
+      { capture: 0, applyPrompt: 0, applyModel: 0, introspect: 0 }, {});
+    assert.deepEqual(
+      [off.captureEnabled, off.applyPromptEnabled, off.applyModelEnabled, off.introspect],
+      [false, false, false, false]);
+  });
+});
+
+describe("the host's schema never refuses what declaration.js should judge", () => {
+  // OpenClaw validates plugin config against this schema, and a value it
+  // rejects SKIPS THE PLUGIN -- local capture included. So anything the host
+  // could refuse here would turn "a bad declaration is a warning" into a
+  // plugin that never loaded.
+  it("declares no type for describe", () => {
+    assert.equal("type" in CONFIG_SCHEMA.properties.describe, false);
+  });
+
+  it("lets every switch be a number, or null, as well", () => {
+    for (const key of ["capture", "applyPrompt", "applyModel", "introspect"]) {
+      assert.ok(CONFIG_SCHEMA.properties[key].type.includes("number"), key);
+      assert.ok(CONFIG_SCHEMA.properties[key].type.includes("null"), key);
+    }
+    // And null means unset: the environment decides, as with no key at all.
+    assert.equal(resolveConfig({ introspect: null }, { PERCEPTEYE_INTROSPECT: "0" }).introspect, false);
+    assert.equal(resolveConfig({ capture: null }, {}).captureEnabled, true);
   });
 });
 
@@ -230,13 +274,30 @@ describe("a declaration anchors no execution identity", () => {
     assert.equal("agent_fingerprint" in p.serveOneTurn(), false);
     assert.ok(p.warnings.some((w) => w.includes("introspection is off")));
   });
+
+  it("says so when a declaration withholds an identity that was configured", () => {
+    const p = plugin({ executionSnapshot: SNAPSHOT, describe: { tools: [] } });
+    assert.ok(p.warnings.some((w) => w.includes("exact execution identity is withheld")));
+    // The control: no declaration, no such line.
+    assert.equal(plugin({ executionSnapshot: SNAPSHOT }).warnings.some(
+      (w) => w.includes("withheld")), false);
+  });
+});
+
+describe("with nothing observed, the plugin names its host", () => {
+  it("passes its framework where Python, knowing nothing, says custom", () => {
+    const d = applyDeclaration(resolveDeclaration({ tools: [] }), {
+      reflected: null, agentName: "support", framework: "openclaw" });
+    assert.equal(d.framework, "openclaw");
+    assert.equal(declared({ tools: [] }).framework, "custom");   // the default
+  });
 });
 
 describe("a declaration never costs the plugin load", () => {
   it("a bad one is dropped with the cause, and capture keeps running", () => {
     const p = plugin({ describe: { prompt: "typo" } });
     assert.ok(p.out, "the plugin must still load");
-    assert.ok(p.warnings.some((w) => w.includes("describe= got unknown key(s) ['prompt']")));
+    assert.ok(p.warnings.some((w) => w.includes('describe= got unknown key(s) ["prompt"]')));
   });
 
   it("the opt-out wins over a declaration, with a warning", () => {
@@ -246,7 +307,17 @@ describe("a declaration never costs the plugin load", () => {
 
   it("a typo still surfaces under the opt-out, before lifting it would", () => {
     const p = plugin({ describe: { prompt: "typo" } }, { PERCEPTEYE_INTROSPECT: "0" });
-    assert.ok(p.warnings.some((w) => w.includes("unknown key(s) ['prompt']")));
+    assert.ok(p.warnings.some((w) => w.includes('unknown key(s) ["prompt"]')));
+    // And the opt-out is still said: nothing at all is registered, not
+    // "what was observed".
+    assert.ok(p.warnings.some((w) => w.includes("registers no description at all")));
+    assert.equal(p.warnings.some((w) => w.includes("registers only what was observed")), false);
+  });
+
+  it("a declaration that throws something else still costs nothing", () => {
+    const p = plugin({ describe: { get tools() { throw new Error("boom"); } } });
+    assert.ok(p.out, "the plugin must still load");
+    assert.ok(p.warnings.some((w) => w.includes("describe could not be read (boom)")));
   });
 
   it("a function is not run for a description that will not be sent", () => {

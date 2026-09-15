@@ -106,26 +106,39 @@ export { DESCRIBE_HOOK_NAME };
  * lifting the opt-out later must not be the moment a typo surfaces. A
  * FUNCTION runs only with consent -- nothing of the customer's runs for a
  * description that will not be sent.
+ *
+ * Anything thrown is caught, not only a ConfigurationError: this runs inside
+ * `register()`, and the promise is that a declaration never costs the load.
  */
 function declarationFor(config, logger) {
   if (config.describe === null) return null;
-  try {
-    if (!config.introspect) {
-      if (typeof config.describe !== "function") {
+  const refusal = (err) => (err instanceof ConfigurationError
+    ? err.message
+    : `describe could not be read (${err?.message ?? typeof err})`);
+  if (!config.introspect) {
+    if (typeof config.describe !== "function") {
+      try {
         resolveDeclaration(config.describe);
+      } catch (err) {
+        logger?.warn?.(
+          `[${PLUGIN_ID}] ${refusal(err)}. Fix ` +
+          `plugins.entries.${PLUGIN_ID}.config.describe before turning ` +
+          `introspection back on.`,
+        );
       }
-      logger?.warn?.(
-        `[${PLUGIN_ID}] introspection is off (introspect / ` +
-        `PERCEPTEYE_INTROSPECT), and it wins: the description declared with ` +
-        `describe is not sent.`,
-      );
-      return null;
     }
+    logger?.warn?.(
+      `[${PLUGIN_ID}] introspection is off (introspect / ` +
+      `PERCEPTEYE_INTROSPECT), and it wins: the description declared with ` +
+      `describe is not sent, and this agent registers no description at all.`,
+    );
+    return null;
+  }
+  try {
     return resolveDeclaration(config.describe);
   } catch (err) {
-    if (!(err instanceof ConfigurationError)) throw err;
     logger?.warn?.(
-      `[${PLUGIN_ID}] ${err.message}. The declaration is ignored, so this ` +
+      `[${PLUGIN_ID}] ${refusal(err)}. The declaration is ignored, so this ` +
       `agent registers only what was observed. Fix ` +
       `plugins.entries.${PLUGIN_ID}.config.describe.`,
     );
@@ -211,8 +224,10 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // they consented to saying anything at all.
   const declaration = declarationFor(config, logger);
   const tracker = createExecutionIdentityTracker({
-    // Refused discovery observes nothing, so it anchors nothing: the Python
-    // SDK authors no execution identity when PERCEPTEYE_INTROSPECT is off.
+    // Refused discovery authors no identity: the Python SDK authors none when
+    // PERCEPTEYE_INTROSPECT is off. (The describer below may still write
+    // discovered_agent.json locally under PERCEPTEYE_TRAJECTORY_DIR; its one
+    // reader, the Python SDK's warm-up, asks consent itself.)
     executionSnapshot: config.introspect ? config.executionSnapshot : null,
     mode: config.mode,
     agentId: config.agentId,
@@ -235,6 +250,14 @@ export function register(api, pluginConfig = {}, env = process.env) {
   const executionIdentity = declaration === null
     ? tracker
     : withholdFingerprints(tracker);
+  if (declaration !== null && tracker.enabled) {
+    // Said, because an operator who configured an execution snapshot and then
+    // added `describe` otherwise loses exact identity with no line anywhere.
+    logger?.warn?.(
+      `[${PLUGIN_ID}] exact execution identity is withheld: ` +
+      `${executionIdentity.refusal}. Remove describe to restore it.`,
+    );
+  }
   // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
   //
   // In TRAINING mode a trajectory belongs to one ROLLOUT, and the rollout

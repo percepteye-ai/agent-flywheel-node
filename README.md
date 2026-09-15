@@ -37,15 +37,15 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 473 was true on 2026-09-15 (it had drifted to 373 while the suite
-     grew). Re-derive with `npm test` (prints "tests 473" / "skipped 0")
+     its 490 was true on 2026-09-15 (it had drifted to 373 while the suite
+     grew). Re-derive with `npm test` (prints "tests 490" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-473_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-490_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -335,12 +335,12 @@ The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a no
 } } } } }
 ```
 
-It is the Python SDK's `describe=`, read by the same rules, and a cross-language test holds the two equal:
-- **`tools`** is the list your agent sends its model: OpenAI function specs, Anthropic tools, or `{name, description, input_schema, read_only}`. `read_only: true` goes at the top level of an entry, whichever shape.
-- **`model`** is a name, or `{model_name, provider, temperature, max_tokens}`.
-- **What you declare wins** over what was observed, where you gave it. Anything you leave out still comes from observation.
-- **It is your word, not an observation,** so it anchors no execution identity.
-- **A bad declaration does not stop the plugin**, because a throw would take local capture down with it. It is dropped with a warning that names the cause, the same one the Python SDK refuses with, and the agent registers only what was observed.
+It is the Python SDK's `describe=`, read by the same rules, and a cross-language test holds the two equal: the same record, and the same refusals, for anything JSON carries — except an integer beyond 2⁵³ inside a schema, which JavaScript holds rounded.
+- **`tools`** is the list your agent sends its model: OpenAI function specs, Anthropic tools, or `{name, description, input_schema, read_only}`. A name and a description must be strings. `read_only: true` goes at the top level of an entry, whichever shape.
+- **`model`** is a name, or `{model_name, provider, temperature, max_tokens}`: `temperature` a finite number, and `max_tokens` a whole number from 1 to 2⁵³ − 1.
+- **What you declare wins** over what was observed, where you gave it. Anything you leave out still comes from observation. With nothing observed, the record names this plugin's host, `framework: "openclaw"`, where the Python SDK — which cannot know — says `custom`.
+- **It is your word, not an observation,** so it anchors no execution identity. If you also configured `executionSnapshot`, a startup warning says the identity is withheld.
+- **A bad declaration does not stop the plugin**, because a throw would take local capture down with it — and the config schema accepts any `describe` value, so OpenClaw never refuses the plugin over one either. It is dropped with a warning that names the cause, the same one the Python SDK refuses with, and the agent registers only what was observed.
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`); `PERCEPTEYE_CAPTURE_DIR` overrides just the production turn capture (default `$PERCEPTEYE_HOME/captured`); and `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's outcomes go, which the rollout driver sets per rollout.
 
@@ -378,7 +378,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 473 tests, no install step — node:test, zero dependencies
+npm test     # 490 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

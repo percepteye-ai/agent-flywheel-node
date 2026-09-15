@@ -761,12 +761,23 @@ describe("the agent is registered, so an operator has something to enable", () =
       declaration: resolveDeclaration({
         system_prompt: "You triage.", tools: [{ name: "refund" }] }),
     });
+    // `openclaw`, not Python's `custom`: nothing was observed, but the host is
+    // known, and the control plane reads the framework as a lookup key.
     assert.deepEqual(tr.registered[0].discovered_agent, {
-      agent_name: "a1", framework: "custom", source_type: "sdk_declared",
+      agent_name: "a1", framework: "openclaw", source_type: "sdk_declared",
       role: "standalone", system_prompt: "You triage.",
       tool_definitions: [{ name: "refund", description: "", input_schema: {},
                            original_format: "anthropic_tool" }],
     });
+  });
+
+  it("keeps discovered_agent LAST, so an undeclared registration is the old bytes", async () => {
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr);
+    assert.deepEqual(Object.keys(tr.registered[0]), [
+      "agent_id", "mode", "sdk", "contract_version", "reports_tool_calls",
+      "isolation", "concurrency", "input_shape", "entrypoint", "discovered_agent",
+    ]);
   });
 
   it("still reads the verdict when the registration is REFUSED", async () => {
