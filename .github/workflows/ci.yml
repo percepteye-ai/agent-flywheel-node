@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # publish.yml runs this whole workflow on the commit it is about to publish,
+  # so the gate before a release is the gate before a merge -- not a copy of it.
+  workflow_call:
 
 jobs:
   test:

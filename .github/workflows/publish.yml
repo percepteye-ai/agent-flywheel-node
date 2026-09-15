@@ -1,0 +1,113 @@
+name: publish
+
+# Publishes this package to npm through TRUSTED PUBLISHING (OIDC). GitHub mints
+# a short-lived identity token for this workflow and npm verifies it against the
+# publisher configured on the package, so there is no npm token in this
+# repository, in a secret, or anywhere else a leak could reach. The same shape
+# as the Python SDK's release workflow (percepteye-ai/agent-flywheel,
+# .github/workflows/workflow.yml).
+#
+# ONE-TIME SETUP, by a human with the npm account (the release runbook is
+# docs/RELEASING.md in percepteye-ai/agent-flywheel, section 3):
+#
+#   1. The FIRST publish is manual: `npm publish --access public` from a clean
+#      checkout of main, with 2FA. npm configures a trusted publisher on an
+#      existing package's settings page.
+#   2. npmjs.com -> the package -> Settings -> Trusted Publisher -> GitHub Actions:
+#        Organization or user : percepteye-ai
+#        Repository           : agent-flywheel-node
+#        Workflow filename    : publish.yml
+#        Environment name     : npm
+#      npm matches every field exactly, this file's NAME included. Rename it
+#      only together with the publisher: a mismatched workflow file name is how
+#      the Python SDK's first release was refused on PyPI.
+#   3. On the same page, choose "Require two-factor authentication and
+#      disallow tokens". Trusted publishing keeps working; no long-lived token
+#      ever can.
+#   4. Give the `npm` GitHub environment a required reviewer (Settings ->
+#      Environments), so a tag waits for a human before anything is published.
+#      Without one, pushing a tag publishes immediately.
+#
+# After that, a release is: bump package.json and openclaw.plugin.json together
+# (test/version.test.js holds them equal), merge, push a vX.Y.Z tag.
+# Actions -> publish -> Run workflow rehearses a release and publishes nothing.
+#
+# NOTE, because it is irreversible: npm never lets a version be published
+# twice, not even after an unpublish.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:     # a rehearsal: every check, then `npm publish --dry-run`
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # EXACTLY the checks every pull request passes -- the test matrix, the
+    # no-dependencies rule, and what the tarball carries -- on the commit being
+    # published. Reused rather than copied, so the two gates cannot drift.
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest   # npm trusts GitHub-hosted runners only
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write        # the OIDC token npm verifies. No secret is used.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: npm new enough for trusted publishing
+        # npm documents 11.5.1 as the minimum, and the npm bundled with a
+        # given Node release can be older than that.
+        run: npm install -g "npm@^11.5.1" && npm --version
+
+      - name: the tag must match the version being published
+        # A tag that disagrees with package.json publishes a version nobody
+        # asked for, under a name they will look for in vain -- and npm never
+        # lets that version number be used again.
+        run: |
+          node -e '
+            const { version } = require("./package.json");
+            const tag = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (tag !== version) {
+              console.error(`tag v${tag} != package.json version ${version}`);
+              process.exit(1);
+            }
+            console.log(`tag and version agree: ${version}`);
+          '
+
+      - name: publish
+        env:
+          # PROVENANCE FOLLOWS VISIBILITY. npm cannot generate it for a private
+          # repository, so it is off while this one is private; the day the
+          # repository goes public it is on, and a publish that cannot attest
+          # where it was built fails rather than shipping unattested.
+          NPM_CONFIG_PROVENANCE: ${{ github.event.repository.private && 'false' || 'true' }}
+        # --access public: required if the name is ever scoped (a scoped
+        # package defaults to restricted), harmless while it is not.
+        run: npm publish --access public
+
+  rehearse:
+    # Everything the publish job does, ending in `npm publish --dry-run`:
+    # proof the pipeline works before the first real run is also the first
+    # time anyone has seen it.
+    needs: ci
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g "npm@^11.5.1" && npm --version
+      - run: npm publish --access public --dry-run
