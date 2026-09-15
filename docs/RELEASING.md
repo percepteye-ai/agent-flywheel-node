@@ -4,7 +4,7 @@ The release runbook for both Agent Flywheel SDKs lives in the Python
 repository, which leads the release train: it owns the wire schema and renders
 this README's figures.
 
-**[percepteye-ai/agent-flywheel → RELEASING.md](https://github.com/percepteye-ai/agent-flywheel/blob/main/RELEASING.md)**
+**[percepteye-ai/agent-flywheel → docs/RELEASING.md](https://github.com/percepteye-ai/agent-flywheel/blob/main/docs/RELEASING.md)**
 
 - **§1** covers the checks before any release. That includes re-syncing
   `schema/flywheel-1.json` and the four figures from the Python repository,
