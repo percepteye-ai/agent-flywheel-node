@@ -63,6 +63,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { applyDeclaration } from "./declaration.js";
+import { FRAMEWORK } from "./describe.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { percepteyeHome } from "./session.js";
@@ -471,7 +473,7 @@ export const GATEWAY_STOP = "gateway_stop";
  */
 export function registerTurnCapture(api, {
   config, turns, pluginId, logger = null, env = process.env,
-  makeTransport = defaultTransport,
+  makeTransport = defaultTransport, declaration = null,
 }) {
   if (!turns || typeof api?.on !== "function") return null;
   const root = captureRoot(env);
@@ -555,7 +557,7 @@ export function registerTurnCapture(api, {
     //
     // NOT AWAITED: `register()` must return to the host synchronously, and a
     // control plane that is slow or down must not delay a plugin load.
-    started = enrol({ transport, config, pluginId, logger })
+    started = enrol({ transport, config, pluginId, logger, declaration })
       .then(() => announce({ transport, uploader, config, pluginId, logger, env }));
   } else {
     logger?.info?.(
@@ -606,34 +608,30 @@ function defaultTransport(config) {
  * share one route, and only one of them survived the split. This is the other
  * one, back as its own call, which is why `announce()` still performs no write.
  *
- * `discovered_agent: null` -- INTROSPECTION_UNREADABLE. It is the TRUE state of
- * the three rather than the convenient one, and the other two are wrong for
- * different reasons:
+ * `discovered_agent` -- THREE ANSWERS, one per case, each the true one, asked
+ * exactly as the Python SDK's `attach()` asks them:
  *
- *   OMITTING the key records `disabled`, which means "the customer opted out
- *   of introspection". Nothing here offers them that choice -- this package
- *   has no `introspect` setting and reads no PERCEPTEYE_INTROSPECT -- so it
- *   would assert a decision nobody made. It is also the DESTRUCTIVE state:
- *   `FlywheelAgentRepository.upsert` writes `disabled` onto the row
- *   unconditionally, which stops that agent's description driving workflow
- *   generation. That is precisely the side effect `announce()` describes and
- *   the reason the old registration had to go, so re-creating it here would
- *   undo one fix while claiming another.
+ *   OMITTED when the customer refused introspection (`introspect: false` or
+ *   PERCEPTEYE_INTROSPECT=0). The control plane records that as `disabled`,
+ *   which stops the stored description driving workflow generation -- the
+ *   instruction the customer gave. Omitting it for anyone else would assert a
+ *   decision nobody made, which is why this used to be the one state never
+ *   sent: before the switch existed, nobody could have made it.
  *
- *   A DESCRIPTION cannot honestly be sent. `describe.js` is the only source of
- *   one and it writes into PERCEPTEYE_TRAJECTORY_DIR, which production mode
- *   does not set -- so the describer is inert here -- and even where it is
- *   active `llm_input` first fires on the first model call, strictly after
- *   this. Waiting for one would put registration behind a CONVERSATION hook
- *   the host drops for a non-bundled plugin by default, i.e. this same defect
- *   again for the majority of installs.
+ *   THE DECLARATION, when the operator gave one (`describe`, see
+ *   declaration.js): their word about the agent, and the only description
+ *   this process can honestly send. The control plane keeps a stored
+ *   catalogue that a declaration without tools did not observe.
  *
- *   NULL is what is left and what is true: we looked, and we have no
- *   description. It is also the one state `upsert` treats as a fact about the
- *   control plane's framework coverage rather than a retraction by the
- *   customer -- a row that already holds a tool catalogue keeps BOTH the
- *   catalogue and its state -- so a production process re-registering on every
- *   restart cannot erase what a training run established.
+ *   NULL otherwise: we looked, and we have no description. `describe.js`, the
+ *   only observer, writes into PERCEPTEYE_TRAJECTORY_DIR, which production
+ *   mode does not set, and `llm_input` first fires on the first model call,
+ *   strictly after this -- waiting for it would put registration behind a
+ *   CONVERSATION hook the host drops for a non-bundled plugin by default. A
+ *   production null changes nothing the control plane holds, neither the
+ *   stored description nor its state (a new agent is `not_described`), so a
+ *   process re-registering on every restart cannot erase what a training run
+ *   established.
  *
  * NEVER REJECTS, and never throws into its caller. A refused or unreachable
  * control plane must not cost the verdict read, local capture (which needs no
@@ -647,7 +645,7 @@ function defaultTransport(config) {
  * package has already paid for one exported control-plane call that nothing
  * called: `AttachTransport.register` itself, which is the defect above.
  */
-function enrol({ transport, config, pluginId, logger = null }) {
+function enrol({ transport, config, pluginId, logger = null, declaration = null }) {
   return Promise.resolve()
     .then(() => transport.register({
       agent_id: config.agentId,
@@ -673,8 +671,15 @@ function enrol({ transport, config, pluginId, logger = null }) {
       concurrency: 1,
       input_shape: "text",
       entrypoint: "openclaw-plugin",
-      // See the docstring. `null`, never omitted and never invented.
-      discovered_agent: null,
+      // See the docstring: omitted on a refusal, the declaration when there
+      // is one, and otherwise null -- never invented. Last, where it always
+      // was, so an undeclared registration is the same bytes as before. The
+      // framework is the host's: this plugin knows it runs in OpenClaw.
+      ...(config.introspect === false ? {} : {
+        discovered_agent: applyDeclaration(declaration, {
+          reflected: null, agentName: config.agentId, framework: FRAMEWORK,
+        }) ?? null,
+      }),
     }))
     .then(() => true)
     .catch((err) => {
@@ -706,9 +711,10 @@ function enrol({ transport, config, pluginId, logger = null }) {
  * writes -- re-asking costs a read and nothing else, which is the whole point
  * of the route -- but the row the verdict is computed from still has to be
  * created by somebody, and `enrol()` above is now the one that does it. When
- * that was left out, this read answered "not registered" forever. The explicit
- * `discovered_agent: null` it sends is no longer a workaround for a side
- * effect: it is the honest state, for the reasons `enrol()` gives.
+ * that was left out, this read answered "not registered" forever. What it
+ * sends as `discovered_agent` -- null, a declaration, or nothing under the
+ * customer's opt-out -- is no longer a workaround for a side effect: each is
+ * the honest state, for the reasons `enrol()` gives.
  */
 export function announce({ transport, uploader, config, pluginId, logger }) {
   return Promise.resolve()

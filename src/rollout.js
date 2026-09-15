@@ -88,6 +88,8 @@
  * at report time -- and when it is missing the operator gets one line naming
  * the exact setting, instead of a queue that quietly stops moving.
  */
+import { applyDeclaration } from "./declaration.js";
+import { FRAMEWORK } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
@@ -670,6 +672,7 @@ export function createRolloutDriver({
  */
 export function registerRolloutDriver(api, {
   config, transport, pluginId, logger = null, executionIdentity = null,
+  declaration = null,
 }) {
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
@@ -702,13 +705,27 @@ export function registerRolloutDriver(api, {
     concurrency: 1,
     input_shape: "text",
     entrypoint: "openclaw-plugin",
-    // A startup observation is optional. When an adapter can provide one, the
-    // same immutable exact evidence drives both discovery and the execution
-    // digest registration sends before the first claim. Otherwise null says
-    // discovery ran but was unreadable; it never invents a worker identity.
-    discovered_agent: registrationDescription ?? null,
   };
-  if (isLowerSha256(registrationFingerprint?.execution_sha256)) {
+  // CONSENT, asked as the Python SDK's serve() asks it. Refused, the key is
+  // OMITTED, which the control plane records as the customer's opt-out
+  // (`disabled`). Given: a startup observation is optional -- when an adapter
+  // can provide one, the same immutable exact evidence drives both discovery
+  // and the execution digest registration sends before the first claim -- and
+  // what the operator declared (`describe`) wins over it where given. With
+  // neither, null says discovery ran but was unreadable; it never invents a
+  // worker identity, and a declaration never anchors one (index.js withholds
+  // the fingerprint).
+  const consented = config.introspect !== false;
+  if (consented) {
+    registrationSpec.discovered_agent = applyDeclaration(declaration, {
+      reflected: registrationDescription ?? null,
+      agentName: config.agentId,
+      // With nothing observed, the host is still known: this is OpenClaw.
+      framework: FRAMEWORK,
+    }) ?? null;
+  }
+  // The digest is derived from the description, so the same refusal covers it.
+  if (consented && isLowerSha256(registrationFingerprint?.execution_sha256)) {
     registrationSpec.agent_execution_sha256 =
       registrationFingerprint.execution_sha256;
   }

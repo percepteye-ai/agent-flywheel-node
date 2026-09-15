@@ -13,7 +13,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { register, PLUGIN_ID } from "../src/index.js";
+import { resolveDeclaration } from "../src/declaration.js";
 import { LeaseLost } from "../src/errors.js";
+import { withholdFingerprints } from "../src/execution-identity.js";
+import { SDK_UA } from "../src/http.js";
 import {
   MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
   driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
@@ -199,6 +202,8 @@ describe("training worker registration gates every claim", () => {
     fail = false,
     executionIdentity = null,
     servedContracts = ["flywheel/1"],
+    config = {},
+    declaration = null,
   } = {}) {
     const order = [];
     const registrations = [];
@@ -223,14 +228,51 @@ describe("training worker registration gates every claim", () => {
       async heartbeat() {},
     };
     const driver = registerRolloutDriver(api, {
-      config: { mode: "training", apiKey: "key", agentId: "support" },
+      config: { mode: "training", apiKey: "key", agentId: "support", ...config },
       transport,
       pluginId: PLUGIN_ID,
       logger: api.logger,
       executionIdentity,
+      declaration,
     });
     return { api, driver, order, registrations };
   }
+
+  const STARTUP = () => ({
+    registrationFingerprint: Object.freeze({ execution_sha256: "a".repeat(64) }),
+    registrationDescription: Object.freeze({
+      agent_name: "support", framework: "openclaw", source_type: "sdk_runtime",
+      role: "standalone", tool_definitions: null, system_prompt: "observed",
+      incomplete: ["tool_definitions"],
+    }),
+  });
+
+  it("omits the description AND its digest when introspection is refused", async () => {
+    // Python's serve() under PERCEPTEYE_INTROSPECT=0: the key absent is the
+    // customer's opt-out, and the digest is derived from what they refused.
+    const h = registrationHarness({
+      config: { introspect: false }, executionIdentity: STARTUP(),
+    });
+    await h.driver.onSessionStart({ sessionKey: "refused" });
+    assert.equal("discovered_agent" in h.registrations[0], false);
+    assert.equal("agent_execution_sha256" in h.registrations[0], false);
+  });
+
+  it("merges a declaration over the startup observation, anchoring no digest", async () => {
+    const h = registrationHarness({
+      executionIdentity: withholdFingerprints(STARTUP()),
+      declaration: resolveDeclaration({ tools: [{ name: "refund" }] }),
+    });
+    await h.driver.onSessionStart({ sessionKey: "declared" });
+    const spec = h.registrations[0];
+    assert.deepEqual(spec.discovered_agent, {
+      agent_name: "support", framework: "openclaw", source_type: "sdk_declared",
+      role: "standalone", system_prompt: "observed",
+      tool_definitions: [{ name: "refund", description: "", input_schema: {},
+                           original_format: "anthropic_tool" }],
+    });
+    assert.equal("agent_execution_sha256" in spec, false);
+  });
 
   it("registers the rollout worker before its first attended claim", async () => {
     const h = registrationHarness();
@@ -241,7 +283,7 @@ describe("training worker registration gates every claim", () => {
     assert.deepEqual(h.registrations[0], {
       agent_id: "support",
       mode: "rollout",
-      sdk: "agent-flywheel-node/0.1.0",
+      sdk: SDK_UA,
       contract_version: "flywheel/1",
       reports_tool_calls: true,
       isolation: "inprocess",
