@@ -23,8 +23,14 @@ export class LeaseLost extends TransportError {
 /**
  * A setting this package refuses to guess at.
  *
- * Raised for an unrecognised `PERCEPTEYE_AGENT_MODE`, and only there. The
- * alternative -- defaulting a typo to `training` -- keeps a process
+ * The original and still the clearest case is an unrecognised
+ * `PERCEPTEYE_AGENT_MODE`. It is not the only one: `config.js`, `rollout.js`
+ * and `execution-identity.js` each refuse a setting they must not guess at.
+ * This line used to read "and only there", which stopped being true the first
+ * time one of those was added.
+ *
+ * For the mode, the alternative -- defaulting a typo to `training` -- keeps a
+ * process
  * contributing rollouts on a customer's credentials after an operator
  * believed they had switched it off, with nothing printed anywhere. There is
  * no safe guess for a mode, so a bad one is a startup failure.
