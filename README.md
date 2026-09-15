@@ -8,10 +8,12 @@
      serves a PRIVATE repo's file to nobody unauthenticated — every reader,
      the owner included. Verified 2026-09-06: all three returned HTTP 404.
 
-     THE TRADE-OFF, so nobody has to rediscover it a third time: relative wins
-     while the repo is private, because GitHub is the only surface that can
-     show these files at all. Absolute wins on PyPI/npm — and only works once
-     the repo is PUBLIC. The two flip together, never separately.
+     AND THERE IS NO TRADE-OFF LEFT, so nobody has to rediscover it a third
+     time: "a registry page cannot resolve a relative path" is wrong for npm,
+     which rewrites each relative <img> src to raw.githubusercontent.com on
+     the default branch (seen on the live package page, 2026-09-14). These
+     paths render on GitHub now, and on npm the day the repo goes public —
+     with no edit here and no new release.
 
      Held by a test, not by this comment: `test/oss-boundary.test.js` asserts every
      <img> src is relative AND names a file that exists. Shields badges are
@@ -39,7 +41,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      grew). Re-derive with `npm test` (prints "tests 434" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
-[![npm](https://img.shields.io/npm/v/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/agent-flywheel)
+[![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
@@ -82,8 +84,8 @@ No container to build. No cluster to run. No GPU to provision. No inbound port t
 One package, two harnesses. Pick your line:
 
 ```bash
-openclaw plugins install agent-flywheel          # OpenClaw
-dsh plugin --profile <name> add agent-flywheel   # DeepSeek Harness
+openclaw plugins install @percepteye/agent-flywheel          # OpenClaw
+dsh plugin --profile <name> add @percepteye/agent-flywheel   # DeepSeek Harness
 ```
 
 **That's the integration.** No import, no wrapper process, no sidecar. Start your agent exactly the way you always did.

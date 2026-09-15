@@ -8,4 +8,4 @@
 # a rollout.
 - insert:
     - id: agent-flywheel
-      name: 'agent-flywheel/dsh'
+      name: '@percepteye/agent-flywheel/dsh'

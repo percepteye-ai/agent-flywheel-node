@@ -79,8 +79,11 @@ jobs:
           node-version: "24"
       - name: the tarball carries what it claims
         run: |
-          npm pack --silent >/dev/null
-          tar -tzf agent-flywheel-*.tgz | sed 's|^package/||' | sort > /tmp/shipped.txt
+          # The file name comes from npm, not a glob: a scoped package packs as
+          # percepteye-agent-flywheel-<version>.tgz, and a hard-coded pattern
+          # breaks on the next rename.
+          tgz=$(npm pack --silent)
+          tar -tzf "$tgz" | sed 's|^package/||' | sort > /tmp/shipped.txt
           echo "--- shipped ---"; cat /tmp/shipped.txt
           # LICENSE is the one npm will NOT add for you from a parent
           # directory, and package.json declares MIT. A tarball asserting a
