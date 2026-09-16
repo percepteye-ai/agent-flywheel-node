@@ -27,9 +27,17 @@ import { createRolloutDriver } from "../src/rollout.js";
 import {
   JOB_PREFIX, createUnattendedRunner, cronTurnStarter, sessionKeyFor,
 } from "../src/unattended.js";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { resolveConfig } from "../src/config.js";
+
+// Every driver in this file now holds an undelivered result durably, so it
+// needs somewhere to hold it. A temp home, never the developer's: `node --test`
+// runs each test FILE in its own process, so setting this here cannot leak
+// into another file's expectations.
+process.env.PERCEPTEYE_HOME = mkdtempSync(join(tmpdir(), "percepteye-unattended-"));
 
 const trainingApi = () => {
   const hooks = [];
@@ -144,7 +152,9 @@ function harness({ started = true, degraded = false, rollouts, pollMs } = {}) {
     transport, enqueue: async () => ({ enqueued: true }),
   });
   const runner = createUnattendedRunner({
-    transport, driver, pollMs,
+    // No `transport`: this lane claims through `driver.claim`, which is the
+    // one seam that drains held results before asking for more work.
+    driver, pollMs,
     logger: { info() {}, warn: (m) => calls.warns.push(String(m)) },
     startTurn: async (t) => {
       calls.turns.push(t);
@@ -210,10 +220,20 @@ describe("the unattended loop", () => {
   });
 
   it("survives a control plane that is down", async () => {
-    const h = harness();
+    // INJECTED THROUGH THE DRIVER, because that is where claiming now happens.
+    // This used to hand the runner its own `transport` with a throwing
+    // `claim`; once the runner started claiming via `driver.claim` that object
+    // was simply unused, and the test asserted that a runner whose claim
+    // SUCCEEDS does not reject -- which is not the property it is named for.
+    const driver = createRolloutDriver({
+      transport: {
+        claim: async () => { throw new Error("down"); },
+        report: async () => {}, abandon: async () => {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+    });
     const runner = createUnattendedRunner({
-      transport: { ...h.driver, claim: async () => { throw new Error("down"); } },
-      driver: h.driver, startTurn: async () => ({ started: true }),
+      driver, startTurn: async () => ({ started: true }),
     });
     await assert.doesNotReject(async () => { await runner.tick(); });
   });

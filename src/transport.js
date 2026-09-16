@@ -101,8 +101,16 @@ function pyStr(s) {
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
 
-/** `urllib.parse.quote(value, safe="-._~")`, for cross-SDK keys. */
-function quoteIdentifier(value) {
+/**
+ * `urllib.parse.quote(value, safe="-._~")`, for cross-SDK keys.
+ *
+ * TWO CONSUMERS, which is why it is exported. `outbox.js` turns the same
+ * opaque rollout id into a FILENAME, and an id that percent-encodes one way
+ * for the URL and is filtered another way for the file would let two ids that
+ * differ only in stripped characters share one spool path -- losing the second
+ * result exactly as the outbox exists to prevent.
+ */
+export function quoteIdentifier(value) {
   return encodeURIComponent(value).replace(
     /[!'()*]/g,
     (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,

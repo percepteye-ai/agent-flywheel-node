@@ -12,12 +12,22 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { register, PLUGIN_ID } from "../src/index.js";
 import { LeaseLost } from "../src/errors.js";
 import {
   MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
   driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
 } from "../src/rollout.js";
+
+// Every driver in this file now holds an undelivered result durably, so it
+// needs somewhere to hold it. A temp home, never the developer's: `node --test`
+// runs each test FILE in its own process, so setting this here cannot leak
+// into another file's expectations.
+process.env.PERCEPTEYE_HOME = mkdtempSync(join(tmpdir(), "percepteye-rollout-"));
 
 // ROLLOUT-EXCLUSIVE hooks only. `agent_end` used to be in this list and had
 // to come out: production turn capture subscribes it too, to record the

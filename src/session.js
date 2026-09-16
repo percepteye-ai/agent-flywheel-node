@@ -17,7 +17,16 @@
  * So it was deleted rather than left in place with a comment. Dead code that
  * looks finished is worse than absent code: the next person wires it up.
  *
- * What remains is the two things that are actually used.
+ * THE ROLLOUT LANE DOES HAVE THAT PROBLEM, and `outbox.js` is the answer to
+ * it -- WITH a producer and a consumer, which is the whole difference from
+ * what was removed here. A rollout's result exists only in flight: it is
+ * assembled in `agent_end` and posted once, so a control plane that is down
+ * loses the agent's entire work product. `rollout.js:onAgentEnd` writes it
+ * (the producer) and `rollout.js:claim` drains it before every claim (the
+ * consumer). It lives under `percepteyeHome()` below, beside `captured/`,
+ * which is why this module is the one that says where.
+ *
+ * What remains here is the two things that are actually used.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";

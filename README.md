@@ -303,6 +303,12 @@ One JSON object per executed tool call, appended to `tool_calls.jsonl`:
 
 That line is real output from a live OpenClaw run, and it is the same format the Python SDK writes and reads.
 
+**And, in training mode, one file per rollout result the control plane has not acknowledged yet**, under `$PERCEPTEYE_HOME/outbox/<agentId>/`. The result is written there *before* the report is sent and removed the moment it lands, so a control plane that is briefly down, a key without the `rollout.report` scope, or a process killed mid-POST costs you nothing: held results are delivered before the next rollout is claimed, including by a later process over the same directory. Three things follow, worth knowing before you go looking in there:
+
+- **A file still present is work the control plane has not recorded yet.** It is retried in front of every claim, in both the attended and the unattended lane.
+- **A refusal that resending cannot fix stops the retries and never deletes the file.** It is renamed `<id>.json.refused-410`, `.refused-422`, `.stale` and so on, and a second refusal of the same rollout gets `.refused-422.1` rather than overwriting the first. A warning names the exact path every time. Retries stop after seven days, and that file is kept too.
+- **No credential is ever written there.** The rollout's lease token stays in this process's memory, because this directory is readable by the same agent the lease fences out.
+
 <br/>
 
 ## ⚙️ Configuration
@@ -322,7 +328,7 @@ Scalar settings are settable two ways: in your OpenClaw config under `plugins.en
 
 The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. An adapter that can resolve the full execution before work is claimed may also provide `startupObservation: {systemPrompt, tools, provider, model}`. Core runs startup and per-run evidence through the same canonical descriptor; it never accepts a caller-authored final digest. Component names belong to the adapter, and core does not assign them meaning. The resulting `execution_sha256` identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
 
-Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`); `PERCEPTEYE_CAPTURE_DIR` overrides just the production turn capture (default `$PERCEPTEYE_HOME/captured`); and `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's outcomes go, which the rollout driver sets per rollout.
+Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
 
 One host setting is not ours and has no environment form: `plugins.entries.agent-flywheel.hooks.allowConversationAccess`, which OpenClaw itself requires before it will deliver conversation hooks to a non-bundled plugin. See [Install](#-install-in-one-call).
 

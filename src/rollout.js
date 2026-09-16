@@ -87,12 +87,31 @@
  * conversation access is part of `canDrive` rather than something discovered
  * at report time -- and when it is missing the operator gets one line naming
  * the exact setting, instead of a queue that quietly stops moving.
+ *
+ * ── AND REPORTING IT IS NOT ALLOWED TO BE SILENT ──────────────────────────
+ *
+ * The other half of that sentence was missing for as long as this file has
+ * existed. `onAgentEnd` awaited `transport.report` and its `catch` logged one
+ * warning, so an outcome the control plane did not accept was gone: held in a
+ * local variable that went out of scope, with the row then swept to
+ * `abandoned` / `deadline_exceeded` by a reaper whose detail says no agent
+ * ever claimed it. Every rollout on one OPSD queue came back that way.
+ *
+ * `outbox.js` is the fix and its header is the long version. What this file
+ * owes it is two seams, both named here so a third lane cannot be written
+ * without them:
+ *
+ *   PRODUCER  `onAgentEnd` delivers through `spool.deliver`, which writes the
+ *             outcome to disk BEFORE the first network call.
+ *   CONSUMER  `claim` drains the outbox before every claim, in BOTH lanes --
+ *             which is why `unattended.js` has no transport of its own.
  */
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
+import { createOutbox, outboxDir } from "./outbox.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
 
@@ -173,6 +192,8 @@ export function createRolloutDriver({
   },
   heartbeatCanceller = (timer) => clearTimeout(timer),
   now = () => Date.now(),
+  env = process.env,
+  outbox = null,
 }) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
@@ -181,6 +202,25 @@ export function createRolloutDriver({
   if (cancel !== null && typeof cancel !== "function") {
     throw new ConfigurationError("cancel must be a function when supplied");
   }
+
+  /**
+   * Durable delivery, always on.
+   *
+   * NOT OPTIONAL and not behind a setting. A result held only in a local
+   * variable is the whole incident this lane was rewritten for, and a
+   * capability that ships dormant is a capability nobody gets. The directory
+   * is resolved from `env` for the same reason `capture.js` resolves its root
+   * that way: one answer to "where does this package write", honouring
+   * PERCEPTEYE_HOME, with no second environment flag.
+   */
+  const spool = outbox ?? createOutbox({
+    dir: outboxDir(transport?.agentId, env),
+    // The ONE way a result leaves this SDK, on the first attempt and on every
+    // redelivery alike.
+    send: (rollout, output) => transport.report(rollout, output),
+    logger,
+    now,
+  });
 
   /** sessionKey -> the rollout this session is running. */
   const inFlight = new Map();
@@ -256,67 +296,125 @@ export function createRolloutDriver({
       timer: null,
     };
     heartbeats.set(sessionKey, state);
+    // A logger belongs to the host, and a host whose logger throws must not be
+    // able to stop a lease being renewed. Every diagnostic below goes through
+    // this rather than calling `logger` directly.
+    const note = (message) => {
+      try { logger?.warn?.(message); } catch { /* telemetry, not the lease */ }
+    };
     const schedule = () => {
       if (state.stopped) return;
-      state.timer = heartbeatScheduler(beat, state.intervalMs);
+      try {
+        state.timer = heartbeatScheduler(beat, state.intervalMs);
+      } catch (err) {
+        // The scheduler is injectable and on a real host it is the host's own
+        // timer. If it refuses, this lease stops being renewed -- which is the
+        // one outcome that has to be SAID rather than discovered from a
+        // requeued rollout twenty minutes later.
+        state.stopped = true;
+        heartbeats.delete(sessionKey);
+        note(
+          `[agent-flywheel] rollout ${rollout.rolloutId}'s lease can no longer ` +
+          `be renewed because its heartbeat could not be scheduled ` +
+          `(${err?.message ?? err}); the control plane will requeue it when ` +
+          `the lease lapses.`,
+        );
+      }
     };
+    /** The lease is gone. Returns nothing; sets `state.stopped`. */
+    const onLeaseLost = async () => {
+      state.stopped = true;
+      heartbeats.delete(sessionKey);
+      if (reporting.get(sessionKey) === rollout) {
+        // The terminal result request races this heartbeat. It owns the
+        // authoritative outcome now; a 410 here can simply mean that the
+        // result landed first and closed the lease. The agent run is
+        // already over, so there is nothing to cancel or fence.
+        return;
+      }
+      if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
+      try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
+      const runStarted = activeRuns.has(sessionKey);
+      const runId = activeRuns.get(sessionKey) ?? undefined;
+      activeRuns.delete(sessionKey);
+      if (!runStarted) blockNextRun.add(sessionKey);
+      else revokedRuns.set(sessionKey, runId ?? null);
+      let cancelled = false;
+      if (cancel) {
+        try {
+          cancelled = await cancel({ sessionKey, runId, rollout }) === true;
+          if (!cancelled && runStarted) {
+            note(
+              `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, ` +
+              `but the host did not confirm that its active run stopped.`,
+            );
+          }
+        } catch (cancelErr) {
+          note(
+            `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, and ` +
+            `the host could not stop its run: ${cancelErr?.message ?? cancelErr}`,
+          );
+        }
+      } else if (runStarted) {
+        note(
+          `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; this ` +
+          `host exposes no active-run cancellation seam, so every later ` +
+          `tool call from the revoked run will be blocked.`,
+        );
+      }
+      note(
+        `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; its ` +
+        `${cancelled ? "host run was cancelled and " : ""}result will not ` +
+        `be reported because the control plane requeued it.`,
+      );
+    };
+    /**
+     * One renewal. STRUCTURALLY INCAPABLE OF ENDING THE RENEWAL CHAIN, and
+     * that is the whole reason it is shaped this way.
+     *
+     * This used to reschedule only on the two paths it recognised -- a clean
+     * beat and a non-LeaseLost transport error. Anything else thrown anywhere
+     * in here (a host logger that raises, a customer transport that rejects
+     * with something exotic, a cancel seam that throws twice) escaped as a
+     * rejected promise from a `setTimeout` callback: the lease stopped being
+     * renewed with nothing logged, the control plane's reaper wrote
+     * `abandoned` / `deadline_exceeded` over the rollout that was still
+     * running, and no report was ever accepted. That is the original incident,
+     * reproduced from one unexpected exception type. Worse here than in the
+     * Python SDK, in fact: an unhandled rejection is fatal to the whole
+     * process under Node's default policy, so it can take the customer's
+     * gateway down rather than one lease.
+     *
+     * So: a beat that fails is treated exactly like a transient failure --
+     * the next beat is already due, and a beat that raises is not evidence the
+     * lease is gone. Only a LeaseLost stops the chain.
+     */
     const beat = async () => {
       if (state.stopped) return;
       state.timer = null;
       try {
         await transport.heartbeat(rollout);
       } catch (err) {
-        if (err instanceof LeaseLost || err?.name === "LeaseLost") {
-          state.stopped = true;
-          heartbeats.delete(sessionKey);
-          if (reporting.get(sessionKey) === rollout) {
-            // The terminal result request races this heartbeat. It owns the
-            // authoritative outcome now; a 410 here can simply mean that the
-            // result landed first and closed the lease. The agent run is
-            // already over, so there is nothing to cancel or fence.
-            return;
-          }
-          if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
-          try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
-          const runStarted = activeRuns.has(sessionKey);
-          const runId = activeRuns.get(sessionKey) ?? undefined;
-          activeRuns.delete(sessionKey);
-          if (!runStarted) blockNextRun.add(sessionKey);
-          else revokedRuns.set(sessionKey, runId ?? null);
-          let cancelled = false;
-          if (cancel) {
-            try {
-              cancelled = await cancel({ sessionKey, runId, rollout }) === true;
-              if (!cancelled && runStarted) {
-                logger?.warn?.(
-                  `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, ` +
-                  `but the host did not confirm that its active run stopped.`,
-                );
-              }
-            } catch (cancelErr) {
-              logger?.warn?.(
-                `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}, and ` +
-                `the host could not stop its run: ${cancelErr?.message ?? cancelErr}`,
-              );
-            }
-          } else if (runStarted) {
-            logger?.warn?.(
-              `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; this ` +
-              `host exposes no active-run cancellation seam, so every later ` +
-              `tool call from the revoked run will be blocked.`,
+        try {
+          if (err instanceof LeaseLost || err?.name === "LeaseLost") {
+            await onLeaseLost();
+          } else {
+            note(
+              `[agent-flywheel] could not renew rollout ${rollout.rolloutId}; the ` +
+              `next scheduled heartbeat will retry: ${err?.message ?? err}`,
             );
           }
-          logger?.warn?.(
-            `[agent-flywheel] lease lost for rollout ${rollout.rolloutId}; its ` +
-            `${cancelled ? "host run was cancelled and " : ""}result will not ` +
-            `be reported because the control plane requeued it.`,
+        } catch (guardErr) {
+          // NAMES WHICH OF THE TWO ACTUALLY HAPPENED. A lease-loss handler
+          // that fails partway has already stopped the chain, and telling an
+          // operator "still being renewed" in that case is one wrong cause for
+          // two opposite states.
+          note(
+            `[agent-flywheel] rollout ${rollout.rolloutId}'s heartbeat failure ` +
+            `handler itself failed (${guardErr?.message ?? guardErr}); renewal ` +
+            `${state.stopped ? "has stopped" : "continues"}.`,
           );
-          return;
         }
-        logger?.warn?.(
-          `[agent-flywheel] could not renew rollout ${rollout.rolloutId}; the next ` +
-          `scheduled heartbeat will retry: ${err?.message ?? err}`,
-        );
       }
       schedule();
     };
@@ -442,10 +540,39 @@ export function createRolloutDriver({
     }
   }
 
+  /**
+   * THE ONE CLAIM SEAM. Both lanes reach the control plane through this.
+   *
+   * DRAIN BEFORE CLAIM, because a result already produced is worth more than
+   * the next rollout: the work is done, the agent's time is spent, and the
+   * only thing standing between it and a graded row is one POST. Claiming more
+   * work while a finished result sits on disk is how an outage becomes a
+   * backlog.
+   *
+   * This is where it lives rather than in each caller because there were two
+   * callers and a third would have been written without it. `unattended.js`
+   * used to hold its own `transport.claim`; it calls this now, so "every claim
+   * drains first" is a property of the code rather than of remembering.
+   */
+  async function claim(maxRollouts = 1) {
+    try {
+      await spool.drain();
+    } catch (err) {
+      // NAMED AS ITSELF. Folding this into the claim failure below would tell
+      // an operator the control plane was unreachable when what failed was the
+      // local outbox, which is a different thing to go and look at.
+      logger?.warn?.(
+        `[agent-flywheel] the outbox drain failed (${err?.message ?? err}); ` +
+        `held results stay on disk and are retried before the next claim.`,
+      );
+    }
+    return transport.claim(maxRollouts);
+  }
+
   async function claimAndDeliver(sessionKey) {
     let claimed;
     try {
-      claimed = await transport.claim(1);
+      claimed = await claim(1);
     } catch (err) {
       // A control plane that cannot be reached must never break the agent.
       // No rollout is delivered and the session runs as an ordinary one.
@@ -581,7 +708,14 @@ export function createRolloutDriver({
       );
     }
     try {
-      await transport.report(rollout, {
+      // SPOOLED BEFORE IT IS SENT, and never merely awaited. `deliver` writes
+      // the outcome to the outbox before the first network call and settles
+      // the file on the answer, so a control plane that is down, a key without
+      // the report scope, and a process killed mid-POST all end with the
+      // result on disk and an operator told where -- instead of one warning
+      // and a rollout the reaper marks `abandoned` twenty minutes later. It
+      // does not throw: the failure IS the return value.
+      const delivered = await spool.deliver(rollout, {
         finalText,
         // `undefined`, never `[]`. The recorder owns tool calls and writes
         // them to the trajectory; asserting zero here would overwrite what it
@@ -599,13 +733,10 @@ export function createRolloutDriver({
           ?? undefined
         ),
       });
-      return rollout;
-    } catch (err) {
-      logger?.warn?.(
-        `[agent-flywheel] could not report rollout ${rollout.rolloutId}: ` +
-        `${err?.message ?? err}`,
-      );
-      return null;
+      // `null` still means "the control plane does not have this yet", which
+      // is what every caller already reads it as. What changed is that it no
+      // longer means the outcome is gone.
+      return delivered ? rollout : null;
     } finally {
       // Keep renewing through the result POST itself; stop only once it has
       // either landed or failed, not merely when the agent produced an answer.
@@ -658,6 +789,11 @@ export function createRolloutDriver({
     onModelCallStarted, onModelCallEnded,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
+    // `claim` is what the UNATTENDED runner claims through -- not
+    // `transport.claim` -- so the drain in front of it cannot be skipped by a
+    // lane that forgot about it. `outbox` is exposed for diagnostics and for
+    // the tests that pin durability.
+    claim, outbox: spool,
   };
 }
 
@@ -670,6 +806,11 @@ export function createRolloutDriver({
  */
 export function registerRolloutDriver(api, {
   config, transport, pluginId, logger = null, executionIdentity = null,
+  // A PARAMETER, matching `resolveConfig` and `captureRoot` rather than
+  // inventing a second convention: it is the one thing that decides where
+  // undelivered results are held (PERCEPTEYE_HOME), and a read of the global
+  // here would be untestable without mutating the process's environment.
+  env = process.env,
 }) {
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
@@ -763,6 +904,10 @@ export function registerRolloutDriver(api, {
   // reaches `/rollouts/claim`, and the warning above names the real cause once.
   const registeredTransport = {
     get leaseMs() { return transport.leaseMs; },
+    // FORWARDED, because the outbox is keyed by agent: two installs sharing
+    // one PERCEPTEYE_HOME would otherwise replay each other's held results.
+    // A wrapper that silently dropped it would key every one of them "agent".
+    get agentId() { return transport.agentId; },
     async claim(...args) {
       if (!(await ensureRegistered())) {
         return { rollouts: [], pollAfterMs: 5_000 };
@@ -779,6 +924,7 @@ export function registerRolloutDriver(api, {
     enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
     logger,
     executionIdentity,
+    env,
   });
 
   // Failures are swallowed at the boundary: a telemetry plugin must never be
@@ -854,7 +1000,8 @@ export function registerRolloutDriver(api, {
     // reachable.
     let gatewayCtx = null;
     unattended = createUnattendedRunner({
-      transport: registeredTransport,
+      // No transport of its own: it claims through `driver.claim`, which is
+      // both the registration gate and the outbox drain. See `claim` above.
       driver,
       startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
       logger,

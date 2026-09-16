@@ -150,9 +150,16 @@ export const sessionKeyFor = (rolloutId) => `percepteye-rollout-${rolloutId}`;
  *
  * `driver` is the same one the attended lane uses, so reporting and typed
  * abandon happen in exactly one place for both lanes.
+ *
+ * AND CLAIMING TOO, now. This used to hold its own `transport` and call
+ * `transport.claim` directly, which made it the second of two claim sites --
+ * and the drain that has to run in front of a claim (a finished result is
+ * worth more than the next rollout) would then have had to be remembered in
+ * both. `driver.claim` is the one seam; there is no transport here to walk
+ * around it with.
  */
 export function createUnattendedRunner({
-  transport, driver, startTurn, logger = null, pollMs = DEFAULT_POLL_MS,
+  driver, startTurn, logger = null, pollMs = DEFAULT_POLL_MS,
 }) {
   let timer = null;
   let running = false;
@@ -181,7 +188,7 @@ export function createUnattendedRunner({
     try {
       let claimed;
       try {
-        claimed = await transport.claim(1);
+        claimed = await driver.claim(1);
       } catch (err) {
         logger?.warn?.(
           `[agent-flywheel] could not claim a rollout: ${err?.message ?? err}`);

@@ -205,7 +205,8 @@ export class ControlPlaneClient {
       }
 
       if (response.status === 410) {
-        throw new LeaseLost((await detail(response)) || "lease lost");
+        throw new LeaseLost((await detail(response)) || "lease lost",
+                            { statusCode: response.status });
       }
 
       // 429 retries EVEN WHEN ambiguous retries are off: it is the server
@@ -222,8 +223,15 @@ export class ControlPlaneClient {
       if (response.status >= 400) {
         // Terminal. A 4xx that is not 408/429 will not become a 2xx by being
         // sent again; retrying only delays the error.
+        //
+        // The STATUS travels with the error, not only inside its message: a
+        // caller holding a rollout's only copy of its result has to tell a 422
+        // (these bytes are refused forever) from a 401 (a reissued key
+        // delivers them), and the difference decides whether the file stays in
+        // the retry set. See `outbox.js:REDELIVERY_CANNOT_FIX`.
         throw new TransportError(
           `${method} ${path} -> HTTP ${response.status}: ${await detail(response)}`,
+          { statusCode: response.status },
         );
       }
 

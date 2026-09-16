@@ -61,6 +61,42 @@ describe("retrying reads the response, not just the exception", () => {
     await assert.rejects(() => c.request("POST", "/x"), LeaseLost);
   });
 
+  it("carries the status ON the error, not only inside its message", async () => {
+    // THE PRODUCER of the fact `outbox.js:retirementFor` consumes. A caller
+    // holding a rollout's only copy of its result has to tell a 422 (these
+    // bytes are refused forever -- keep them, under a name) from a 401 (a
+    // reissued key delivers them -- keep retrying), and parsing English out of
+    // a message is not a mechanism. Without this the outbox reads every
+    // refusal as transient and retries it for a week.
+    const { c } = client([{ status: 422, body: '{"detail":"nope"}' }]);
+    await assert.rejects(() => c.request("POST", "/rollouts/r1/result"), (err) => {
+      assert.equal(err.statusCode, 422,
+        `the status did not travel with the error: ${err.statusCode}`);
+      return true;
+    });
+  });
+
+  it("puts 410 on the LeaseLost too", async () => {
+    const { c } = client([{ status: 410, body: '{"detail":"gone"}' }]);
+    await assert.rejects(() => c.request("POST", "/rollouts/r1/heartbeat"), (err) => {
+      assert.ok(err instanceof LeaseLost);
+      assert.equal(err.statusCode, 410);
+      return true;
+    });
+  });
+
+  it("leaves the status null when no response was ever produced", async () => {
+    // The TRANSIENT side of the split, and it has to stay that way: a network
+    // blip that retired a rollout's only copy of its result would be a worse
+    // failure than the one the split exists to handle.
+    const { c } = client([netError("ECONNREFUSED")]);
+    await assert.rejects(() => c.request("POST", "/rollouts/r1/result"), (err) => {
+      assert.equal(err.statusCode, null,
+        "a failure the server never saw was classified as a permanent refusal");
+      return true;
+    });
+  });
+
   it("honours Retry-After over its own backoff", async () => {
     const { c, seen } = client([
       { status: 429, headers: { "retry-after": "0" } },

@@ -7,9 +7,23 @@
  * transport failure retries forever against a rollout someone else now owns.
  */
 export class TransportError extends Error {
+  /**
+   * `statusCode` is the HTTP status the control plane answered with, or `null`
+   * when no response was ever produced.
+   *
+   * IT HAD TO BECOME A PROPERTY. It was only ever in the message string, so
+   * the one caller that has to tell a 422 ("resending these bytes will be
+   * refused forever") from a 503 ("try again in a moment") could do it by
+   * parsing English or not at all. `outbox.js:retirementFor` is that caller,
+   * and it reads this. `null` is the TRANSIENT side of the split on purpose: a
+   * network blip that retired a rollout's only copy of its result would be a
+   * worse failure than the one the split exists to handle. Python's half of
+   * this contract spells it `status_code`.
+   */
   constructor(message, options) {
     super(message, options);
     this.name = "TransportError";
+    this.statusCode = options?.statusCode ?? null;
   }
 }
 
@@ -17,6 +31,9 @@ export class LeaseLost extends TransportError {
   constructor(message, options) {
     super(message, options);
     this.name = "LeaseLost";
+    // A lease is lost by exactly one status, and a caller that reads the code
+    // must see it here too rather than only on the subclass's name.
+    this.statusCode = options?.statusCode ?? 410;
   }
 }
 

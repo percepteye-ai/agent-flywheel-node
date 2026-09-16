@@ -237,6 +237,10 @@ export function register(api, pluginConfig = {}, env = process.env) {
         config,
         pluginId: PLUGIN_ID,
         logger,
+        // Where an undelivered result waits, via PERCEPTEYE_HOME. Passed for
+        // the same reason `captureRoot(env)` is above: one answer to "where
+        // does this package write", and the same `env` for both lanes.
+        env,
         transport: config.apiKey
           ? new AttachTransport(
             new ControlPlaneClient(config.controlPlaneUrl, config.apiKey),
