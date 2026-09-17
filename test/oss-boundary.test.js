@@ -76,6 +76,13 @@ const INTERNAL_DETAILS = [
 ];
 
 /** Extensions that are documentation assets, never package payload. */
+//: A developer's absolute home path, ANCHORED AT A PATH ROOT. Exported here
+//: rather than built inline so the guard's own precision is under test: an
+//: over-broad version of this fires on ordinary fixtures and docs, and the
+//: cheap response is to rename the fixture -- which trains everyone to work
+//: around the guard rather than trust it.
+const DEV_PATH = /(?<![\w/~.\-])(\/(?:users|home)\/[^/\s"'`]+\/|c:\\users\\)/gi;
+
 const ASSET_EXTENSIONS = [
   ".gif", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".mp4", ".mov", ".webm",
 ];
@@ -154,7 +161,20 @@ describe("the open-source boundary", () => {
     // An absolute path off a developer's machine discloses the username, the
     // internal repo names and the working layout, and it cannot work for
     // anyone else. One shipped publicly for exactly this reason.
-    const pattern = /(\/users\/[^/\s"']+\/|\/home\/[^/\s"']+\/|c:\\users\\)/g;
+    //
+    // ANCHORED AT A PATH ROOT, because the question is whether the path IS a
+    // home directory, not whether it CONTAINS a segment called "home". The
+    // unanchored form matched "/home/outbox/" inside the perfectly ordinary
+    // "/tmp/home/outbox/alpha" and inside "$PERCEPTEYE_HOME/outbox/", so it
+    // failed on fixtures and docs that disclose nothing -- and the cheap way
+    // out is to rename the fixture, which teaches the next person to work
+    // around the guard instead of trusting it. A guard that cries wolf is how
+    // a real leak gets waved through.
+    //
+    // The lookbehind rejects a preceding path character, so "/home/..." only
+    // counts at the start of a token: after whitespace, a quote, "(", "=", ","
+    // or the start of the file.
+    const pattern = new RegExp(DEV_PATH.source, DEV_PATH.flags);
     const offenders = [];
     for (const rel of publishedFiles()) {
       const text = textOf(rel);
@@ -215,5 +235,37 @@ describe("the open-source boundary", () => {
     const missing = sources.filter((src) => !existsSync(resolve(ROOT, src.split(/[?#]/)[0])));
     assert.deepEqual(missing, [],
       `a README image names a file that is not in the repo:\n${missing.join("\n")}`);
+  });
+});
+
+describe("the developer-path guard itself", () => {
+  const hits = (t) => [...t.matchAll(new RegExp(DEV_PATH.source, DEV_PATH.flags))]
+    .map((m) => m[0]);
+
+  it("catches a real developer path, however it is quoted", () => {
+    for (const leak of [
+      '"/Users/srini/Projects/agent-flywheel/src"',
+      "  /home/srini/ranger_training/x",
+      "path=/home/alice/outbox/",
+      "(/Users/bob/Desktop/)",
+      "C:\\Users\\carol\\dev",
+    ]) {
+      assert.ok(hits(leak).length > 0, `missed a real leak: ${leak}`);
+    }
+  });
+
+  it("does NOT fire on a path that merely CONTAINS a home-ish segment", () => {
+    // Every one of these is innocuous and the unanchored guard flagged them.
+    // This is the half of the predicate that was missing.
+    for (const ok of [
+      "/tmp/home/outbox/alpha",
+      "$PERCEPTEYE_HOME/outbox/",
+      "~/.percepteye/outbox/agent/",
+      "relative/users/thing/",
+      "/var/lib/users/",
+      "/opt/home/",
+    ]) {
+      assert.deepEqual(hits(ok), [], `false positive on: ${ok}`);
+    }
   });
 });

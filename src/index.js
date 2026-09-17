@@ -84,11 +84,67 @@ import { conversationAccessGranted } from "./host.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
 } from "./capture.js";
-import { createExecutionIdentityTracker } from "./execution-identity.js";
+import {
+  createExecutionIdentityTracker, withholdFingerprints,
+} from "./execution-identity.js";
+import { resolveDeclaration } from "./declaration.js";
 
 export const PLUGIN_ID = "agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
+
+/**
+ * The operator's `describe`, validated -- or null, having said why.
+ *
+ * NOT A THROW, and that is the one place this differs from the Python SDK,
+ * which refuses to start on a bad declaration. Here a throw fails the plugin
+ * load and takes local capture down with it (see the mode fallback below), so
+ * a bad declaration is dropped with a warning that names the same cause
+ * Python's refusal names, and the agent registers what was observed.
+ *
+ * A STATIC declaration is checked whatever consent says, as Python checks it:
+ * lifting the opt-out later must not be the moment a typo surfaces. A
+ * FUNCTION runs only with consent -- nothing of the customer's runs for a
+ * description that will not be sent.
+ *
+ * Anything thrown is caught, not only a ConfigurationError: this runs inside
+ * `register()`, and the promise is that a declaration never costs the load.
+ */
+function declarationFor(config, logger) {
+  if (config.describe === null) return null;
+  const refusal = (err) => (err instanceof ConfigurationError
+    ? err.message
+    : `describe could not be read (${err?.message ?? typeof err})`);
+  if (!config.introspect) {
+    if (typeof config.describe !== "function") {
+      try {
+        resolveDeclaration(config.describe);
+      } catch (err) {
+        logger?.warn?.(
+          `[${PLUGIN_ID}] ${refusal(err)}. Fix ` +
+          `plugins.entries.${PLUGIN_ID}.config.describe before turning ` +
+          `introspection back on.`,
+        );
+      }
+    }
+    logger?.warn?.(
+      `[${PLUGIN_ID}] introspection is off (introspect / ` +
+      `PERCEPTEYE_INTROSPECT), and it wins: the description declared with ` +
+      `describe is not sent, and this agent registers no description at all.`,
+    );
+    return null;
+  }
+  try {
+    return resolveDeclaration(config.describe);
+  } catch (err) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] ${refusal(err)}. The declaration is ignored, so this ` +
+      `agent registers only what was observed. Fix ` +
+      `plugins.entries.${PLUGIN_ID}.config.describe.`,
+    );
+    return null;
+  }
+}
 
 
 export function register(api, pluginConfig = {}, env = process.env) {
@@ -164,16 +220,42 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
     return null;
   }
-  const executionIdentity = createExecutionIdentityTracker({
-    executionSnapshot: config.executionSnapshot,
+  // What the operator says this agent is (see declaration.js), and whether
+  // they consented to saying anything at all.
+  const declaration = declarationFor(config, logger);
+  const tracker = createExecutionIdentityTracker({
+    // Refused discovery authors no identity: the Python SDK authors none when
+    // PERCEPTEYE_INTROSPECT is off. (The describer below may still write
+    // discovered_agent.json locally under PERCEPTEYE_TRAJECTORY_DIR; its one
+    // reader, the Python SDK's warm-up, asks consent itself.)
+    executionSnapshot: config.introspect ? config.executionSnapshot : null,
     mode: config.mode,
     agentId: config.agentId,
   });
-  if (config.executionSnapshot !== null && !executionIdentity.enabled) {
+  if (config.executionSnapshot !== null && !config.introspect) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] exact execution identity is disabled: introspection is ` +
+      `off (introspect / PERCEPTEYE_INTROSPECT), and identity is derived from ` +
+      `the description. Capture continues without an execution fingerprint.`,
+    );
+  } else if (config.executionSnapshot !== null && !tracker.enabled) {
     logger?.warn?.(
       `[${PLUGIN_ID}] exact execution identity is disabled: ` +
-      `${executionIdentity.refusal}. Capture continues without an affirmative ` +
+      `${tracker.refusal}. Capture continues without an affirmative ` +
       `execution fingerprint.`,
+    );
+  }
+  // A DECLARED description is the customer's word, not an observation: it
+  // merges over what was observed and anchors no fingerprint, anywhere.
+  const executionIdentity = declaration === null
+    ? tracker
+    : withholdFingerprints(tracker);
+  if (declaration !== null && tracker.enabled) {
+    // Said, because an operator who configured an execution snapshot and then
+    // added `describe` otherwise loses exact identity with no line anywhere.
+    logger?.warn?.(
+      `[${PLUGIN_ID}] exact execution identity is withheld: ` +
+      `${executionIdentity.refusal}. Remove describe to restore it.`,
     );
   }
   // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
@@ -248,6 +330,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
           )
           : null,
         executionIdentity,
+        declaration,
       });
     } catch (err) {
       logger?.warn?.(
@@ -276,7 +359,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // inputs is a second answer that drifts the moment a cause is added.
     const conversationAccess = conversationAccessGranted(api, PLUGIN_ID);
     capture = registerTurnCapture(api, {
-      config, turns, pluginId: PLUGIN_ID, logger, env,
+      config, turns, pluginId: PLUGIN_ID, logger, env, declaration,
     });
     // THE LAST MILE. `capture` owns the one control-plane client, so this
     // reuses it rather than building a second against the same key -- and

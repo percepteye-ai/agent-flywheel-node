@@ -94,15 +94,28 @@ jobs:
           NPM_CONFIG_PROVENANCE: ${{ github.event.repository.private && 'false' || 'true' }}
         # --access public: required if the name is ever scoped (a scoped
         # package defaults to restricted), harmless while it is not.
-        run: npm publish --access public
+        #
+        # --loglevel verbose, because npm reports WHY trusted publishing failed
+        # only at that level ("oidc: Failed token exchange request with body
+        # message: ..."), then falls back to setup-node's placeholder token and
+        # the registry answers a bare E404. The 0.1.2 tag run failed exactly
+        # like that, with the reason nowhere in the log.
+        run: npm publish --access public --loglevel verbose
 
   rehearse:
-    # Everything the publish job does, ending in `npm publish --dry-run`:
-    # proof the pipeline works before the first real run is also the first
-    # time anyone has seen it.
+    # Everything the publish job does, ending in `npm publish --dry-run` --
+    # AUTHENTICATION INCLUDED. npm performs the OIDC token exchange before it
+    # looks at --dry-run, so with the same environment and `id-token: write`
+    # as `publish`, a rehearsal proves the trusted publisher matches without
+    # uploading anything. Without them it skipped the exchange silently, and
+    # rehearsed everything except the one step that failed.
     needs: ci
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -110,4 +123,4 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - run: npm install -g "npm@^11.5.1" && npm --version
-      - run: npm publish --access public --dry-run
+      - run: npm publish --access public --dry-run --loglevel verbose

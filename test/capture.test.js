@@ -20,6 +20,7 @@ import {
   captureRoot, captureVerdict, createTurnCapture, createTurnUploader,
   lastAssistantText, registerTurnCapture,
 } from "../src/capture.js";
+import { resolveDeclaration } from "../src/declaration.js";
 import { SDK_UA } from "../src/http.js";
 import { CONTRACT_VERSION } from "../src/wire.js";
 import {
@@ -470,14 +471,15 @@ function age(dir) {
 }
 
 /** Wire the production lane against a fake control plane, verdict already in. */
-async function wireCapture(root, a, tr) {
+async function wireCapture(root, a, tr, { config = {}, declaration = null } = {}) {
   const out = registerTurnCapture(a, {
-    config: { apiKey: "k", agentId: "a1" },
+    config: { apiKey: "k", agentId: "a1", ...config },
     turns: createTurnCapture({ root }),
     pluginId: PLUGIN_ID,
     logger: a.logger,
     env: { PERCEPTEYE_CAPTURE_DIR: root },
     makeTransport: () => tr,
+    declaration,
   });
   await settle();
   assert.equal(out.uploader.mayUpload, true, "the fake verdict did not land");
@@ -741,6 +743,41 @@ describe("the agent is registered, so an operator has something to enable", () =
     assert.equal(wire.discovered_agent, null,
       "the honest state is `unreadable`: this lane has no description to " +
       "send, and `unreadable` is the one state that preserves a stored one");
+  });
+
+  it("OMITS it when the customer refused introspection -- their opt-out", async () => {
+    // Asked as the Python SDK's attach() asks it. Before the switch existed,
+    // omitting the key asserted a decision nobody could have made; now the
+    // absence is exactly the instruction the customer gave.
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr, { config: { introspect: false } });
+    const wire = JSON.parse(JSON.stringify(tr.registered[0]));
+    assert.equal("discovered_agent" in wire, false);
+  });
+
+  it("sends what the operator DECLARED, when they declared it", async () => {
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr, {
+      declaration: resolveDeclaration({
+        system_prompt: "You triage.", tools: [{ name: "refund" }] }),
+    });
+    // `openclaw`, not Python's `custom`: nothing was observed, but the host is
+    // known, and the control plane reads the framework as a lookup key.
+    assert.deepEqual(tr.registered[0].discovered_agent, {
+      agent_name: "a1", framework: "openclaw", source_type: "sdk_declared",
+      role: "standalone", system_prompt: "You triage.",
+      tool_definitions: [{ name: "refund", description: "", input_schema: {},
+                           original_format: "anthropic_tool" }],
+    });
+  });
+
+  it("keeps discovered_agent LAST, so an undeclared registration is the old bytes", async () => {
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr);
+    assert.deepEqual(Object.keys(tr.registered[0]), [
+      "agent_id", "mode", "sdk", "contract_version", "reports_tool_calls",
+      "isolation", "concurrency", "input_shape", "entrypoint", "discovered_agent",
+    ]);
   });
 
   it("still reads the verdict when the registration is REFUSED", async () => {

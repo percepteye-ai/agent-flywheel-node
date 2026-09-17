@@ -47,6 +47,12 @@ export const PLUGIN_ID = "agent-flywheel";
  * rollouts and started unattended turns anyway, and the operator got no signal
  * because the production-mode log is on the branch that was never taken.
  *
+ * THE SAME HOST REFUSES A WRONG TYPE THE SAME WAY: a value its validator
+ * rejects fails the plugin load. So the on/off switches take a NUMBER too --
+ * `capture: 0` is documented as off, and a schema of string|boolean refused it
+ * and skipped the plugin -- and NULL, which `resolveConfig` reads as unset;
+ * and `describe` declares no type at all.
+ *
  * `resolveConfig` below is the ONE place a default is decided. A schema default
  * is a second answer to a question already answered there, and this host turns
  * it into the winning one. `test/config-gate.test.js` asserts the absence.
@@ -77,20 +83,20 @@ export const CONFIG_SCHEMA = {
       description: "Override the control-plane base URL.",
     },
     capture: {
-      type: ["string", "boolean"],
+      type: ["string", "boolean", "number", "null"],
       description:
         "Set false/0/off to disable local capture entirely. Unset means " +
         "PERCEPTEYE_CAPTURE, then on.",
     },
     applyPrompt: {
-      type: ["string", "boolean"],
+      type: ["string", "boolean", "number", "null"],
       description:
         "Set false/0/off to stop applying the control plane's approved " +
         "system prompt in production mode. Unset means " +
         "PERCEPTEYE_APPLY_PROMPT, then on.",
     },
     applyModel: {
-      type: ["string", "boolean"],
+      type: ["string", "boolean", "number", "null"],
       description:
         "Set false/0/off to stop pointing this agent at the control " +
         "plane's approved model in production mode. Unset means " +
@@ -149,6 +155,27 @@ export const CONFIG_SCHEMA = {
         "the system prompt your control plane approved. Unset means " +
         "PERCEPTEYE_AGENT_MODE, then training; a value here overrides the " +
         "environment.",
+    },
+    introspect: {
+      type: ["string", "boolean", "number", "null"],
+      description:
+        "Set false/0/off to register this agent with no description at all; " +
+        "the control plane records that as your opt-out. " +
+        "PERCEPTEYE_INTROSPECT=0 refuses too, whatever this says. Unset " +
+        "means on.",
+    },
+    // NO `type`, deliberately. A value the host's validator refuses fails the
+    // whole plugin load and takes local capture down with it, so any value
+    // passes here and declaration.js decides -- refusing a bad one with a
+    // warning, the plugin still loaded.
+    describe: {
+      description:
+        "The agent's own description, for what this plugin cannot observe " +
+        "(OpenClaw's llm_input carries no tools): system_prompt, tools (the " +
+        "list the agent sends its model -- OpenAI function specs, Anthropic " +
+        "tools, or {name, description, input_schema, read_only}) and model " +
+        "(a name, or {model_name, provider, temperature, max_tokens}). What " +
+        "you declare wins where given; it anchors no execution identity.",
     },
   },
 };
@@ -244,6 +271,18 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     // Adapter-owned opaque evidence. Validation and fail-closed reconciliation
     // live with the identity code; configuration only transports the snapshot.
     executionSnapshot: pluginConfig.executionSnapshot ?? null,
+    // CONSENT to describe this agent, asked as the Python SDK asks it and
+    // refusable from EITHER side: `introspect: false` here (Python's
+    // `serve(introspect=False)`) or PERCEPTEYE_INTROSPECT=0 (for an operator
+    // who cannot edit the config). Unlike the switches above, neither side
+    // overrides the other -- one refusal is enough, as it is in Python.
+    introspect:
+      enabledUnlessOff(pluginConfig.introspect, undefined) &&
+      enabledUnlessOff(undefined, env.PERCEPTEYE_INTROSPECT),
+    // The operator's own description, transported only. It is checked in
+    // index.js, where a bad one can be refused loudly without failing the
+    // plugin load; see declaration.js.
+    describe: pluginConfig.describe ?? null,
     contributing: Boolean(apiKey),
   };
 }
