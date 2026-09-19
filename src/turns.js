@@ -40,6 +40,7 @@ import {
 import { basename, join } from "node:path";
 
 import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
+import { recordTurnSpan } from "./tracing.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, productionIdentifier, productionTurnIdentifier,
@@ -136,10 +137,41 @@ export function recordTurnText(dir, kind, text, ids = {}) {
     mkdirSync(dir, { recursive: true });
     appendFileSync(join(dir, TURNS_FILENAME),
                    JSON.stringify(record) + "\n", "utf8");
-    return true;
   } catch {
     return false;
   }
+
+  // THE OTel PROJECTION RIDES THE SAME CALL THAT WRITES THE FILE, for the
+  // reason the Python SDK states at its own call site: two call sites for one
+  // fact drift, and a turn that reached the trajectory but not the customer's
+  // traces is the drift nobody notices until they are comparing the two.
+  //
+  // THIS IS WHAT MAKES A NEXT-STATE SIGNAL POSSIBLE from a customer's own
+  // export. A chat span carrying the turn content is what the trace ingest
+  // reads into an ordered conversation; the turn AFTER each answer is the
+  // observed consequence the per-step reward model votes on. Without it an
+  // export is HTTP server spans only, which record what a caller asked a
+  // service to do and never what came back into the agent's context.
+  //
+  // It is a projection, so it happens AFTER the write and cannot cost it:
+  // the file is already on disk by the time we get here.
+  try {
+    recordTurnSpan({
+      // "task" is what the agent was ASKED, "answer" is what it ANSWERED.
+      ...(kind === "task"
+        ? { inputText: record.text }
+        : { outputText: record.text }),
+      turnId: record.turn_id,
+      conversationId: record.conversation_id,
+      taskId: record.task_id,
+      rolloutId: record.rollout_id,
+      executionSha256: record.execution_sha256,
+    });
+  } catch {
+    // A capture bug costs the observation and never the turn -- and the file
+    // is already written, so this cannot cost that either.
+  }
+  return true;
 }
 
 /** Record which conversation this turn belongs to. Idempotent, never throws. */

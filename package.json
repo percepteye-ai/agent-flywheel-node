@@ -10,7 +10,8 @@
     ".": "./src/index.js",
     "./classify": "./src/classify.js",
     "./trajectory": "./src/trajectory.js",
-    "./dsh": "./src/dsh.js"
+    "./dsh": "./src/dsh.js",
+    "./tracing": "./src/tracing.js"
   },
   "files": [
     "src",
@@ -63,5 +64,13 @@
   },
   "bugs": {
     "url": "https://github.com/percepteye-ai/agent-flywheel-node/issues"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
   }
 }

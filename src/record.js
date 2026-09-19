@@ -11,6 +11,8 @@
  * exists on this path.
  */
 import { classify } from "./classify.js";
+import { resolveMode, TRAINING } from "./mode.js";
+import { recordToolCallSpan } from "./tracing.js";
 import { extractEntityIds } from "./evidence.js";
 import { toWire } from "./trajectory.js";
 
@@ -77,6 +79,34 @@ export function createRecorder({ writer }) {
           || null,
       });
       if (ok) written += 1;
+
+      // THE OTel PROJECTION RIDES THE SAME CALL THAT WRITES THE RECORD, for
+      // the reason the Python SDK states at its own call site: two call sites
+      // for one fact drift, and a tool call that reached the trajectory but
+      // not the customer's traces is the drift nobody notices until they are
+      // comparing the two.
+      //
+      // ``mode`` decides which id is stamped, and it is REQUIRED rather than
+      // defaulted — defaulting it would silently restore the bug the two ids
+      // exist to prevent: a production turn stamped as a rollout, which makes
+      // the customer's own telemetry unable to answer "how much of my traffic
+      // was training". In production the plugin claims no rollout, so the
+      // scope id is a TURN id; in training it is a rollout id.
+      const isTraining = resolveMode() === TRAINING;
+      const scopeId = (typeof event.runId === "string" && event.runId)
+        || (typeof ctx.runId === "string" && ctx.runId)
+        || null;
+      recordToolCallSpan(name, event.params, {
+        outcome: verdict.outcome,
+        error: verdict.error,
+        latencyMs: typeof event.durationMs === "number"
+          ? event.durationMs : null,
+        agentName: typeof ctx.agentId === "string" ? ctx.agentId : null,
+        rolloutId: isTraining ? scopeId : null,
+        turnId: isTraining ? null : scopeId,
+        toolCallId: typeof event.toolCallId === "string"
+          ? event.toolCallId : null,
+      });
       return ok;
     },
   };
