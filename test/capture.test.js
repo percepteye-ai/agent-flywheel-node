@@ -24,7 +24,7 @@ import { resolveDeclaration } from "../src/declaration.js";
 import { SDK_UA } from "../src/http.js";
 import { CONTRACT_VERSION } from "../src/wire.js";
 import {
-  CONVERSATION_ID_FILENAME, MAX_TEXT_CHARS, TASK_ID_CONFLICT_FILENAME,
+  CONVERSATION_ID_FILENAME, TASK_ID_CONFLICT_FILENAME,
   TASK_ID_FILENAME, TURNS_FILENAME, readTaskId, readTurnText, recordTaskId,
   recordTurnText,
   turnDir, turnIndexOf, turnWire,
@@ -64,7 +64,6 @@ describe("the on-disk format is the Python SDK's", () => {
     assert.equal(TURNS_FILENAME, "turns.jsonl");
     assert.equal(CONVERSATION_ID_FILENAME, "conversation_id");
     assert.equal(TASK_ID_FILENAME, "task_id");
-    assert.equal(MAX_TEXT_CHARS, 20_000);
   });
 
   it("writes a turn record with the keys the Python reader expects", () => {
@@ -98,11 +97,14 @@ describe("the on-disk format is the Python SDK's", () => {
     assert.equal(readTurnText(turnDir(root, "r")), null);
   });
 
-  it("truncates at the same point as the other end", () => {
+  it("stores the text whole, as the other end does", () => {
+    // No size limitation: both SDKs used to cut at 20,000 characters, and a
+    // turn cut short is a different turn from the one the agent served.
     const root = tmp();
     const cap = createTurnCapture({ root });
-    cap.onMessageReceived({ runId: "r", content: "x".repeat(MAX_TEXT_CHARS + 500) });
-    assert.equal(readTurnText(turnDir(root, "r")).task.length, MAX_TEXT_CHARS);
+    const text = "x".repeat(20_500) + "\u{1F4E6}".repeat(5_000);
+    cap.onMessageReceived({ runId: "r", content: text });
+    assert.equal(readTurnText(turnDir(root, "r")).task, text);
   });
 
   it("preserves valid opaque ids and gives invalid host ids fresh safe ids", () => {
@@ -934,6 +936,29 @@ describe("the production lane is wired", () => {
   });
 });
 
+describe("a production tool call", () => {
+  it("records the conversation and task its host context names", async () => {
+    // The recorder handed the writer only `{runId}`, so the half of
+    // `resolveToolDir` that records the conversation read fields that were
+    // never there: a turn with no `message_received` (a terminal session)
+    // was uploaded with no conversation at all.
+    const { createRecorder } = await import("../src/record.js");
+    const { createWriter } = await import("../src/trajectory.js");
+    const root = tmp();
+    const cap = createTurnCapture({ root });
+    createRecorder({
+      writer: createWriter({ resolveDir: cap.resolveToolDir }), mode: "production",
+    }).handle(
+      { toolName: "read", params: {}, runId: "r1" },
+      { runId: "r1", sessionKey: "agent:main:cli:x", taskId: "case-1" },
+    );
+    const dir = turnDir(root, "r1");
+    assert.equal(readFileSync(join(dir, CONVERSATION_ID_FILENAME), "utf8"),
+                 "agent:main:cli:x");
+    assert.equal(readTaskId(dir), "case-1");
+  });
+});
+
 describe("reading the answer", () => {
   it("takes the last assistant message and joins parts", () => {
     assert.equal(lastAssistantText([
@@ -945,6 +970,19 @@ describe("reading the answer", () => {
   it("returns empty rather than inventing one", () => {
     assert.equal(lastAssistantText(null), "");
     assert.equal(lastAssistantText([{ role: "user", content: "x" }]), "");
+  });
+
+  it("never takes the PREVIOUS turn's answer for a run that produced none", () => {
+    // The host hands over the whole session. A run that failed mid-tool has
+    // no text of its own, and a search that ran to the start of the session
+    // returned the answer to the user's previous question instead.
+    assert.equal(lastAssistantText([
+      { role: "user", content: "first question" },
+      { role: "assistant", content: "the previous answer" },
+      { role: "user", content: "second question" },
+      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "f" }] },
+      { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "boom" }] },
+    ]), "");
   });
 });
 

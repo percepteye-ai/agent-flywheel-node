@@ -40,7 +40,6 @@ import {
 import { basename, join } from "node:path";
 
 import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
-import { recordTurnSpan } from "./tracing.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, productionIdentifier, productionTurnIdentifier,
@@ -55,41 +54,6 @@ export const AGENT_FINGERPRINT_CONFLICT_FILENAME = "agent_fingerprint.conflict";
 
 /** The two halves of a turn. Anything else is a programming error. */
 export const TURN_KINDS = ["task", "answer"];
-
-/**
- * Matches Python's `record_turn_text(max_chars=20_000)`.
- *
- * A cap rather than the whole message, because this is a customer's end user's
- * text and a runaway paste should not put a megabyte per turn on their disk.
- * The same number on both sides, so a turn captured by either package
- * truncates at the same point and the two corpora are comparable.
- *
- * CHARS MEANS CODE POINTS, which is what `truncateChars` below exists to make
- * true -- see it for why `slice` was not that.
- */
-export const MAX_TEXT_CHARS = 20_000;
-
-/**
- * `text[:MAX_TEXT_CHARS]` as PYTHON means it: code POINTS, not UTF-16 units.
- *
- * `String.prototype.slice` counts UTF-16 code units, so it truncated a
- * mostly-emoji message at HALF the documented point -- the two corpora were
- * not comparable, which is the one thing the shared constant is for. Worse, a
- * cut landing between the halves of a surrogate pair leaves a LONE SURROGATE,
- * which `JSON.stringify` writes into `turns.jsonl` and onto the wire; the
- * intake cannot encode it to UTF-8, the chunk is never acknowledged, and
- * `createTurnUploader.flush` leaves every marker in that chunk unwritten, so
- * the poisoned turn is re-sent on every flush forever. Iterating the string
- * yields whole code points, so neither is possible.
- *
- * The length guard is not an optimisation of the general case, it IS the
- * common case: code units are never fewer than code points, so text under the
- * cap in units is under it in points and never needs to be split at all.
- */
-function truncateChars(text) {
-  if (text.length <= MAX_TEXT_CHARS) return text;
-  return [...text].slice(0, MAX_TEXT_CHARS).join("");
-}
 
 /** One turn's directory. The directory name IS the turn id. */
 export function turnDir(root, turnId) {
@@ -123,13 +87,18 @@ export function safeTurnId(value) {
  * claims, and only the second is true when there is no text. Collapsing them
  * would put an empty `final_text` on the wire, which the intake would accept
  * as a real -- and terrible -- answer.
+ *
+ * NO LENGTH CAP, as in Python. A turn cut at a fixed length is a different
+ * turn from the one the agent served, and a conversation is rebuilt from
+ * exactly this text. (The cap that stood here also had to count code points
+ * by hand, because a UTF-16 slice could split a surrogate pair.)
  */
 export function recordTurnText(dir, kind, text, ids = {}) {
   if (!TURN_KINDS.includes(kind)) {
     throw new Error(`turn kind must be one of ${TURN_KINDS}, got ${kind}`);
   }
   if (typeof text !== "string" || !text.trim()) return false;
-  const record = { kind, text: truncateChars(text.trim()) };
+  const record = { kind, text: text.trim() };
   for (const [k, v] of Object.entries(ids)) {
     if (typeof v === "string" && v) record[k] = v;
   }
@@ -141,36 +110,9 @@ export function recordTurnText(dir, kind, text, ids = {}) {
     return false;
   }
 
-  // THE OTel PROJECTION RIDES THE SAME CALL THAT WRITES THE FILE, for the
-  // reason the Python SDK states at its own call site: two call sites for one
-  // fact drift, and a turn that reached the trajectory but not the customer's
-  // traces is the drift nobody notices until they are comparing the two.
-  //
-  // THIS IS WHAT MAKES A NEXT-STATE SIGNAL POSSIBLE from a customer's own
-  // export. A chat span carrying the turn content is what the trace ingest
-  // reads into an ordered conversation; the turn AFTER each answer is the
-  // observed consequence the per-step reward model votes on. Without it an
-  // export is HTTP server spans only, which record what a caller asked a
-  // service to do and never what came back into the agent's context.
-  //
-  // It is a projection, so it happens AFTER the write and cannot cost it:
-  // the file is already on disk by the time we get here.
-  try {
-    recordTurnSpan({
-      // "task" is what the agent was ASKED, "answer" is what it ANSWERED.
-      ...(kind === "task"
-        ? { inputText: record.text }
-        : { outputText: record.text }),
-      turnId: record.turn_id,
-      conversationId: record.conversation_id,
-      taskId: record.task_id,
-      rolloutId: record.rollout_id,
-      executionSha256: record.execution_sha256,
-    });
-  } catch {
-    // A capture bug costs the observation and never the turn -- and the file
-    // is already written, so this cannot cost that either.
-  }
+  // NO SPAN FROM HERE. A span per half-turn described neither half: the
+  // turn's `invoke_agent` span is emitted once, when the turn is whole, by
+  // the capture lane that knows when that is (`capture.js`).
   return true;
 }
 

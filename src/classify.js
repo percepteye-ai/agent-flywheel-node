@@ -81,7 +81,9 @@ export function classify(name, error, result) {
     return {
       outcome: "failed",
       status_code: null,
-      error: error.slice(0, 1000),
+      // Whole. A cut here sliced UTF-16 code units, so it could split a
+      // surrogate pair into text the intake cannot encode.
+      error,
       error_class: "ToolError",
     };
   }

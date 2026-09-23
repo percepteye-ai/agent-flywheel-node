@@ -81,3 +81,14 @@ describe("reading an exit status", () => {
     assert.equal(readExit({ meta: { exitCode: "not a number" } }), undefined);
   });
 });
+
+describe("the host's error is kept whole", () => {
+  it("never cuts it, so no cut can split a surrogate pair", () => {
+    // It used to be sliced at 1,000 UTF-16 code units: a pair straddling the
+    // cut became an unpaired surrogate the intake cannot encode.
+    const error = "a" + "\u{1F4E6}".repeat(3_000);
+    const v = classify("exec", error, undefined);
+    assert.equal(v.outcome, "failed");
+    assert.equal(v.error, error);
+  });
+});

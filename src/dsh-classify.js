@@ -47,9 +47,9 @@ export function classifyDsh(name, result) {
     return {
       outcome: "failed",
       status_code: null,
-      error: typeof failure.message === "string"
-        ? failure.message.slice(0, 1000)
-        : undefined,
+      // Whole, as `classify.js` keeps it: a UTF-16 slice here could split a
+      // surrogate pair into text the intake cannot encode.
+      error: typeof failure.message === "string" ? failure.message : undefined,
       // dsh carries an internal error class on `info`; it is far more useful
       // downstream than a generic label when it is a plain string.
       error_class: typeof info === "string" ? info

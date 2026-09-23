@@ -1,27 +1,45 @@
 /**
- * OpenTelemetry egress: a projection out, never a source in.
+ * OpenTelemetry egress: OTel GenAI spans, rendered to the published standard.
  *
- * PARITY WITH THE PYTHON SDK'S ``agent_flywheel/tracing.py``. A customer
- * deploys this package or the pip one, never both, and the promise is that
- * they behave identically — so the span names, the attribute keys and the
- * truncation limits here are the same values, asserted by the test suite
- * rather than kept in step by a comment. Python had this module and Node had
- * nothing, which meant a Node customer's agent emitted no ``gen_ai.*``
- * telemetry at all: Scout's agent-trace lane selects INTERNAL/CLIENT spans
- * carrying a ``gen_ai.*`` attribute, so their traces produced zero agent
- * records, no conversation, and therefore no next-state signal for the
- * per-step reward model to vote on.
+ * WHAT "THE STANDARD" MEANS HERE. The GenAI semantic conventions at
+ * `open-telemetry/semantic-conventions-genai@8ffdf568e1`: span names, kinds
+ * and attributes from its `spans.yaml`/`registry.yaml`, and every content
+ * attribute (`gen_ai.input.messages`, `gen_ai.output.messages`,
+ * `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
+ * `gen_ai.tool.call.result`) in the shape its JSON schemas define. Content is
+ * written as a JSON STRING, which the convention permits on spans and which is
+ * what its own reference instrumentations write.
  *
- * Tool outcomes already land in the append-only trajectory, which is what the
- * control plane grades. This emits them as spans additionally, so they show up
- * in whatever the customer already runs — Datadog, Phoenix, Grafana —
- * alongside the rest of their agent's telemetry.
+ * PARITY WITH THE PYTHON SDK'S `agent_flywheel/tracing.py` IS A TEST, NOT A
+ * PROMISE. A customer deploys this package or the pip one, never both, so the
+ * two must emit the same spans for the same facts. Both repositories carry the
+ * same golden fixture (`test/fixtures/genai-golden.json` here,
+ * `tests/fixtures/genai-golden.json` there, byte-identical): a scripted
+ * scenario and the exact spans it must produce, content JSON included. Each
+ * SDK renders the scenario and must match it byte for byte; the Python side
+ * also validates every content value against the convention's own schemas.
  *
- * **Tool spans are egress only. THE TURN SPAN IS NOT.** A tool name and an
- * outcome are telemetry; a prompt and a completion are the user's own words.
- * So ``recordTurnSpan`` is OPT-IN and is only ever called with text the
- * customer handed over deliberately — nothing in this package can see a prompt
- * on its own.
+ * TWO SPANS, both INTERNAL:
+ *
+ *   execute_tool {tool}   one per recorded tool call, with its real start and
+ *                         end, its arguments and (on success) its result as
+ *                         objects, and `error.type` plus ERROR on a reported
+ *                         failure.
+ *   invoke_agent {agent}  one per TURN, carrying the whole turn: the system
+ *                         instructions, the history the agent was given and
+ *                         the answer it returned. It replaced two half-turn
+ *                         `chat` spans, which described neither half as what
+ *                         it was -- no model call happened on either.
+ *
+ * NOTHING IS CUT. There is no size limit on any attribute: a cut at a fixed
+ * character count turned a JSON argument into invalid JSON, and on this side
+ * of the SDK sliced by UTF-16 code units, so it could also split a surrogate
+ * pair. A customer who needs a bound sets one in their own exporter or
+ * collector, where it applies to every instrumentation alike.
+ *
+ * **The turn span is OPT-IN; tool spans are not.** A tool name and an outcome
+ * are telemetry; a prompt and a completion are the user's own words, so only
+ * text the customer handed over reaches a turn span.
  *
  * **We never install a TracerProvider.** Registering one is once-only: the
  * second caller gets a log line, not an exception. So calling it would either
@@ -31,25 +49,12 @@
  * API's no-op tracer swallows everything, which is the correct outcome for a
  * library.
  *
- * Attributes follow ``gen_ai.*`` where the convention has a name for
- * something, and ``percepteye.*`` where it does not — which notably includes
- * the tri-state outcome. The convention has no way to say "this tool call's
- * result was never observed", so the projection is documented as lossy rather
- * than bent into a standard attribute that means something else to every other
- * consumer.
+ * `percepteye.*` carries what the convention has no word for -- notably the
+ * tri-state outcome. The convention cannot say "this tool call's result was
+ * never observed", so the projection is documented as lossy rather than bent
+ * into a standard attribute that means something else to every consumer.
  */
 import { createRequire } from "node:module";
-
-/** Attribute payload cap. Attributes are telemetry, not payloads. */
-export const MAX_ATTRIBUTE_CHARS = 2000;
-
-/**
- * Turn content is bounded before it leaves. A pasted stack trace or a long
- * answer must not make one span dominate the customer's export, and an
- * exporter that silently drops an oversized span costs us the whole turn
- * rather than its tail.
- */
-export const MAX_TURN_CHARS = 20000;
 
 //: Resolved once. ``null`` means the OTel API is not installed, which is the
 //: normal case: it is an optional peer dependency and this package ships with
@@ -90,16 +95,87 @@ export function tracingAvailable() {
   return tracer() !== null;
 }
 
-/** Stringify and truncate. A large tool argument must not bloat every span. */
-function short(value, limit = MAX_ATTRIBUTE_CHARS) {
-  let out;
+/**
+ * A content attribute's value: the JSON text of `value`, or null when it has
+ * none (undefined, a function, a BigInt, a cycle).
+ *
+ * `JSON.stringify` with no spacing. Python writes the same bytes with
+ * `separators=(",", ":")` and `ensure_ascii=False`; the golden fixture is what
+ * holds the two to it.
+ */
+function genaiJson(value) {
   try {
-    out = typeof value === "string" ? value : JSON.stringify(value);
+    const out = JSON.stringify(value);
+    return typeof out === "string" ? out : null;
   } catch {
-    out = String(value);
+    return null;
   }
-  if (out === undefined) out = String(value);
-  return out.length <= limit ? out : out.slice(0, limit) + "...[truncated]";
+}
+
+/** Integer literals a JavaScript number cannot hold exactly. */
+const LOSSY_INTEGER = /^-?\d+$/;
+
+/**
+ * `value` as a JSON object, or null.
+ *
+ * The convention expects tool arguments and results to be OBJECTS, and says a
+ * serialized string SHOULD be deserialized on a best-effort basis. So a string
+ * is parsed -- but a string holding an integer beyond +/-(2^53 - 1) is left as
+ * it is: parsing it here would silently change the number, and Python, which
+ * could hold it, refuses the same input so the two SDKs agree.
+ */
+function asObject(value) {
+  let v = value;
+  if (typeof v === "string") {
+    let lossy = false;
+    try {
+      v = JSON.parse(v, (_key, parsed, context) => {
+        if (typeof parsed === "number" && !Number.isSafeInteger(parsed)
+            && typeof context?.source === "string"
+            && LOSSY_INTEGER.test(context.source)) {
+          lossy = true;
+        }
+        return parsed;
+      });
+    } catch {
+      return null;
+    }
+    if (lossy) return null;
+  }
+  return v !== null && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+
+/**
+ * Messages in the convention's shape, ready to serialize.
+ *
+ * Callers hand over `{role, parts, ...}` objects already -- the host adapter
+ * (`host.js`) builds them from the host's own transcript. The one thing done
+ * here is the convention's best-effort rule for a `tool_call` part whose
+ * `arguments` arrived as a JSON string (the OpenAI wire form): it becomes the
+ * object it encodes. Everything else is carried exactly as given, `null`
+ * included -- a tool response's `null` is data.
+ */
+function genaiMessages(messages) {
+  if (!Array.isArray(messages)) return null;
+  return messages.map((m) => {
+    if (!m || typeof m !== "object" || !Array.isArray(m.parts)) return m;
+    return {
+      ...m,
+      parts: m.parts.map((p) => {
+        if (p && typeof p === "object" && p.type === "tool_call"
+            && typeof p.arguments === "string") {
+          const obj = asObject(p.arguments);
+          if (obj !== null) return { ...p, arguments: obj };
+        }
+        return p;
+      }),
+    };
+  });
+}
+
+/** One user or assistant text message, the shape a bare string becomes. */
+function textMessage(role, text) {
+  return { role, parts: [{ type: "text", content: String(text) }] };
 }
 
 function markError(span, message) {
@@ -107,9 +183,9 @@ function markError(span, message) {
     // SpanStatusCode.ERROR === 2. Read from the API when present so a future
     // renumbering cannot silently invert the verdict.
     const code = _api?.SpanStatusCode?.ERROR ?? 2;
-    span.setStatus({ code, message: String(message).slice(0, 500) });
+    span.setStatus({ code, message: String(message) });
   } catch {
-    // Older/partial API surfaces: the attribute still carries the verdict.
+    // Older/partial API surfaces: `error.type` still carries the verdict.
   }
 }
 
@@ -118,8 +194,60 @@ function setIf(span, key, value) {
   span.setAttribute(key, value);
 }
 
+/** The value, or null when it is not a usable number. */
+function finite(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 /**
- * Project one recorded tool call into the customer's traces.
+ * `gen_ai.conversation.id` AND `percepteye.conversation.id`, the same value.
+ *
+ * The first is the convention's name and what any consumer reads; the second
+ * is this SDK's earlier spelling, kept for one release so a consumer reading
+ * it keeps working while it moves.
+ */
+function setConversation(span, conversationId) {
+  if (!conversationId) return;
+  span.setAttribute("gen_ai.conversation.id", String(conversationId));
+  span.setAttribute("percepteye.conversation.id", String(conversationId));
+}
+
+/**
+ * The attributes both span kinds carry for correlation.
+ *
+ * `rolloutId` is stamped only on work that IS a rollout; a production turn
+ * carries `percepteye.turn.id` and no rollout id, so a consumer counting "how
+ * much of my traffic was training" is not told every served turn was.
+ */
+function setCorrelation(span, { rolloutId, turnId, conversationId, taskId,
+                                 executionSha256 }) {
+  setConversation(span, conversationId);
+  setIf(span, "percepteye.rollout.id", rolloutId && String(rolloutId));
+  setIf(span, "percepteye.turn.id", turnId && String(turnId));
+  // Caller-authored correlation evidence only. Asserts no success, no policy
+  // identity and no training eligibility.
+  setIf(span, "percepteye.task.id", taskId && String(taskId));
+  setIf(span, "percepteye.agent.execution_sha256",
+        executionSha256 && String(executionSha256));
+}
+
+/**
+ * `error.type` for a reported failure: the error's class when one was
+ * classified, else the status code, else the convention's `_OTHER`.
+ */
+function errorType(errorClass, statusCode) {
+  if (typeof errorClass === "string" && errorClass.trim()) return errorClass;
+  if (statusCode !== null && statusCode !== undefined) return String(statusCode);
+  return "_OTHER";
+}
+
+/**
+ * Project one recorded tool call into the customer's traces as an
+ * `execute_tool {name}` span.
+ *
+ * Its END is `endTimeMs` (default: now -- it is recorded when the call
+ * returns) and its START is `latencyMs` before that, so the span covers the
+ * call rather than the instant it was written down.
  *
  * A no-op when the API is absent, and it NEVER throws: this runs beside the
  * trajectory write on the customer's own execution path, and a telemetry
@@ -132,7 +260,9 @@ export function recordToolCallSpan(name, args, opts = {}) {
     outcome,
     statusCode = null,
     error = null,
+    errorClass = null,
     latencyMs = null,
+    endTimeMs = null,
     agentName = null,
     rolloutId = null,
     turnId = null,
@@ -140,83 +270,99 @@ export function recordToolCallSpan(name, args, opts = {}) {
     taskId = null,
     toolCallId = null,
     executionSha256 = null,
+    result = undefined,
   } = opts;
   try {
-    t.startActiveSpan(`execute_tool ${name}`, (span) => {
-      try {
-        if (typeof span.isRecording === "function" && !span.isRecording()) return;
-        // gen_ai.* where the convention names it.
-        span.setAttribute("gen_ai.operation.name", "execute_tool");
-        span.setAttribute("gen_ai.tool.name", String(name));
-        // The convention DOES name this one: the model-assigned call id, the
-        // same value that reappears on the role="tool" message of the next
-        // request. It is what lets a consumer join a tool span to the
-        // completion that requested it.
-        setIf(span, "gen_ai.tool.call.id", toolCallId && String(toolCallId));
-        if (args !== undefined && args !== null) {
-          span.setAttribute("gen_ai.tool.call.arguments", short(args));
-        }
-
-        // percepteye.* where it does not.
-        span.setAttribute("percepteye.tool.outcome", String(outcome));
-        if (statusCode !== null && statusCode !== undefined) {
-          span.setAttribute("percepteye.tool.status_code", Number(statusCode));
-        }
-        setIf(span, "percepteye.rollout.id", rolloutId && String(rolloutId));
-        // A production turn is NOT a rollout. Stamping its id under
-        // `percepteye.rollout.id` made a customer's own telemetry unable to
-        // answer "how much of my traffic was training" — every served turn
-        // looked like contributed work.
-        setIf(span, "percepteye.turn.id", turnId && String(turnId));
-        // ON THE TOOL SPAN TOO, not only on the turn span: a consumer grouping
-        // an export into conversations must put a call in the same bucket as
-        // the turn that made it, and an export sliced by time or sampled by
-        // the collector may not carry that turn's chat span at all.
-        setIf(span, "percepteye.conversation.id",
-              conversationId && String(conversationId));
-        // Caller-authored correlation evidence only. Asserts no success, no
-        // policy identity and no training eligibility.
-        setIf(span, "percepteye.task.id", taskId && String(taskId));
-        setIf(span, "percepteye.agent.execution_sha256",
-              executionSha256 && String(executionSha256));
-        setIf(span, "gen_ai.agent.name", agentName && String(agentName));
-        if (latencyMs !== null && latencyMs !== undefined) {
-          span.setAttribute("percepteye.tool.latency_ms", Number(latencyMs));
-        }
-
-        // Only a REPORTED failure sets the span to error. An `unknown` outcome
-        // leaves the status unset: marking it OK would assert a success nobody
-        // observed, and ERROR a failure nobody observed.
-        if (outcome === "failed") markError(span, error || "tool call failed");
-      } finally {
-        try { span.end(); } catch { /* nothing left to do */ }
-      }
+    const end = finite(endTimeMs) ?? Date.now();
+    const latency = finite(latencyMs);
+    const start = latency !== null && latency >= 0 ? end - latency : end;
+    // The attributes a sampler may decide on go in at CREATION, as the
+    // convention asks: operation, tool name, tool type, agent.
+    const attributes = {
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.tool.name": String(name),
+      // A client-side function the agent's own process ran.
+      "gen_ai.tool.type": "function",
+    };
+    if (agentName) attributes["gen_ai.agent.name"] = String(agentName);
+    const span = t.startSpan(`execute_tool ${name}`, {
+      kind: _api?.SpanKind?.INTERNAL ?? 0,
+      attributes,
+      startTime: start,
     });
+    try {
+      if (typeof span.isRecording === "function" && !span.isRecording()) return;
+      // The model-assigned call id: the same value that reappears on the
+      // tool response the model is sent next, so it joins the two.
+      setIf(span, "gen_ai.tool.call.id", toolCallId && String(toolCallId));
+      const argsObject = asObject(args);
+      if (argsObject !== null) {
+        setIf(span, "gen_ai.tool.call.arguments", genaiJson(argsObject));
+      }
+      // The result only when execution succeeded, and only as the object the
+      // convention's schema requires; a text result reaches the next model
+      // call as a tool response, not here.
+      if (outcome !== "failed") {
+        const resultObject = asObject(result);
+        if (resultObject !== null) {
+          setIf(span, "gen_ai.tool.call.result", genaiJson(resultObject));
+        }
+      }
+
+      span.setAttribute("percepteye.tool.outcome", String(outcome));
+      if (statusCode !== null && statusCode !== undefined) {
+        span.setAttribute("percepteye.tool.status_code", Number(statusCode));
+      }
+      if (latency !== null) span.setAttribute("percepteye.tool.latency_ms", latency);
+      setCorrelation(span, {
+        rolloutId, turnId, conversationId, taskId, executionSha256,
+      });
+
+      // Only a REPORTED failure sets the span to error. An `unknown` outcome
+      // leaves the status unset: marking it OK would assert a success nobody
+      // observed, and ERROR a failure nobody observed.
+      if (outcome === "failed") {
+        span.setAttribute("error.type", errorType(errorClass, statusCode));
+        markError(span, error || "tool call failed");
+      }
+    } finally {
+      try { span.end(end); } catch { /* nothing left to do */ }
+    }
   } catch {
     /* telemetry must never cost the caller anything */
   }
 }
 
 /**
- * Emit one span carrying what the agent was ASKED and what it ANSWERED.
+ * Emit one `invoke_agent {agent}` span carrying one whole TURN.
  *
  * THE CAPTURE SURFACE. SFT wants the messages; OPSD wants them plus a
  * privileged reference; RAFT wants them plus a reward and a proven success;
  * DPO wants two of them to pair. None reads a sampled logprob, which is why a
  * span suffices here.
  *
- * It is also what makes a NEXT-STATE signal possible from a customer's own
- * traces: the ingest reads these chat spans into an ordered conversation, and
- * the turn after each answer is the observed consequence the per-step reward
- * model votes on.
+ * Content, all optional, in the convention's shapes:
  *
- * ``rolloutId`` is stamped when the turn IS a rollout — the marker the ingest
- * side reads to keep our own training traffic out of the customer's
- * observed-traffic accounting. A production turn carries ``percepteye.turn.id``
- * instead and no rollout id, so it is counted as the customer's own.
+ *   systemInstructions  `[{type:"text", content}]`
+ *   inputMessages       the history the agent was given, in order
+ *   outputMessages      what it returned, one message per choice; a
+ *                       `finish_reason` on each is also collected into
+ *                       `gen_ai.response.finish_reasons`
+ *   inputText/outputText  a bare string for either side, when that is all the
+ *                       caller has; messages win when both are given
+ *
+ * `error` marks a turn the host reported as failed: `error.type` `_OTHER` and
+ * ERROR status, since a failed invocation left UNSET claims it ran cleanly.
+ *
+ * With no content at all nothing is emitted: an empty turn span would assert
+ * a turn happened and carried nothing, which is a different claim from not
+ * having been given it.
  */
 export function recordTurnSpan(opts = {}) {
   const {
+    systemInstructions = null,
+    inputMessages = null,
+    outputMessages = null,
     inputText = null,
     outputText = null,
     turnId = null,
@@ -226,42 +372,53 @@ export function recordTurnSpan(opts = {}) {
     model = null,
     rolloutId = null,
     executionSha256 = null,
+    startTimeMs = null,
+    endTimeMs = null,
+    error = null,
   } = opts;
-  // Nothing to say. An empty turn span would assert a turn happened and
-  // carried no content, which is a different claim from not being given it.
-  if (!inputText && !outputText) return;
+  const input = genaiMessages(inputMessages)
+    ?? (inputText ? [textMessage("user", inputText)] : null);
+  const output = genaiMessages(outputMessages)
+    ?? (outputText ? [textMessage("assistant", outputText)] : null);
+  const system = Array.isArray(systemInstructions) && systemInstructions.length
+    ? systemInstructions : null;
+  if (!input?.length && !output?.length && !system) return;
   const t = tracer();
   if (t === null) return;
   try {
-    t.startActiveSpan("chat", (span) => {
-      try {
-        if (typeof span.isRecording === "function" && !span.isRecording()) return;
-        span.setAttribute("gen_ai.operation.name", "chat");
-        setIf(span, "gen_ai.request.model", model && String(model));
-        setIf(span, "gen_ai.agent.name", agentName && String(agentName));
-        // The convention's names for turn content. Carried as ATTRIBUTES
-        // rather than events because the ingest side normalises attributes
-        // into `raw_attributes` verbatim, and an event body does not survive
-        // that path.
-        if (inputText) {
-          span.setAttribute("gen_ai.input.messages",
-                            String(inputText).slice(0, MAX_TURN_CHARS));
+    const end = finite(endTimeMs) ?? Date.now();
+    const begun = finite(startTimeMs);
+    const start = begun !== null && begun <= end ? begun : end;
+    const attributes = { "gen_ai.operation.name": "invoke_agent" };
+    if (agentName) attributes["gen_ai.agent.name"] = String(agentName);
+    const span = t.startSpan(
+      agentName ? `invoke_agent ${agentName}` : "invoke_agent",
+      { kind: _api?.SpanKind?.INTERNAL ?? 0, attributes, startTime: start },
+    );
+    try {
+      if (typeof span.isRecording === "function" && !span.isRecording()) return;
+      setIf(span, "gen_ai.request.model", model && String(model));
+      if (system) setIf(span, "gen_ai.system_instructions", genaiJson(system));
+      if (input?.length) setIf(span, "gen_ai.input.messages", genaiJson(input));
+      if (output?.length) {
+        setIf(span, "gen_ai.output.messages", genaiJson(output));
+        // One reason per returned message, and only when every message has
+        // one: a partial list would misalign reasons with messages.
+        const reasons = output.map((m) => m?.finish_reason);
+        if (reasons.every((r) => typeof r === "string" && r)) {
+          span.setAttribute("gen_ai.response.finish_reasons", reasons);
         }
-        if (outputText) {
-          span.setAttribute("gen_ai.output.messages",
-                            String(outputText).slice(0, MAX_TURN_CHARS));
-        }
-        setIf(span, "percepteye.rollout.id", rolloutId && String(rolloutId));
-        setIf(span, "percepteye.turn.id", turnId && String(turnId));
-        setIf(span, "percepteye.conversation.id",
-              conversationId && String(conversationId));
-        setIf(span, "percepteye.task.id", taskId && String(taskId));
-        setIf(span, "percepteye.agent.execution_sha256",
-              executionSha256 && String(executionSha256));
-      } finally {
-        try { span.end(); } catch { /* nothing left to do */ }
       }
-    });
+      setCorrelation(span, {
+        rolloutId, turnId, conversationId, taskId, executionSha256,
+      });
+      if (error) {
+        span.setAttribute("error.type", "_OTHER");
+        markError(span, error);
+      }
+    } finally {
+      try { span.end(end); } catch { /* nothing left to do */ }
+    }
   } catch {
     /* telemetry must never cost the caller anything */
   }

@@ -12,7 +12,7 @@ import { describe, it } from "node:test";
 import { AttachTransport } from "../src/transport.js";
 import { TOOL_CALLS_FILENAME } from "../src/trajectory.js";
 import {
-  MAX_TEXT_CHARS, readTurnText, recordTurnText, turnWire,
+  readTurnText, recordTurnText, turnWire,
 } from "../src/turns.js";
 
 /** Records every request the transport makes, and replays scripted bodies. */
@@ -405,7 +405,7 @@ describe("the captured turn's wire", () => {
   });
 });
 
-describe("turn text truncates where PYTHON truncates", () => {
+describe("turn text is stored whole, as Python stores it", () => {
   const roots = [];
   const cleanup = () => {
     for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
@@ -416,30 +416,16 @@ describe("turn text truncates where PYTHON truncates", () => {
     return join(r, name);
   };
 
-  it("counts CODE POINTS, so an emoji message under the cap is kept whole", (t) => {
+  it("stores an emoji message whole, with no pair split", (t) => {
     t.after(cleanup);
-    // Python's `record_turn_text` does `text.strip()[:20_000]` -- code points.
-    // `slice` counts UTF-16 units, so this message was cut in half and the two
-    // corpora stopped being comparable, which is the only thing the shared
-    // constant is for.
+    // There is no cap any more, so there is no cut to land between the halves
+    // of a surrogate pair -- the defect the old code-point counting existed
+    // to prevent. What goes in is what goes on the wire.
     const dir = dirFor("emoji");
-    const text = "\u{1F4E6}".repeat(15_000);
+    const text = "a" + "\u{1F4E6}".repeat(25_000);
     assert.equal(recordTurnText(dir, "task", text), true);
-    assert.equal([...readTurnText(dir).task].length, 15_000);
-  });
-
-  it("never emits a LONE SURROGATE when it does truncate", (t) => {
-    t.after(cleanup);
-    // The cut landing between the halves of a pair put an unpaired \ud83d on
-    // the wire; the intake cannot encode that to UTF-8, so the chunk was never
-    // acknowledged and `flush` re-sent it on every flush forever.
-    // One leading ASCII char, so the 20,000th CODE UNIT falls on the high half
-    // of a pair; over the cap in code points too, so the cap really fires.
-    const dir = dirFor("split-pair");
-    assert.equal(
-      recordTurnText(dir, "task", "a" + "\u{1F4E6}".repeat(25_000)), true);
     const stored = readTurnText(dir).task;
-    assert.equal([...stored].length, MAX_TEXT_CHARS);
+    assert.equal(stored, text);
     assert.equal(Buffer.from(stored, "utf8").toString("utf8"), stored,
       "the stored text does not survive a UTF-8 round trip, so it holds an " +
       "unpaired surrogate and the intake will refuse the whole chunk");

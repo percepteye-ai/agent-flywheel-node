@@ -65,14 +65,18 @@ import { join } from "node:path";
 
 import { applyDeclaration } from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
-import { conversationAccessGranted, lastAssistantText } from "./host.js";
+import {
+  conversationAccessGranted, conversationIdOf, genaiTurn, lastAssistantText,
+  taskIdOf,
+} from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { percepteyeHome } from "./session.js";
 import { AttachTransport } from "./transport.js";
-import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
+import { recordTurnSpan } from "./tracing.js";
+import { CONTRACT_VERSION } from "./wire.js";
 import {
-  listTurnDirs, readConversationId, readTaskId, recordConversationId,
-  recordTaskId, recordTurnText,
+  listTurnDirs, readConversationId, readExecutionFingerprint, readTaskId,
+  recordConversationId, recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
   turnDir, turnIndexOf, turnWire,
 } from "./turns.js";
@@ -166,11 +170,20 @@ export function captureVerdict(registration) {
 }
 
 /**
- * The turn store: three hooks in, turn directories out.
+ * The turn store: three hooks in, turn directories and turn spans out.
  *
  * Exact host ids need no in-memory state. An invalid host id gets a fresh
  * storage-safe id instead of being rewritten; that one exceptional mapping is
  * bounded and exists only to keep the same run's observer hooks joined.
+ *
+ * ONE `invoke_agent` SPAN PER TURN, emitted when the turn is whole. With the
+ * answer hook delivered, that is `agent_end`, whose transcript carries the
+ * entire turn -- the user's message, every tool call and response, and the
+ * answer -- plus the system prompt `llm_input` showed for the same run. When
+ * the host will never deliver `agent_end` (see `registerTurnCapture`), the
+ * user's message is the whole of what this plugin will ever see of the turn,
+ * so the span is emitted from `message_received` carrying that half alone.
+ * Never both for one turn: two half-turn spans described neither half.
  */
 export function createTurnCapture({ root, logger = null }) {
   let warned = false;
@@ -196,12 +209,11 @@ export function createTurnCapture({ root, logger = null }) {
     }
     return generated;
   };
-  const taskIdFrom = (event, ctx) => productionIdentifier(
-    event?.taskId ?? event?.task_id ?? ctx?.taskId ?? ctx?.task_id,
-  );
-  const conversationIdFrom = (event, ctx) => productionIdentifier(
-    event?.sessionKey ?? ctx?.sessionKey,
-  );
+  // The system prompt `llm_input` showed for a run, held only until that
+  // run's `agent_end` takes it. Bounded like the id map above: a run whose
+  // `agent_end` never arrives must not pin its prompt for the life of the
+  // gateway.
+  const systemPrompts = new Map();
   const warnOnce = (err) => {
     if (warned) return;
     warned = true;
@@ -211,14 +223,20 @@ export function createTurnCapture({ root, logger = null }) {
     );
   };
 
-  /** The end user's message. */
-  function onMessageReceived(event, ctx = {}) {
+  /**
+   * The end user's message.
+   *
+   * `answersExpected: false` means the host drops `agent_end` for this
+   * plugin, so this is the only half of the turn that will ever arrive, and
+   * the turn span is emitted here with it.
+   */
+  function onMessageReceived(event, ctx = {}, { answersExpected = true } = {}) {
     const runId = event?.runId ?? ctx?.runId;
     const text = event?.content;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
-    const conversationId = conversationIdFrom(event, ctx);
-    const taskId = taskIdFrom(event, ctx);
+    const conversationId = conversationIdOf(event, ctx);
+    const taskId = taskIdOf(event, ctx);
     const dir = turnDir(root, turnId);
     try {
       const wroteConversation = conversationId
@@ -230,6 +248,15 @@ export function createTurnCapture({ root, logger = null }) {
         conversation_id: conversationId ?? "",
         task_id: effectiveTaskId ?? "",
       });
+      if (wroteText && !answersExpected) {
+        recordTurnSpan({
+          inputText: text.trim(),
+          turnId,
+          conversationId,
+          taskId: effectiveTaskId,
+          executionSha256: readExecutionFingerprint(dir)?.execution_sha256,
+        });
+      }
       return wroteConversation || wroteTaskId || wroteText;
     } catch (err) {
       warnOnce(err);
@@ -237,17 +264,56 @@ export function createTurnCapture({ root, logger = null }) {
     }
   }
 
-  /** The agent's answer. */
+  /** What `llm_input` showed the model for a run: its system prompt. */
+  function onModelInput(event, ctx = {}) {
+    const turnId = turnIdFor(event?.runId ?? ctx?.runId);
+    if (turnId === null || typeof event?.systemPrompt !== "string"
+        || !event.systemPrompt) return false;
+    systemPrompts.delete(turnId);
+    systemPrompts.set(turnId, event.systemPrompt);
+    while (systemPrompts.size > 4096) {
+      systemPrompts.delete(systemPrompts.keys().next().value);
+    }
+    return true;
+  }
+
+  /** The agent's answer, and the span carrying the whole turn. */
   function onAgentEnd(event, ctx = {}) {
     const runId = event?.runId ?? ctx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
+    const endedAt = Date.now();
     const dir = turnDir(root, turnId);
-    const conversationId = conversationIdFrom(event, ctx);
-    const taskId = taskIdFrom(event, ctx);
+    const conversationId = conversationIdOf(event, ctx);
+    const taskId = taskIdOf(event, ctx);
     const wroteConversation = conversationId
       ? recordConversationId(dir, conversationId) : false;
     const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
+    // Emitted whether or not the run produced text: a run that failed after
+    // three tool calls is still a turn the agent took.
+    const systemPrompt = systemPrompts.get(turnId) ?? null;
+    systemPrompts.delete(turnId);
+    const { input, output } = genaiTurn(event?.messages);
+    const durationMs = typeof event?.durationMs === "number"
+      && Number.isFinite(event.durationMs) && event.durationMs >= 0
+      ? event.durationMs : null;
+    recordTurnSpan({
+      systemInstructions: systemPrompt
+        ? [{ type: "text", content: systemPrompt }] : null,
+      inputMessages: input,
+      outputMessages: output,
+      turnId,
+      conversationId: readConversationId(dir),
+      taskId: readTaskId(dir),
+      agentName: typeof ctx?.agentId === "string" ? ctx.agentId : null,
+      executionSha256: readExecutionFingerprint(dir)?.execution_sha256,
+      startTimeMs: durationMs === null ? null : endedAt - durationMs,
+      endTimeMs: endedAt,
+      error: event?.success === false
+        ? (typeof event?.error === "string" && event.error
+          ? event.error : "the agent run failed")
+        : null,
+    });
     const text = lastAssistantText(event?.messages);
     if (!text) return wroteConversation || wroteTaskId;
     try {
@@ -276,9 +342,9 @@ export function createTurnCapture({ root, logger = null }) {
     const turnId = turnIdFor(runId);
     if (turnId === null) return null;
     const dir = turnDir(root, turnId);
-    const taskId = taskIdFrom(null, callCtx);
+    const taskId = taskIdOf(null, callCtx);
     if (taskId) recordTaskId(dir, taskId);
-    const conversationId = conversationIdFrom(null, callCtx);
+    const conversationId = conversationIdOf(null, callCtx);
     if (conversationId) recordConversationId(dir, conversationId);
     return dir;
   }
@@ -294,7 +360,10 @@ export function createTurnCapture({ root, logger = null }) {
     return recordExecutionFingerprint(dir, observation.fingerprint);
   }
 
-  return { onMessageReceived, onAgentEnd, onExecutionIdentity, resolveToolDir };
+  return {
+    onMessageReceived, onModelInput, onAgentEnd, onExecutionIdentity,
+    resolveToolDir,
+  };
 }
 
 /**
@@ -479,9 +548,10 @@ export function registerTurnCapture(api, {
   const root = captureRoot(env);
 
   // ASKED ONCE, HERE, and handed to everything that needs it. Whether this
-  // host will deliver `agent_end` decides two things at once -- whether the
-  // operator is told answers are missing, and whether the cadence may ever
-  // send a turn that has none -- and those must not be able to disagree.
+  // host will deliver `agent_end` decides three things at once -- whether the
+  // operator is told answers are missing, whether the cadence may ever send a
+  // turn that has none, and which hook emits the turn's span -- and those
+  // must not be able to disagree.
   const answersExpected = conversationAccessGranted(api, pluginId);
 
   let uploader = null;
@@ -502,7 +572,7 @@ export function registerTurnCapture(api, {
   // control-plane call is attempted, because capture runs without a key.
   api.on(MESSAGE_RECEIVED, (event, ctx) => {
     try {
-      turns.onMessageReceived(event, ctx ?? {});
+      turns.onMessageReceived(event, ctx ?? {}, { answersExpected });
     } catch { /* one lost observation, never a failed turn */ }
     // NOT AWAITED. This hook sits on the path of a turn whose user is waiting;
     // an upload must never be between them and their answer.

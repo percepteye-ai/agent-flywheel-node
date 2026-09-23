@@ -29,6 +29,12 @@ describe("classifying a dsh tool result", () => {
     assert.equal(v.error_class, "EPERM");
   });
 
+  it("keeps the failure message whole, so no cut can split a surrogate pair", () => {
+    const message = "a" + "\u{1F4E6}".repeat(3_000);
+    const v = classifyDsh("bash", { isError: true, error: { message } });
+    assert.equal(v.error, message);
+  });
+
   it("scores a non-zero exit as failed although isError is false", () => {
     // The case this exists for: the bash tool renders `[exit code: 3]` into
     // the model-facing TEXT and still settles as a non-error result. The tool
