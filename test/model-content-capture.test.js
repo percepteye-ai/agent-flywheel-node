@@ -24,6 +24,7 @@ import {
   MODEL_CONTENT_REFUSED, captureVerdict, createTurnCapture, createTurnUploader,
   registerTurnCapture,
 } from "../src/capture.js";
+import { TransportError } from "../src/errors.js";
 import { OBSERVATION_FILENAME } from "../src/genai-otlp.js";
 import { PLUGIN_ID, register } from "../src/index.js";
 import { turnWire } from "../src/turns.js";
@@ -272,6 +273,78 @@ describe("consent: model content is RECORDED only when granted", () => {
     turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2" });
     assert.ok(!existsSync(join(root, "r2", OBSERVATION_FILENAME)),
       "model content was recorded after the intake refused it");
+  });
+
+  it("stops recording model content when the intake refuses the turns", async () => {
+    // A 403 on /turns is an operator's decision, not a blip. Read as a blip it
+    // left both tiers on, and every later run's system prompt, history and
+    // tool results were written to disk while consent was withdrawn -- ready
+    // to be uploaded if consent came back, which makes the grant retroactive.
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    const tr = transport();
+    let verdict = { turns: false, reason: "disabled by an operator" };
+    tr.captureCurrent = async () => ({ capture: verdict });
+    let posts = 0;
+    tr.reportTurns = async () => {
+      posts += 1;
+      throw new TransportError(
+        "POST /api/flywheel/v1/agents/a/turns -> HTTP 403: production " +
+        "capture is not enabled for this agent.", { statusCode: 403 });
+    };
+    const u = createTurnUploader({ transport: tr, agentId: "a", root });
+    u.setVerdict(captureVerdict({ capture: { turns: true, model_content: true } }));
+    turns.gateModelContent(() => u.mayCaptureModelContent);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    turns.onLlmInput(llmInput("r"), ctx);
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, ctx);
+    assert.ok(existsSync(join(root, "r", OBSERVATION_FILENAME)));
+
+    const res = await u.flush();
+    assert.equal(res.notPermitted, true);
+    assert.equal(u.mayUpload, false, "a 403 was read as a transport blip");
+    assert.equal(u.refusal, "production capture is not enabled for this agent.");
+    assert.equal(u.mayCaptureModelContent, false,
+      "model content is still being recorded after the intake refused the turns");
+    assert.equal(u.modelContentReason, u.refusal);
+    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2" }), false);
+    turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2" });
+    assert.ok(!existsSync(join(root, "r2", OBSERVATION_FILENAME)),
+      "model content was recorded while consent was withdrawn");
+    await u.flush();
+    assert.equal(posts, 1, "the refused batch was POSTed again");
+
+    // COMPLETES: an operator re-enables both tiers, and the next flush picks
+    // the grant up, uploads the backlog and records model content again.
+    verdict = { turns: true, model_content: true };
+    tr.reportTurns = async (_a, ts) => {
+      tr.batches.push(ts);
+      return { turns: ts.map((t) => ({ turn_id: t.turn_id, accepted: true })) };
+    };
+    assert.equal((await u.flush()).sent, 2);
+    assert.equal(u.mayUpload, true);
+    assert.equal(u.mayCaptureModelContent, true);
+    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3" }), true);
+  });
+
+  it("keeps both tiers through a transport blip", async () => {
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    turns.gateModelContent(() => true);
+    turns.onLlmInput(llmInput("r"), { runId: "r", sessionKey: CONVERSATION });
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, { runId: "r" });
+    const tr = transport();
+    let posts = 0;
+    tr.reportTurns = async () => {
+      posts += 1;
+      throw new TransportError("POST /x -> HTTP 503: upstream", { statusCode: 503 });
+    };
+    const u = createTurnUploader({ transport: tr, agentId: "a", root });
+    u.setVerdict(captureVerdict({ capture: { turns: true, model_content: true } }));
+    await u.flush();
+    assert.equal(posts, 1);
+    assert.equal(u.mayUpload, true, "a 5xx was read as a revocation");
+    assert.equal(u.mayCaptureModelContent, true);
   });
 
   it("notices a model-content grant made after startup", async () => {

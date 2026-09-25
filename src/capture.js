@@ -212,6 +212,34 @@ export const MODEL_CONTENT_NOT_ENABLED =
   "prompt, the conversation history and the tool results its model calls " +
   "saw are neither recorded nor uploaded.";
 
+/** How `http.js` spells a terminal 403 in the error it throws. */
+const REFUSED_MARKER = "-> HTTP 403";
+
+/**
+ * The intake's sentence when it REFUSED a batch of turns, else `null`.
+ *
+ * THE PYTHON SDK'S `_capture_refusal`. A 403 is a DECISION -- an operator
+ * turned capture off, or the key lost the `turn.report` scope -- and will not
+ * become a 2xx by being sent again. Read as a blip, it left both consent tiers
+ * on: every flush re-POSTed the same end users' messages, and the model-content
+ * gate kept writing each run's system prompt, history and tool results to disk
+ * while consent was withdrawn -- to be uploaded if it were ever granted again,
+ * which would make that grant retroactive.
+ *
+ * Read off the STATUS `http.js` puts on its `TransportError`, not the English.
+ * Anything else -- a timeout, a 5xx, a 429 that outlasted the retry ladder --
+ * is a blip and stays retryable: mistaking a blip for a refusal would stop a
+ * consenting customer's uploads.
+ */
+export function captureRefusal(err) {
+  if (err?.statusCode !== 403) return null;
+  const text = String(err?.message ?? "");
+  const at = text.indexOf(REFUSED_MARKER);
+  const detail = at < 0 ? ""
+    : text.slice(at + REFUSED_MARKER.length).replace(/^[: ]+/, "").trim();
+  return detail || "the control plane refused this agent's turns (HTTP 403).";
+}
+
 /**
  * The turn store: three hooks in, turn directories out.
  *
@@ -500,8 +528,8 @@ export function createTurnUploader({
    * turns -- long after this process started, and nothing else would tell it:
    * until this existed a Node install learned a grant only by restarting.
    * Turn upload is only ever turned ON here (a blip that answers nothing must
-   * not revoke it; the intake's 403 does that); model content follows any
-   * verdict the control plane actually GAVE, both ways.
+   * not revoke it; the intake's 403 does that, in `refuseUpload`); model
+   * content follows any verdict the control plane actually GAVE, both ways.
    */
   async function recheck() {
     if (typeof transport?.captureCurrent !== "function") return;
@@ -521,6 +549,25 @@ export function createTurnUploader({
       mayCaptureModelContent = v.mayCaptureModelContent && mayUpload;
       modelContentReason = mayCaptureModelContent ? null : v.modelContentReason;
     }
+  }
+
+  /**
+   * The intake terminally refused these turns. Stop sending, say why.
+   *
+   * THE PYTHON SDK'S `_refuse_upload`, and the one place `mayUpload` turns
+   * false after it was true. A trace rides on a turn, so a refused turn
+   * refuses its model content too: from here on no run records what its model
+   * saw, until `recheck` reads a verdict that grants it again.
+   */
+  function refuseUpload(reason) {
+    mayUpload = false;
+    refusal = reason;
+    mayCaptureModelContent = false;
+    modelContentReason = reason;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane refused this agent's captured ` +
+      `turns and uploading has stopped: ${reason} The turns stay on disk, ` +
+      `and uploading resumes on its own if capture is enabled again.`);
   }
 
   /**
@@ -569,6 +616,13 @@ export function createTurnUploader({
         try {
           reply = await transport.reportTurns(agentId, chunk);
         } catch (err) {
+          const refused = captureRefusal(err);
+          if (refused !== null) {
+            // NOT A TRANSPORT FAILURE. Stop, in the intake's own words, and
+            // leave the turns on disk; `recheck` picks consent back up.
+            refuseUpload(refused);
+            return { sent, notPermitted: true };
+          }
           // Whole chunk unacknowledged: leave every marker unwritten so the
           // next flush retries it.
           logger?.warn?.(
