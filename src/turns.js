@@ -18,6 +18,10 @@
  *   task_id.conflict   monotonic abstention when two task bindings disagree
  *   agent_fingerprint.json  an exact, SDK-reconciled execution fingerprint
  *   agent_fingerprint.conflict  permanent abstention if writers disagree
+ *   genai_observation.jsonl  the turn's MODEL BOUNDARY -- what its model calls
+ *                      saw and said -- written only under the control plane's
+ *                      model-content consent (`genai-otlp.js`, whose reader is
+ *                      the Python SDK's `observation_from_lines` rule for rule)
  *
  * The Python end is `agent_flywheel.outcomes` (`record_turn_text`,
  * `read_turn_text`, `read_conversation_id`) and `production.Attachment._turn_wire`.
@@ -41,6 +45,10 @@ import { basename, join } from "node:path";
 
 import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
 import { recordTurnSpan } from "./tracing.js";
+import {
+  OBSERVATION_FILENAME, endRecord, newSpanId, newTraceId, observationFromLines,
+  operationRecord, renderTurnTrace, traceRecord,
+} from "./genai-otlp.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, productionIdentifier, productionTurnIdentifier,
@@ -301,6 +309,49 @@ export function readExecutionFingerprint(dir) {
   return { execution_sha256: value.execution_sha256 };
 }
 
+/**
+ * Record one run's model boundary beside its turn. Never throws; returns
+ * whether anything was written.
+ *
+ * `boundary` is `{start, end, operations}` (see `model-boundary.js`). The
+ * turn's trace id and root span id are minted ONCE, with the file: a second
+ * run recorded into the same turn appends to that trace rather than naming a
+ * second one, because the upload carries exactly one trace per turn.
+ */
+export function recordModelBoundary(dir, boundary) {
+  if (!boundary || !Array.isArray(boundary.operations)
+      || !boundary.operations.length) {
+    return false;
+  }
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, OBSERVATION_FILENAME);
+    const lines = [];
+    if (!existsSync(path)) {
+      lines.push(traceRecord({
+        traceId: newTraceId(), spanId: newSpanId(), start: boundary.start,
+      }));
+    }
+    for (const op of boundary.operations) lines.push(operationRecord(op));
+    lines.push(endRecord(boundary.end));
+    appendFileSync(path, lines.join("\n") + "\n", "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The turn's recorded model boundary, or `null` when none was recorded. */
+export function readModelBoundary(dir) {
+  let raw;
+  try {
+    raw = readFileSync(join(dir, OBSERVATION_FILENAME), "utf8");
+  } catch {
+    return null;
+  }
+  return observationFromLines(raw.split("\n"));
+}
+
 /** The conversation this turn declared, or `null`. */
 export function readConversationId(dir) {
   try {
@@ -378,7 +429,7 @@ export function readTurnText(dir) {
  *   file present, no rows   -> []    (it ran and called nothing)
  *   file absent             -> null  (nothing was recorded for it)
  */
-export function turnWire(dir, { turnIndex = 0 } = {}) {
+export function turnWire(dir, { turnIndex = 0, modelContentAgent = null } = {}) {
   const turnId = productionTurnIdentifier(basename(dir));
   if (turnId === null) {
     throw new ContractError(
@@ -390,13 +441,27 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
   const answer = text.answer ?? null;
   const task = text.task ?? null;
   const taskId = readTaskId(dir);
+  const cid = readConversationId(dir);
 
   let toolCalls;
   if (calls && calls.length) toolCalls = calls;
   else if (existsSync(join(dir, TOOL_CALLS_FILENAME))) toolCalls = [];
   else toolCalls = null;
 
-  if (!task && !answer && !(toolCalls && toolCalls.length) && !taskId) return null;
+  // WHAT THE MODEL SAW AND SAID, when this turn recorded it -- and only when
+  // the caller says model content may be uploaded now, by naming the agent it
+  // is uploaded for (`modelContentAgent`). Rendered from the turn's own record
+  // every time, so a retried upload carries the same trace; its conversation
+  // id is the wire's, from the same file, because the intake refuses a trace
+  // that names any other.
+  const genaiTrace = modelContentAgent
+    ? renderTurnTrace(readModelBoundary(dir), {
+      agentName: modelContentAgent, conversationId: cid,
+    })
+    : null;
+
+  if (!task && !answer && !(toolCalls && toolCalls.length) && !taskId
+      && genaiTrace === null) return null;
 
   const wire = {
     // `basename`, not `split("/")`. The turn id is the DIRECTORY NAME, and on
@@ -411,7 +476,6 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
     tool_calls: toolCalls,
     tool_calls_omitted_count: malformed,
   };
-  const cid = readConversationId(dir);
   if (cid) {
     wire.conversation_id = cid;
     wire.turn_index = turnIndex;
@@ -419,6 +483,9 @@ export function turnWire(dir, { turnIndex = 0 } = {}) {
   if (taskId) wire.task_id = taskId;
   const fingerprint = readExecutionFingerprint(dir);
   if (fingerprint !== null) wire.agent_fingerprint = fingerprint;
+  // OMITTED, never null, when there is none: a turn that recorded no model
+  // boundary keeps exactly the bytes it always had.
+  if (genaiTrace !== null) wire.genai_trace = genaiTrace;
   return wire;
 }
 

@@ -405,6 +405,15 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // persistence: it must work in production, where the trajectory env var
     // is normally absent and the describer writes nothing.
     onObservation: (event, ctx) => {
+      // The run's first model input, for production model-content capture
+      // (capture.js). Asked here because this is the plugin's one
+      // `llm_input` subscription; it records nothing without the control
+      // plane's model-content consent, and cannot cost the identity below.
+      if (turns) {
+        try {
+          turns.onLlmInput(event, ctx ?? {});
+        } catch { /* one lost observation */ }
+      }
       const observation = executionIdentity.observe(event, ctx ?? {});
       if (turns && observation) {
         turns.onExecutionIdentity(event, ctx ?? {}, observation);

@@ -19,9 +19,11 @@
  *
  * **Tool spans are egress only. THE TURN SPAN IS NOT.** A tool name and an
  * outcome are telemetry; a prompt and a completion are the user's own words.
- * So ``recordTurnSpan`` is OPT-IN and is only ever called with text the
- * customer handed over deliberately — nothing in this package can see a prompt
- * on its own.
+ * So ``recordTurnSpan`` is OPT-IN and is only ever called with the turn text
+ * the host handed the plugin (the user's message, the answer). What production
+ * capture observes at the model boundary under the model-content consent tier
+ * never reaches the customer's TracerProvider: it goes to the control plane as
+ * the turn's ``genai_trace`` (see ``genai-otlp.js``).
  *
  * **We never install a TracerProvider.** Registering one is once-only: the
  * second caller gets a log line, not an exception. So calling it would either

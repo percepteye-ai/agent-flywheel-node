@@ -37,15 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 490 was true on 2026-09-15 (it had drifted to 373 while the suite
-     grew). Re-derive with `npm test` (prints "tests 490" / "skipped 0")
+     its 596 was true on 2026-09-25 (it had drifted to 490, and before that
+     to 373, while the suite grew). Re-derive with `npm test` (prints
+     "tests 596" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-490_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-596_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -226,6 +227,7 @@ $PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured
     task_id            # optional caller-authored case/work-item correlation
     task_id.conflict   # present only when writers disagreed; task_id is then omitted
     tool_calls.jsonl
+    genai_observation.jsonl   # only under the model-content tier, see below
 ```
 
 `task_id` is opaque correlation evidence only. The SDK never interprets it as
@@ -234,9 +236,11 @@ adapters may supply it as `taskId`/`task_id` on an event or hook context. Invali
 or conflicting values are omitted rather than cleaned into another identifier;
 valid task-only turns still reach the control plane for downstream validation.
 
-**Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown.
+**Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart.
 
 Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
+
+**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt with images, a runtime-context carrier, or a history message the host converts out of sight.
 
 ### The approved pair, applied
 
@@ -385,7 +389,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 490 tests, no install step — node:test, zero dependencies
+npm test     # 596 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
