@@ -7,7 +7,7 @@
  * truncation limits here are the same values, asserted by the test suite
  * rather than kept in step by a comment. Python had this module and Node had
  * nothing, which meant a Node customer's agent emitted no ``gen_ai.*``
- * telemetry at all: Scout's agent-trace lane selects INTERNAL/CLIENT spans
+ * telemetry at all: the trace ingest's agent lane selects INTERNAL/CLIENT spans
  * carrying a ``gen_ai.*`` attribute, so their traces produced zero agent
  * records, no conversation, and therefore no next-state signal for the
  * per-step reward model to vote on.
