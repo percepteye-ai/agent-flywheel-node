@@ -65,14 +65,16 @@ import { join } from "node:path";
 
 import { applyDeclaration } from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
+import { nowUnixNano } from "./genai-otlp.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
+import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
 import { percepteyeHome } from "./session.js";
 import { AttachTransport } from "./transport.js";
 import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readTaskId, recordConversationId,
-  recordTaskId, recordTurnText,
+  recordModelBoundary, recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
   turnDir, turnIndexOf, turnWire,
 } from "./turns.js";
@@ -143,26 +145,113 @@ export function captureVerdict(registration) {
   // control plane did not answer" for this body, and the two SDKs owe the same
   // sentence to the same input.
   if (!capture || typeof capture !== "object" || Array.isArray(capture)) {
+    const unanswered =
+      "the control plane did not answer whether this agent may upload " +
+      "production turns, so nothing is uploaded. Turns are still captured " +
+      "locally.";
     return {
       mayUpload: false,
-      reason:
-        "the control plane did not answer whether this agent may upload " +
-        "production turns, so nothing is uploaded. Turns are still captured " +
-        "locally.",
+      reason: unanswered,
+      // The Python verdict's `answered`: whether the control plane answered
+      // at all. A re-read that comes back with nothing is a blip, and must
+      // not overwrite a sentence it did send.
+      answered: false,
+      mayCaptureModelContent: false,
+      modelContentReason: unanswered,
     };
   }
   // `=== true`, not truthiness: a consent question is answered by the exact
   // value. `turns: "false"` is truthy.
   const mayUpload = capture.turns === true;
+  if (mayUpload) {
+    // THE SECOND TIER, read by the same rules: the exact value, and only
+    // where turns may flow, because a trace rides on a turn. It decides
+    // whether model content is RECORDED at all, not merely uploaded -- see
+    // `createTurnCapture`.
+    const mayCaptureModelContent = capture.model_content === true;
+    const served = capture.model_content_reason;
+    return {
+      mayUpload,
+      reason: null,
+      answered: true,
+      mayCaptureModelContent,
+      modelContentReason: mayCaptureModelContent ? null
+        : (typeof served === "string" && served.trim()
+          ? served.trim()
+          : MODEL_CONTENT_NOT_ENABLED),
+    };
+  }
+  // The server's own sentence when it sent one -- it names the switch and
+  // who can flip it, which anything written here could only paraphrase.
+  const reason = typeof capture.reason === "string" && capture.reason.trim()
+    ? capture.reason.trim()
+    : "production capture is not enabled for this agent.";
+  // A refused turn refuses its trace for the same reason, and says THAT one.
   return {
     mayUpload,
-    // The server's own sentence when it sent one -- it names the switch and
-    // who can flip it, which anything written here could only paraphrase.
-    reason: mayUpload ? null
-      : (typeof capture.reason === "string" && capture.reason.trim()
-        ? capture.reason
-        : "production capture is not enabled for this agent."),
+    reason,
+    answered: true,
+    mayCaptureModelContent: false,
+    modelContentReason: reason,
   };
+}
+
+/**
+ * How the turn intake names a trace it refused for want of model-content
+ * consent (the control plane's `governance.MODEL_CONTENT_NOT_ENABLED`).
+ */
+export const MODEL_CONTENT_REFUSED = "model_content_capture_not_enabled";
+
+/**
+ * Every name the turn intake refuses a trace by that means "stop recording
+ * model content": no consent, or a turn attributed to no Product (a shared or
+ * undeclared agent), whose trace the intake never keeps. The capture verdict
+ * withholds the tier for both, and `recheck` picks it back up when either is
+ * fixed. A non-conformant trace is not here: that one is this renderer's bug,
+ * not a decision anyone made about this agent. The Python SDK's
+ * `_MODEL_CONTENT_REFUSALS`.
+ */
+export const MODEL_CONTENT_REFUSALS = new Set([
+  MODEL_CONTENT_REFUSED,
+  "genai_trace_turn_not_attributed_to_a_product",
+]);
+
+/**
+ * The model-content refusal when the control plane granted turns, withheld
+ * model content and sent no sentence of its own. The Python SDK's
+ * `_MODEL_CONTENT_NOT_ENABLED`, word for word -- the parity test compares them.
+ */
+export const MODEL_CONTENT_NOT_ENABLED =
+  "model-content capture is not enabled for this agent, so the system " +
+  "prompt, the conversation history and the tool results its model calls " +
+  "saw are neither recorded nor uploaded.";
+
+/** How `http.js` spells a terminal 403 in the error it throws. */
+const REFUSED_MARKER = "-> HTTP 403";
+
+/**
+ * The intake's sentence when it REFUSED a batch of turns, else `null`.
+ *
+ * THE PYTHON SDK'S `_capture_refusal`. A 403 is a DECISION -- an operator
+ * turned capture off, or the key lost the `turn.report` scope -- and will not
+ * become a 2xx by being sent again. Read as a blip, it left both consent tiers
+ * on: every flush re-POSTed the same end users' messages, and the model-content
+ * gate kept writing each run's system prompt, history and tool results to disk
+ * while consent was withdrawn -- to be uploaded if it were ever granted again,
+ * which would make that grant retroactive.
+ *
+ * Read off the STATUS `http.js` puts on its `TransportError`, not the English.
+ * Anything else -- a timeout, a 5xx, a 429 that outlasted the retry ladder --
+ * is a blip and stays retryable: mistaking a blip for a refusal would stop a
+ * consenting customer's uploads.
+ */
+export function captureRefusal(err) {
+  if (err?.statusCode !== 403) return null;
+  const text = String(err?.message ?? "");
+  const at = text.indexOf(REFUSED_MARKER);
+  const detail = at < 0 ? ""
+    : text.slice(at + REFUSED_MARKER.length).replace(/^[: ]+/, "").trim();
+  return detail || "the control plane refused this agent's turns (HTTP 403).";
 }
 
 /**
@@ -174,6 +263,14 @@ export function captureVerdict(registration) {
  */
 export function createTurnCapture({ root, logger = null }) {
   let warned = false;
+  // THE SECOND CONSENT TIER, asked at the moment of recording. Until the
+  // uploader is wired (`gateModelContent`), and whenever the control plane
+  // has not said `model_content: true`, nothing a model call saw is written.
+  let mayRecordModelContent = () => false;
+  // The run's first model input, from `llm_input`, held until its
+  // `agent_end`. Keyed by turn id; bounded like `generatedTurnIds`, so a run
+  // whose `agent_end` never arrives is forgotten rather than held forever.
+  const pendingInputs = new Map();
   // Invalid host ids are never cleaned into a different caller id. They get a
   // fresh safe id, retained only long enough to keep this run's hooks joined.
   const generatedTurnIds = new Map();
@@ -237,6 +334,44 @@ export function createTurnCapture({ root, logger = null }) {
     }
   }
 
+  /**
+   * The run's first model input. OBSERVE ONLY: the host discards the return
+   * of this hook, and it records nothing without model-content consent.
+   */
+  function onLlmInput(event, ctx = {}) {
+    if (!mayRecordModelContent()) return false;
+    const turnId = turnIdFor(event?.runId ?? ctx?.runId);
+    if (turnId === null) return false;
+    try {
+      const prior = pendingInputs.get(turnId);
+      // A SECOND llm_input in one run means the model saw a second prefix
+      // (a retry, a re-assembly after compaction). Which one each answer
+      // followed is not observable, so the run records no model boundary.
+      pendingInputs.set(turnId, prior
+        ? { refused: "the run assembled more than one model input" }
+        : inputFromLlmInput(event, nowUnixNano())
+          ?? { refused: "the model input cannot be rendered faithfully" });
+      while (pendingInputs.size > 4096) {
+        pendingInputs.delete(pendingInputs.keys().next().value);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The run's model calls, from its first input and its final transcript. */
+  function recordRunBoundary(turnId, dir, messages) {
+    const first = pendingInputs.get(turnId);
+    pendingInputs.delete(turnId);
+    if (!first || first.refused || !mayRecordModelContent()) return false;
+    try {
+      return recordModelBoundary(dir, operationsFromRun(first, messages, nowUnixNano()));
+    } catch {
+      return false;
+    }
+  }
+
   /** The agent's answer. */
   function onAgentEnd(event, ctx = {}) {
     const runId = event?.runId ?? ctx?.runId;
@@ -248,15 +383,16 @@ export function createTurnCapture({ root, logger = null }) {
     const wroteConversation = conversationId
       ? recordConversationId(dir, conversationId) : false;
     const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
+    const wroteBoundary = recordRunBoundary(turnId, dir, event?.messages);
     const text = lastAssistantText(event?.messages);
-    if (!text) return wroteConversation || wroteTaskId;
+    if (!text) return wroteConversation || wroteTaskId || wroteBoundary;
     try {
       const wroteText = recordTurnText(dir, "answer", text, {
         turn_id: turnId,
         conversation_id: readConversationId(dir) ?? "",
         task_id: readTaskId(dir) ?? "",
       });
-      return wroteConversation || wroteTaskId || wroteText;
+      return wroteConversation || wroteTaskId || wroteText || wroteBoundary;
     } catch (err) {
       warnOnce(err);
       return false;
@@ -294,7 +430,15 @@ export function createTurnCapture({ root, logger = null }) {
     return recordExecutionFingerprint(dir, observation.fingerprint);
   }
 
-  return { onMessageReceived, onAgentEnd, onExecutionIdentity, resolveToolDir };
+  /** Bind the model-content verdict: a function asked at each recording. */
+  function gateModelContent(predicate) {
+    mayRecordModelContent = typeof predicate === "function" ? predicate : () => false;
+  }
+
+  return {
+    onMessageReceived, onAgentEnd, onExecutionIdentity, onLlmInput,
+    gateModelContent, resolveToolDir,
+  };
 }
 
 /**
@@ -323,6 +467,8 @@ export function createTurnUploader({
   let inFlight = false;
   let mayUpload = false;
   let refusal = null;
+  let mayCaptureModelContent = false;
+  let modelContentReason = null;
 
   function uploadedIds() {
     try {
@@ -369,6 +515,8 @@ export function createTurnUploader({
         const cid = readConversationId(d.path);
         wire = turnWire(d.path, {
           turnIndex: cid ? turnIndexOf(root, d.name, cid) : 0,
+          // Model content rides only while the control plane says it may.
+          modelContentAgent: mayCaptureModelContent ? agentId : null,
         });
       } catch {
         // One unreadable turn costs that turn. A truncated trajectory is the
@@ -386,14 +534,91 @@ export function createTurnUploader({
   }
 
   /**
+   * Re-read the verdict. A READ, so it is safe to ask on the cadence; never
+   * rejects; fails closed.
+   *
+   * THE PYTHON SDK'S `_recheck_capture`, rule for rule. An operator may grant
+   * consent -- for turns, or for model content on an agent already uploading
+   * turns -- long after this process started, and nothing else would tell it:
+   * until this existed a Node install learned a grant only by restarting.
+   * Turn upload is only ever turned ON here (a blip that answers nothing must
+   * not revoke it; the intake's 403 does that, in `refuseUpload`); model
+   * content follows any verdict the control plane actually GAVE, both ways.
+   */
+  async function recheck() {
+    if (typeof transport?.captureCurrent !== "function") return;
+    let v;
+    try {
+      v = captureVerdict(await transport.captureCurrent(agentId));
+    } catch {
+      return;
+    }
+    if (v.mayUpload) {
+      mayUpload = true;
+      refusal = null;
+    } else if (v.answered) {
+      refusal = v.reason;
+    }
+    if (v.answered) {
+      mayCaptureModelContent = v.mayCaptureModelContent && mayUpload;
+      modelContentReason = mayCaptureModelContent ? null : v.modelContentReason;
+    }
+  }
+
+  /**
+   * The intake terminally refused these turns. Stop sending, say why.
+   *
+   * THE PYTHON SDK'S `_refuse_upload`, and the one place `mayUpload` turns
+   * false after it was true. A trace rides on a turn, so a refused turn
+   * refuses its model content too: from here on no run records what its model
+   * saw, until `recheck` reads a verdict that grants it again.
+   */
+  function refuseUpload(reason) {
+    mayUpload = false;
+    refusal = reason;
+    mayCaptureModelContent = false;
+    modelContentReason = reason;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane refused this agent's captured ` +
+      `turns and uploading has stopped: ${reason} The turns stay on disk, ` +
+      `and uploading resumes on its own if capture is enabled again.`);
+  }
+
+  /**
+   * THE REVOCATION PATH for model content. The intake keeps the turn and
+   * refuses its trace BY NAME (`MODEL_CONTENT_REFUSALS`) when an operator has
+   * withdrawn model-content consent, or when the agent's turns are attributed
+   * to no Product; left unread, every later turn would record the customer's
+   * prompt and tool results and send them to be discarded.
+   */
+  function noteModelContentRefusal(reply) {
+    const results = Array.isArray(reply?.turns) ? reply.turns : [];
+    for (const result of results) {
+      const trace = result?.genai_trace;
+      if (trace && MODEL_CONTENT_REFUSALS.has(trace.error)) {
+        mayCaptureModelContent = false;
+        modelContentReason = typeof trace.detail === "string" && trace.detail.trim()
+          ? trace.detail : MODEL_CONTENT_NOT_ENABLED;
+        logger?.warn?.(
+          `[agent-flywheel] the control plane refused this agent's model ` +
+          `content, so it is no longer recorded or uploaded: ${modelContentReason}`);
+        return;
+      }
+    }
+  }
+
+  /**
    * Send. Never rejects: a control plane that cannot be reached must not break
    * an agent that is serving users, and the turns stay on disk for next time.
    */
   async function flush({ includeUnanswered = false, settleMs = 0 } = {}) {
-    if (!mayUpload) return { sent: 0, notPermitted: true };
     if (inFlight) return { sent: 0, skipped: true };
     inFlight = true;
     try {
+      // Asked while either tier is still NO, and not at all once both are
+      // yes: one read per flush, the Python SDK's cadence.
+      if (!mayUpload || !mayCaptureModelContent) await recheck();
+      if (!mayUpload) return { sent: 0, notPermitted: true };
       const turns = pending({
         includeUnanswered,
         quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
@@ -402,9 +627,17 @@ export function createTurnUploader({
       let sent = 0;
       for (let i = 0; i < turns.length; i += BATCH_SIZE) {
         const chunk = turns.slice(i, i + BATCH_SIZE);
+        let reply;
         try {
-          await transport.reportTurns(agentId, chunk);
+          reply = await transport.reportTurns(agentId, chunk);
         } catch (err) {
+          const refused = captureRefusal(err);
+          if (refused !== null) {
+            // NOT A TRANSPORT FAILURE. Stop, in the intake's own words, and
+            // leave the turns on disk; `recheck` picks consent back up.
+            refuseUpload(refused);
+            return { sent, notPermitted: true };
+          }
           // Whole chunk unacknowledged: leave every marker unwritten so the
           // next flush retries it.
           logger?.warn?.(
@@ -414,6 +647,7 @@ export function createTurnUploader({
         }
         markUploaded(chunk.map((t) => t.turn_id));
         sent += chunk.length;
+        noteModelContentRefusal(reply);
       }
       return { sent };
     } finally {
@@ -424,12 +658,18 @@ export function createTurnUploader({
   return {
     get mayUpload() { return mayUpload; },
     get refusal() { return refusal; },
+    /** The second tier: may a turn also carry what its model calls saw? */
+    get mayCaptureModelContent() { return mayCaptureModelContent; },
+    get modelContentReason() { return modelContentReason; },
     /** Whether this host delivers `agent_end`, i.e. whether answers arrive. */
     get answersExpected() { return answersExpected; },
     /** Record the control plane's verdict. Until this runs, nothing uploads. */
     setVerdict(v) {
       mayUpload = Boolean(v?.mayUpload);
       refusal = v?.reason ?? null;
+      mayCaptureModelContent = mayUpload && v?.mayCaptureModelContent === true;
+      modelContentReason = mayCaptureModelContent ? null
+        : (v?.modelContentReason ?? refusal);
     },
     /**
      * One turn happened. Kicks a flush when the cadence is due.
@@ -515,6 +755,9 @@ export function registerTurnCapture(api, {
       uploader = createTurnUploader({
         transport, agentId: config.agentId, root, logger, answersExpected,
       });
+      // Model content is RECORDED only while the control plane says it may be
+      // uploaded -- asked of the uploader, which holds the one live verdict.
+      turns.gateModelContent?.(() => uploader.mayCaptureModelContent);
     } catch (err) {
       // `new ControlPlaneClient` refuses a missing key or base URL by design.
       // A misconfigured control plane must not take local recording down with

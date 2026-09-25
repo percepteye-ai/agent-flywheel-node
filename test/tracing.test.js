@@ -4,7 +4,7 @@
  * A customer deploys this package or the pip one, never both, and the promise
  * is that they behave identically. Node had NO tracing module at all while
  * Python had one, so a Node customer's agent emitted no `gen_ai.*` telemetry:
- * Scout's agent-trace lane selects INTERNAL/CLIENT spans carrying a `gen_ai.*`
+ * the trace ingest's agent lane selects INTERNAL/CLIENT spans carrying a `gen_ai.*`
  * attribute, so their export produced zero agent records, no conversation, and
  * therefore no next-state signal for the per-step reward model to vote on.
  *

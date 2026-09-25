@@ -331,12 +331,42 @@ describe("uploading", () => {
   };
 
   it("sends nothing until the control plane says yes", async () => {
+    // The control plane is ASKED (the flush re-reads the verdict while it is
+    // no, as the Python SDK's does) and says no. This used to pass a fake
+    // whose verdict was YES and assert nothing was sent -- which only held
+    // because a flush never asked, i.e. a grant made after startup was never
+    // noticed. That is the gap the re-read closes; the test below proves it.
     const root = tmp();
     makeTurn(root, "r", { task: "t", answer: "a" });
-    const tr = fakeTransport();
+    const tr = fakeTransport({ turns: false, reason: "not enabled" });
     const u = createTurnUploader({ transport: tr, agentId: "a1", root });
     assert.deepEqual(await u.flush(), { sent: 0, notPermitted: true });
     assert.deepEqual(tr.sent, []);
+    assert.deepEqual(tr.calls, ["captureCurrent"]);
+    assert.equal(u.refusal, "not enabled");
+  });
+
+  it("notices a grant made after startup on the next flush", async () => {
+    const root = tmp();
+    makeTurn(root, "r", { task: "t", answer: "a" });
+    const tr = fakeTransport({ turns: true });
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    u.setVerdict({ mayUpload: false, reason: "not yet" });
+    assert.equal((await u.flush()).sent, 1);
+    assert.equal(u.mayUpload, true);
+  });
+
+  it("never revokes turn upload on a re-read that answered nothing", async () => {
+    const root = tmp();
+    makeTurn(root, "r", { task: "t", answer: "a" });
+    const tr = {
+      ...fakeTransport(),
+      async captureCurrent() { return {}; },
+    };
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    u.setVerdict({ mayUpload: true });
+    assert.equal((await u.flush()).sent, 1);
+    assert.equal(u.mayUpload, true);
   });
 
   it("uploads answered turns", async () => {
