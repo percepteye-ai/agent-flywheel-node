@@ -393,8 +393,51 @@ describe("what the plugin cannot see, it does not render", () => {
 
   it("records nothing for a run with no model answer", () => {
     assert.equal(recorded(llmInput("r"), [
-      { role: "user", content: "hi", timestamp: 1 },
+      { role: "user", content: "Where is my order 4417?", timestamp: 1 },
     ]), false);
+  });
+
+  // A user message STEERED into the running session (OpenClaw's
+  // `activeSession.steer`) fires no second llm_input, so the transcript's last
+  // user message is no longer the run's prompt. Taking it for one rendered
+  // the answer after the steer against the original prompt alone and dropped
+  // the tool call, its result and the steer itself.
+  const steered = (between) => [
+    { role: "user", content: "Where is my order 4417?", timestamp: 1758000000005 },
+    ...between,
+    { role: "user", content: "Also email me the receipt.", timestamp: 1758000000120 },
+    { role: "assistant", provider: "openai", model: "gpt-4o-mini-2024-07-18",
+      stopReason: "stop", timestamp: 1758000000160,
+      content: [{ type: "text", text: "Done, the receipt is on its way." }] },
+  ];
+
+  it("refuses a run a user message was steered into after a tool result", () => {
+    const [, call, result] = transcript();
+    assert.equal(recorded(llmInput("r"), steered([call, result])), false);
+  });
+
+  it("refuses a run a user message was steered into after an answer", () => {
+    const answer = transcript()[3];
+    assert.equal(recorded(llmInput("r"), steered([answer])), false);
+  });
+
+  it("finds the run's prompt under the stamp the model boundary adds", () => {
+    // OpenClaw stores the prompt bare and prefixes it at the boundary with a
+    // timestamp envelope derived from the message's own timestamp: the run
+    // is still recorded, with the prompt as the model saw it.
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    turns.gateModelContent(() => true);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    const stamped = "[Tue 2025-09-16 05:20 UTC] Where is my order 4417?";
+    turns.onLlmInput(llmInput("r", { prompt: stamped }), ctx);
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, ctx);
+    const chats = spans(turnWire(join(root, "r"), { modelContentAgent: "a" })
+      .genai_trace).filter((s) => attrs(s)["gen_ai.operation.name"] === "chat");
+    assert.equal(chats.length, 2);
+    assert.deepEqual(JSON.parse(attrs(chats[0])["gen_ai.input.messages"]), [
+      { role: "user", parts: [{ type: "text", content: stamped }] },
+    ]);
   });
 
   it("records an errored model call as an error, never as an answer", () => {
@@ -404,7 +447,7 @@ describe("what the plugin cannot see, it does not render", () => {
     const ctx = { runId: "r", sessionKey: CONVERSATION };
     turns.onLlmInput(llmInput("r"), ctx);
     turns.onAgentEnd({ runId: "r", messages: [
-      { role: "user", content: "hi", timestamp: 1 },
+      { role: "user", content: "Where is my order 4417?", timestamp: 1 },
       { role: "assistant", content: [], stopReason: "error", errorType: "RateLimit",
         provider: "openai", model: "m", timestamp: 2 },
     ] }, ctx);

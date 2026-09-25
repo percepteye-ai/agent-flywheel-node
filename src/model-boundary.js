@@ -33,7 +33,11 @@
  *     plugin cannot see;
  *   - a runtime-context carrier on the user turn, which the model saw and
  *     `llm_input` does not include;
- *   - images in the prompt, whose bytes `llm_input` does not carry.
+ *   - images in the prompt, whose bytes `llm_input` does not carry;
+ *   - a transcript whose last user message is not the prompt `llm_input`
+ *     carried: a message steered into the running session
+ *     (`activeSession.steer`, which fires no second `llm_input`) that the
+ *     model saw mid-run, after the input this module was told about.
  *
  * A refusal records no model boundary for that turn; the turn itself is
  * captured exactly as before.
@@ -184,6 +188,9 @@ export function inputFromLlmInput(event, at) {
     input.push({ role: "user", parts: [{ type: "text", content: event.prompt }] });
     return {
       at,
+      // What `operationsFromRun` finds the run's start by, never rendered
+      // from: the input above already carries it as the model saw it.
+      prompt: event.prompt,
       provider: providerName(event.provider),
       model: text(event.model),
       system: text(event.systemPrompt)
@@ -197,18 +204,49 @@ export function inputFromLlmInput(event, at) {
   }
 }
 
+/** A user message's text as the transcript stores it, or `null` when it is
+ * not text alone. */
+function userText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content) || !content.length) return null;
+  if (!content.every((b) => isObject(b) && b.type === "text" && typeof b.text === "string")) {
+    return null;
+  }
+  return content.map((b) => b.text).join("");
+}
+
+/**
+ * Is `message` the transcript's copy of the prompt `llm_input` carried?
+ *
+ * OpenClaw stores the prompt BARE and may only PREFIX it at the model
+ * boundary -- the `[DOW YYYY-MM-DD HH:MM TZ] ` stamp it derives from the
+ * message's own timestamp, a prompt-build hook's prepended context -- so the
+ * boundary's spelling ends with the stored text. Anything else is refused:
+ * the run's start is then unknown, and a guessed one is worse than none.
+ */
+function isRunPrompt(message, prompt) {
+  if (typeof prompt !== "string") return false;
+  const stored = userText(message?.content);
+  if (stored === null) return false;
+  return stored === prompt || (stored.length > 0 && prompt.endsWith(stored));
+}
+
 /**
  * The run's model calls and tool executions, as observation operations, or
  * `null` when the transcript cannot be matched to the input it started from.
  *
  * `messages` is `agent_end`'s transcript; the run's own messages are those
- * after its last user message. `endAt` is the `agent_end` receipt time.
+ * after its last user message, which must be the prompt `first` was given --
+ * a user message steered in mid-run is the last one instead, and the run's
+ * start (and every call before the steer) would otherwise be lost to a
+ * prompt the model never saw. `endAt` is the `agent_end` receipt time.
  */
 export function operationsFromRun(first, messages, endAt) {
   if (!first || !Array.isArray(messages)) return null;
   let lastUser = -1;
   messages.forEach((m, i) => { if (isObject(m) && m.role === "user") lastUser = i; });
   if (lastUser < 0) return null;
+  if (!isRunPrompt(messages[lastUser], first.prompt)) return null;
   const run = messages.slice(lastUser + 1);
   let converted;
   try {
