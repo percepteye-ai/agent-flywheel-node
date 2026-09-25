@@ -203,6 +203,20 @@ export function captureVerdict(registration) {
 export const MODEL_CONTENT_REFUSED = "model_content_capture_not_enabled";
 
 /**
+ * Every name the turn intake refuses a trace by that means "stop recording
+ * model content": no consent, or a turn attributed to no Product (a shared or
+ * undeclared agent), whose trace the intake never keeps. The capture verdict
+ * withholds the tier for both, and `recheck` picks it back up when either is
+ * fixed. A non-conformant trace is not here: that one is this renderer's bug,
+ * not a decision anyone made about this agent. The Python SDK's
+ * `_MODEL_CONTENT_REFUSALS`.
+ */
+export const MODEL_CONTENT_REFUSALS = new Set([
+  MODEL_CONTENT_REFUSED,
+  "genai_trace_turn_not_attributed_to_a_product",
+]);
+
+/**
  * The model-content refusal when the control plane granted turns, withheld
  * model content and sent no sentence of its own. The Python SDK's
  * `_MODEL_CONTENT_NOT_ENABLED`, word for word -- the parity test compares them.
@@ -572,15 +586,16 @@ export function createTurnUploader({
 
   /**
    * THE REVOCATION PATH for model content. The intake keeps the turn and
-   * refuses its trace BY NAME when an operator has withdrawn model-content
-   * consent; left unread, every later turn would record the customer's prompt
-   * and tool results and send them to be discarded.
+   * refuses its trace BY NAME (`MODEL_CONTENT_REFUSALS`) when an operator has
+   * withdrawn model-content consent, or when the agent's turns are attributed
+   * to no Product; left unread, every later turn would record the customer's
+   * prompt and tool results and send them to be discarded.
    */
   function noteModelContentRefusal(reply) {
     const results = Array.isArray(reply?.turns) ? reply.turns : [];
     for (const result of results) {
       const trace = result?.genai_trace;
-      if (trace && trace.error === MODEL_CONTENT_REFUSED) {
+      if (trace && MODEL_CONTENT_REFUSALS.has(trace.error)) {
         mayCaptureModelContent = false;
         modelContentReason = typeof trace.detail === "string" && trace.detail.trim()
           ? trace.detail : MODEL_CONTENT_NOT_ENABLED;

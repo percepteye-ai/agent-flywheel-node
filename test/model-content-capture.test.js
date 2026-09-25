@@ -275,6 +275,48 @@ describe("consent: model content is RECORDED only when granted", () => {
       "model content was recorded after the intake refused it");
   });
 
+  it("stops recording while the agent's turns are attributed to no Product", async () => {
+    // The agent became SHARED after the tier was granted: the intake keeps no
+    // trace of a turn attributed to no Product and refuses it by name. Read
+    // only as a consent refusal, every later run's prompt and tool results
+    // were recorded and sent to be discarded. The plugin stops, and picks the
+    // tier back up when the verdict grants it again.
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    const tr = transport();
+    const detail = "this agent's production turns are attributed to no " +
+      "Product (ambiguous_shared_agent)";
+    let verdict = { turns: true, model_content: false, model_content_reason: detail };
+    tr.captureCurrent = async () => ({ capture: verdict });
+    tr.reportTurns = async (_a, ts) => {
+      tr.batches.push(ts);
+      return { turns: ts.map((t) => ({
+        turn_id: t.turn_id, accepted: true,
+        ...("genai_trace" in t ? { genai_trace: {
+          stored: false, error: "genai_trace_turn_not_attributed_to_a_product",
+          detail } } : {}),
+      })) };
+    };
+    const u = createTurnUploader({ transport: tr, agentId: "a", root });
+    u.setVerdict(captureVerdict({ capture: { turns: true, model_content: true } }));
+    turns.gateModelContent(() => u.mayCaptureModelContent);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    turns.onLlmInput(llmInput("r"), ctx);
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, ctx);
+    await u.flush();
+    assert.equal(u.mayCaptureModelContent, false,
+      "model content is still recorded for turns the intake keeps no trace of");
+    assert.equal(u.modelContentReason, detail);
+    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2" }), false);
+    await u.flush();
+    assert.equal(u.mayCaptureModelContent, false);
+    // COMPLETES: the operator retires the second Product.
+    verdict = { turns: true, model_content: true };
+    await u.flush();
+    assert.equal(u.mayCaptureModelContent, true);
+    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3" }), true);
+  });
+
   it("stops recording model content when the intake refuses the turns", async () => {
     // A 403 on /turns is an operator's decision, not a blip. Read as a blip it
     // left both tiers on, and every later run's system prompt, history and
