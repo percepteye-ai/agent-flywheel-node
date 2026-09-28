@@ -8,6 +8,8 @@
  * `x-contract-version`, because two copies of a contract with no mechanism
  * keeping them in sync is not a contract.
  */
+import { isLowerSha256 } from "./execution-identity.js";
+
 export const CONTRACT_VERSION = "flywheel/1";
 
 /** Runtime mirrors of the production-turn limits published by the schema. */
@@ -179,4 +181,117 @@ function scrubToolCall(call) {
     throw new ContractError("tool call may not carry an 'environment' field");
   }
   return out;
+}
+
+/**
+ * A Product-rulebook declaration's two wire shapes, hand-written to match
+ * `schema/flywheel-1.json` `$defs.RulebookRequest` and `$defs.RulebookReceipt`
+ * -- as the Python SDK's `contract.py` `RulebookRequest` / `RulebookReceipt`
+ * are -- and held equal to them by `test/wire.test.js`. Each refusal below is
+ * worded as the Python end words it.
+ *
+ * @typedef {{rules: string[]}} RulebookRequest
+ * @typedef {{
+ *   status: "registered" | "retracted" | "unchanged",
+ *   product_id: string,
+ *   version_id: string | null,
+ *   version: number | null,
+ *   content_sha256: string | null,
+ *   parent_sha256: string | null,
+ *   rule_count: number,
+ * }} RulebookReceipt
+ */
+export const RULEBOOK_RECEIPT_KEYS = Object.freeze([
+  "status", "product_id", "version_id", "version", "content_sha256",
+  "parent_sha256", "rule_count",
+]);
+
+/** What a registration did, in the schema's enum order. */
+export const RULEBOOK_RECEIPT_STATUSES = Object.freeze([
+  "registered", "retracted", "unchanged",
+]);
+
+/**
+ * The body of `POST /agents/{id}/rulebook`, or a `ContractError` before
+ * anything is sent.
+ *
+ * STRINGS ONLY, IN ORDER: a rule's id is derived from its text by the control
+ * plane, never authored here, and the list is the rulebook as written.
+ *
+ * SHAPE ONLY. What makes a rule acceptable -- its length, a duplicate, JSON
+ * text, a control character, a credential value, how many there may be -- is
+ * the control plane's to decide, and it refuses by cause and rule index. A
+ * second copy of those bounds here would be one more thing to drift, so this
+ * refuses only what cannot be a list of rules at all.
+ *
+ * @returns {RulebookRequest}
+ */
+export function rulebookRequestToWire(rules) {
+  if (!Array.isArray(rules)) {
+    const hint = typeof rules === "string"
+      ? " (a single string is one rule: pass it inside a list)"
+      : "";
+    throw new ContractError(
+      "rules must be a list of strings, one rule per string; got " +
+      `${jsonTypeName(rules)}${hint}`,
+    );
+  }
+  rules.forEach((rule, index) => {
+    if (typeof rule !== "string") {
+      throw new ContractError(
+        `rule ${index} must be a string; got ${jsonTypeName(rule)}`,
+      );
+    }
+  });
+  return { rules: [...rules] };
+}
+
+/**
+ * The control plane's receipt, checked against the contract, or a
+ * `ContractError` naming what it lacks or carries wrongly. A key the contract
+ * does not declare is dropped, not refused -- a newer control plane may say
+ * more.
+ *
+ * @returns {RulebookReceipt}
+ */
+export function rulebookReceiptFromWire(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ContractError("a rulebook receipt must be a JSON object");
+  }
+  const missing = RULEBOOK_RECEIPT_KEYS.filter((key) => !Object.hasOwn(raw, key));
+  if (missing.length) {
+    throw new ContractError(
+      `RulebookReceipt missing required field(s): ${pyList(missing)}`,
+    );
+  }
+  const nullableSha = (v) => v === null || isLowerSha256(v);
+  const wrong = [
+    ["status", RULEBOOK_RECEIPT_STATUSES.includes(raw.status)],
+    ["product_id", typeof raw.product_id === "string" && raw.product_id !== ""],
+    ["version_id", raw.version_id === null || typeof raw.version_id === "string"],
+    ["version", raw.version === null
+      || (Number.isInteger(raw.version) && raw.version >= 1)],
+    ["content_sha256", nullableSha(raw.content_sha256)],
+    ["parent_sha256", nullableSha(raw.parent_sha256)],
+    ["rule_count", Number.isInteger(raw.rule_count) && raw.rule_count >= 0],
+  ].filter(([, ok]) => !ok).map(([key]) => key);
+  if (wrong.length) {
+    throw new ContractError(
+      `RulebookReceipt carries invalid field(s): ${pyList(wrong)}`,
+    );
+  }
+  return Object.fromEntries(RULEBOOK_RECEIPT_KEYS.map((key) => [key, raw[key]]));
+}
+
+/** A list of field names as Python prints one, so both SDKs say it alike. */
+const pyList = (names) => `[${names.map((n) => `'${n}'`).join(", ")}]`;
+
+/** The Python type name of a JSON value, as `type(v).__name__` prints it. */
+function jsonTypeName(value) {
+  if (value === null || value === undefined) return "NoneType";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
+  if (typeof value === "string") return "str";
+  if (Array.isArray(value)) return "list";
+  return typeof value === "object" ? "dict" : typeof value;
 }

@@ -70,7 +70,7 @@ import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
 import { percepteyeHome } from "./session.js";
-import { AttachTransport } from "./transport.js";
+import { AttachTransport, declareRulebook } from "./transport.js";
 import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readTaskId, recordConversationId,
@@ -703,9 +703,11 @@ export const GATEWAY_STOP = "gateway_stop";
 /**
  * Subscribe production turn capture. Called only in production mode.
  *
- * Returns `{turns, uploader, root, transport, started}`, or `null` when
- * nothing was wired. `transport` is null without an API key; `started` is the
- * registration chain, or null when there was nothing to register.
+ * Returns `{turns, uploader, root, transport, started, rulebookRefusal}`, or
+ * `null` when nothing was wired. `transport` is null without an API key;
+ * `started` is the registration chain, or null when there was nothing to
+ * register; `rulebookRefusal` says why the configured `rules` were not
+ * registered once `started` has settled (see `enrol`).
  *
  * CAPTURE RUNS WITHOUT A KEY; only UPLOADING needs one. That is the ordinary
  * first install -- local recording, no account, no traffic -- which is why the
@@ -732,6 +734,10 @@ export function registerTurnCapture(api, {
   // plugin load is three chances to be rate-limited on a cold start, and the
   // policy answer is not needed until the first turn arrives.
   let started = null;
+  // Why the operator's `rules` were not registered, settled once `started`
+  // resolves; null when they were, or when none are configured. The Python
+  // SDK's `Attachment.rulebook_refusal`.
+  let rulebookRefusal = null;
 
   // THE TURN OPENS, and this is the UNGATED half -- the only hook of the three
   // the host is guaranteed to deliver. It carries the cadence for that reason:
@@ -801,7 +807,10 @@ export function registerTurnCapture(api, {
     // NOT AWAITED: `register()` must return to the host synchronously, and a
     // control plane that is slow or down must not delay a plugin load.
     started = enrol({ transport, config, pluginId, logger, declaration })
-      .then(() => announce({ transport, uploader, config, pluginId, logger, env }));
+      .then((enrolled) => {
+        rulebookRefusal = enrolled.rulebookRefusal;
+        return announce({ transport, uploader, config, pluginId, logger, env });
+      });
   } else {
     logger?.info?.(
       `[${pluginId}] capturing production turns to ${root}. No API key is ` +
@@ -822,7 +831,10 @@ export function registerTurnCapture(api, {
 
   // `transport` is handed out so the serving-policy read reuses THIS client
   // rather than constructing a second one against the same base URL and key.
-  return { turns, uploader, root, transport, started };
+  return {
+    turns, uploader, root, transport, started,
+    get rulebookRefusal() { return rulebookRefusal; },
+  };
 }
 
 /** The real control-plane transport. Replaced in tests, never in production. */
@@ -876,12 +888,19 @@ function defaultTransport(config) {
  *   process re-registering on every restart cannot erase what a training run
  *   established.
  *
+ * THEN THE OPERATOR'S `rules`, when configured (`declareRulebook`), as their
+ * own call on their own route -- never in this registration body. Resolves to
+ * `{registered, rulebookRefusal}`: whether the registration landed, and the
+ * sentence saying why the rules were not registered (null when they were, or
+ * when none are configured).
+ *
  * NEVER REJECTS, and never throws into its caller. A refused or unreachable
  * control plane must not cost the verdict read, local capture (which needs no
  * account at all), or the plugin load -- the host treats a throw from
  * `register()` as a failed plugin load. The Python SDK's `attach()` splits the
  * same two calls for the same reason: a registration intake dislikes must not
- * also cost that process its policy read.
+ * also cost that process its policy read. A refused rulebook costs nothing
+ * but the rules.
  *
  * NOT EXPORTED, unlike `announce` beside it. Its tests drive it through
  * `registerTurnCapture`, which is the path a customer actually gets, and this
@@ -932,7 +951,18 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
         `locally. Until a registration lands, no operator can enable upload ` +
         `for this agent, because the control has no agent to act on.`);
       return false;
-    });
+    })
+    // THE RULES, after the registration and whatever its outcome -- the
+    // rulebook belongs to the Product that declares this agent, not to the
+    // agent row, so a refused registration does not refuse it. Declared by
+    // the step the training lane takes too, which never rejects, so neither
+    // does this.
+    .then(async (registered) => ({
+      registered,
+      rulebookRefusal: await declareRulebook({
+        transport, rules: config.rules, pluginId, logger,
+      }),
+    }));
 }
 
 /**

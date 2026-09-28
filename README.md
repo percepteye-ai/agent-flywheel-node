@@ -37,16 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 596 was true on 2026-09-25 (it had drifted to 490, and before that
-     to 373, while the suite grew). Re-derive with `npm test` (prints
-     "tests 596" / "skipped 0")
+     its 633 was true on 2026-09-28 (it had drifted to 596, 490, and before
+     that 373, while the suite grew). Re-derive with `npm test` (prints
+     "tests 633" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-596_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-633_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -332,6 +332,7 @@ Scalar settings are settable two ways: in your OpenClaw config under `plugins.en
 | `executionSnapshot` | *(config only)* | *(none)* | opaque SHA-256 components from the host adapter, its completeness assertion, and optionally an exact startup prompt/tool/provider/model observation. Exact startup evidence binds registration and claims to the same SDK-authored execution identity later reported; missing, invalid, lossy, or conflicting evidence abstains |
 | `introspect` | `PERCEPTEYE_INTROSPECT` | on | `0`/`false`/`no`/`off` registers this agent with no description at all, which the control plane records as your opt-out, and authors no execution identity. **The one switch where config does not win:** a refusal from either side stands, as it does in the Python SDK |
 | `describe` | *(config only)* | *(none)* | the agent's own `system_prompt`, `tools` and `model`, for what this plugin cannot observe — OpenClaw's `llm_input` carries no tools. See below |
+| `rules` | *(config only)* | *(none)* | the workflow rules this agent follows, a list of prose strings, declared as the rulebook of the Product that declares this agent. Unset sends nothing; `[]` retracts. See below |
 
 The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. An adapter that can resolve the full execution before work is claimed may also provide `startupObservation: {systemPrompt, tools, provider, model}`. Core runs startup and per-run evidence through the same canonical descriptor; it never accepts a caller-authored final digest. Component names belong to the adapter, and core does not assign them meaning. The resulting `execution_sha256` identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
 
@@ -352,6 +353,20 @@ It is the Python SDK's `describe=`, read by the same rules, and a cross-language
 - **What you declare wins** over what was observed, where you gave it. Anything you leave out still comes from observation. With nothing observed, the record names this plugin's host, `framework: "openclaw"`, where the Python SDK — which cannot know — says `custom`.
 - **It is your word, not an observation,** so it anchors no execution identity. If you also configured `executionSnapshot`, a startup warning says the identity is withheld.
 - **A bad declaration does not stop the plugin**, because a throw would take local capture down with it — and the config schema accepts any `describe` value, so OpenClaw never refuses the plugin over one either. It is dropped with a warning that names the cause, the same one the Python SDK refuses with, and the agent registers only what was observed.
+
+**`rules`** are the workflow rules your agent follows — the ones a person would tell a new colleague. They become the rulebook of the Product that declares this agent, and when training data is built for that Product, each decision's teacher is shown at most the few rules that apply to it. They are never added to your served agent's prompt.
+
+```json
+"plugins": { "entries": { "agent-flywheel": { "config": { "rules": [
+  "Before issuing a refund, confirm the order number with the customer.",
+  "Escalate to a human when the customer asks to close their account."
+] } } } }
+```
+
+- **Declared once per start**, after this agent registers, on their own route (`POST /agents/{id}/rulebook`) — never inside the registration and never in `describe`. That is every keyed production install, and a training install that drives rollouts; one that does not says at startup that its rules were not declared either. It is the Python SDK's `rules=`, and the two send the same bytes under the same idempotency key.
+- **The last writer wins.** Every start that sets `rules` declares them again: the same rules change nothing, different rules become a new version. Leaving `rules` unset sends nothing and leaves whatever is in force alone; `[]` retracts it. A Product admin can also set them through Mission Control's API (`PUT /api/v2/products/{product_id}/rulebook`), and both writes are kept in the Product's history.
+- **The control plane decides what a rule may be**, and says which rule it refused and why; this plugin refuses only a value that is not a list of strings, before sending anything. The agent must be declared by exactly one Product, or nothing is written.
+- **A refused declaration does not stop the plugin**: it costs the rules and nothing else, and the warning names the cause — also readable as `rulebookRefusal` on the handle `register()` returns (`capture` in production, `rollouts` in training). The config schema accepts any `rules` value for the same reason it accepts any `describe`.
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
 
@@ -389,7 +404,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 596 tests, no install step — node:test, zero dependencies
+npm test     # 633 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

@@ -79,12 +79,17 @@ test("the schema accepts the settings the manifest tells customers to set", () =
   // properties refuses apiKey, which is the first thing the manifest documents.
   for (const key of [
     "apiKey", "agentId", "controlPlaneUrl", "capture", "executionSnapshot",
+    "rules",
   ]) {
     assert.ok(
       key in plugin.configSchema.properties,
       `${key} is documented in the manifest and must be accepted`,
     );
   }
+  // `rules` is typed by nobody but the control plane: a type here would let
+  // the host refuse the whole plugin load -- local capture included -- over a
+  // malformed rule list the control plane would have refused and named.
+  assert.equal("type" in plugin.configSchema.properties.rules, false);
   const startup = plugin.configSchema.properties.executionSnapshot
     .properties.startupObservation;
   assert.deepEqual(
@@ -173,6 +178,7 @@ test("the transport calls no route the control plane does not serve", async () =
   const SERVED = new Set([
     "GET /health",
     "POST /agents",
+    "POST /agents/{id}/rulebook",
     "GET /agents/{id}/capture",
     "POST /rollouts/claim",
     "POST /rollouts/{id}/heartbeat",

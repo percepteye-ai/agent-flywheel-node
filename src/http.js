@@ -80,6 +80,14 @@ function retryAfterMs(response) {
   return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : null;
 }
 
+/**
+ * The first 300 CODE POINTS, as Python's `text[:300]` keeps them. A UTF-16
+ * `.slice` kept fewer characters wherever an emoji or other astral character
+ * came first -- so the same answer read shorter here -- and could cut one in
+ * half.
+ */
+const cut = (text) => [...text].slice(0, 300).join("");
+
 async function detail(response) {
   let text = "";
   try {
@@ -91,12 +99,23 @@ async function detail(response) {
     const body = JSON.parse(text);
     if (body && typeof body === "object" && !Array.isArray(body)) {
       for (const key of ["detail", "error", "message", "reason"]) {
-        if (key in body) return String(body[key]).slice(0, 300);
+        if (!(key in body)) continue;
+        // A STRUCTURED detail is rendered, not flattened. The control plane
+        // answers many refusals with an object -- `{error, cause, index,
+        // detail}` for a refused rule, `{error, status, detail}` for an agent
+        // attributed to no Product -- and `String()` turned every one into
+        // "[object Object]", a refusal naming no cause. The Python SDK's
+        // `_detail` renders the same object as the same compact JSON
+        // (non-ASCII kept), so both packages tell a customer the same thing
+        // about the same answer -- `test_rulebook_parity.py` there compares
+        // the two sentences.
+        const value = body[key];
+        return cut(typeof value === "string" ? value : JSON.stringify(value));
       }
     }
-    return String(text).slice(0, 300);
+    return cut(String(text));
   } catch {
-    return text.slice(0, 300);
+    return cut(text);
   }
 }
 

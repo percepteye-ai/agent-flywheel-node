@@ -114,6 +114,7 @@ import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
 import { createOutbox, outboxDir } from "./outbox.js";
+import { declareRulebook } from "./transport.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
 
@@ -815,9 +816,18 @@ export function registerRolloutDriver(api, {
   env = process.env,
   declaration = null,
 }) {
+  // The configured `rules` ride this lane's registration, so a lane that
+  // never registers never declares them -- said, rather than left for the
+  // operator to find missing from the Product.
+  const rulesNotDeclared = config?.rules != null
+    ? " The configured rules are declared after this agent registers, so " +
+      "they are not declared either."
+    : "";
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
-    logger?.info?.(`[${pluginId}] not claiming rollouts: ${verdict.reason}`);
+    logger?.info?.(
+      `[${pluginId}] not claiming rollouts: ${verdict.reason}${rulesNotDeclared}`,
+    );
     return null;
   }
   const enqueueFn = api?.session?.workflow?.enqueueNextTurnInjection
@@ -825,7 +835,8 @@ export function registerRolloutDriver(api, {
   if (typeof enqueueFn !== "function") {
     logger?.warn?.(
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
-      `claimed task could not be delivered to the agent. Not claiming.`,
+      `claimed task could not be delivered to the agent. Not claiming.` +
+      rulesNotDeclared,
     );
     return null;
   }
@@ -914,7 +925,18 @@ export function registerRolloutDriver(api, {
   // an incompatible or unreachable control plane is diagnosed at startup
   // instead of waiting for a person's first session to reveal it. Every claim
   // still awaits this exact cached promise.
-  void ensureRegistered();
+  //
+  // THEN THE OPERATOR'S `rules`, once, after the registration attempt and
+  // whatever its outcome -- the step the production lane takes
+  // (`declareRulebook`), which never rejects. Chained here rather than inside
+  // the registration, so no claim waits on it: the rules are the Product's
+  // training guidance, not a precondition of this worker's leases.
+  let rulebookRefusal = null;
+  const rulebook = ensureRegistered()
+    .then(() => declareRulebook({
+      transport, rules: config.rules, pluginId, logger,
+    }))
+    .then((refusal) => { rulebookRefusal = refusal; });
 
   // Both the attended hook and the unattended cron loop call this same claim
   // method. A failed registration looks like an empty queue locally; it never
@@ -1041,6 +1063,13 @@ export function registerRolloutDriver(api, {
   // Exposed for diagnostics and focused tests; invoking it performs the same
   // single cached registration the first claim would perform.
   driver.ensureRegistered = ensureRegistered;
+  // The rules' declaration, and why it registered nothing (null when it did,
+  // or when no rules are configured) once `rulebook` settles. The Python
+  // SDK's `rulebook_refusal`; the production lane's is on `capture`.
+  driver.rulebook = rulebook;
+  Object.defineProperty(driver, "rulebookRefusal", {
+    get: () => rulebookRefusal, enumerable: true,
+  });
   return driver;
 }
 

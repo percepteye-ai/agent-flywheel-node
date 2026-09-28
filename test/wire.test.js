@@ -9,8 +9,9 @@ import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
-  CONTRACT_VERSION, ContractError, WIRE_KEYS,
-  rolloutOutputToWire, rolloutRequestFromWire,
+  CONTRACT_VERSION, ContractError, RULEBOOK_RECEIPT_KEYS,
+  RULEBOOK_RECEIPT_STATUSES, WIRE_KEYS, rolloutOutputToWire,
+  rolloutRequestFromWire, rulebookRequestToWire,
 } from "../src/wire.js";
 
 const schema = JSON.parse(
@@ -46,9 +47,45 @@ describe("the vendored schema IS the contract", () => {
     if (!sibling) return;
 
     const authoritative = JSON.parse(readFileSync(sibling, "utf8"));
-    for (const name of ["ProductionTurn", "ProductionTurnBatch"]) {
+    for (const name of [
+      "ProductionTurn", "ProductionTurnBatch", "RulebookRequest",
+      "RulebookReceipt",
+    ]) {
       assert.deepEqual(schema.$defs[name], authoritative.$defs[name]);
     }
+  });
+
+  it("is the Python authority's copy BYTE FOR BYTE", () => {
+    // The two SDKs ship in unison: one contract file, vendored twice. Equal
+    // definitions in a different order or spelling are already two files a
+    // reviewer has to diff by hand, so the bytes are what is held equal.
+    const sibling = [
+      "../../agent-flywheel/schema/flywheel-1.json",
+      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
+    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    if (!sibling) return;
+    assert.equal(
+      readFileSync(new URL("../schema/flywheel-1.json", import.meta.url), "utf8"),
+      readFileSync(sibling, "utf8"),
+      "schema/flywheel-1.json differs from the Python SDK's copy",
+    );
+  });
+
+  it("declares the rulebook shapes this package sends and reads", () => {
+    const request = schema.$defs.RulebookRequest;
+    assert.equal(request.additionalProperties, false);
+    assert.deepEqual(request.required, ["rules"]);
+    assert.deepEqual(request.properties.rules,
+      { type: "array", items: { type: "string" } });
+    assert.deepEqual(
+      Object.keys(rulebookRequestToWire(["Confirm the order number first."])),
+      Object.keys(request.properties),
+    );
+    const receipt = schema.$defs.RulebookReceipt;
+    assert.equal(receipt.additionalProperties, false);
+    assert.deepEqual([...RULEBOOK_RECEIPT_KEYS], receipt.required);
+    assert.deepEqual([...RULEBOOK_RECEIPT_KEYS], Object.keys(receipt.properties));
+    assert.deepEqual([...RULEBOOK_RECEIPT_STATUSES], receipt.properties.status.enum);
   });
 });
 

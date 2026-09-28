@@ -51,7 +51,7 @@ export const PLUGIN_ID = "agent-flywheel";
  * rejects fails the plugin load. So the on/off switches take a NUMBER too --
  * `capture: 0` is documented as off, and a schema of string|boolean refused it
  * and skipped the plugin -- and NULL, which `resolveConfig` reads as unset;
- * and `describe` declares no type at all.
+ * and `describe` and `rules` declare no type at all.
  *
  * `resolveConfig` below is the ONE place a default is decided. A schema default
  * is a second answer to a question already answered there, and this host turns
@@ -177,6 +177,18 @@ export const CONFIG_SCHEMA = {
         "(a name, or {model_name, provider, temperature, max_tokens}). What " +
         "you declare wins where given; it anchors no execution identity.",
     },
+    // NO `type` either, for `describe`'s reason: a wrong one would fail the
+    // plugin load. The control plane is the one validator of the rules and
+    // names what it refuses; the refusal is logged, never fatal.
+    rules: {
+      description:
+        "The workflow rules this agent follows, one prose rule per string " +
+        "(a list of strings), registered after this agent registers as the " +
+        "rulebook of the one Product that declares it -- training guidance, " +
+        "never added to the served agent's prompt. Every start that sets it " +
+        "declares it again, so the last writer wins; [] retracts. Unset sends " +
+        "nothing and leaves the rulebook in force alone.",
+    },
   },
 };
 
@@ -283,6 +295,10 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     // index.js, where a bad one can be refused loudly without failing the
     // plugin load; see declaration.js.
     describe: pluginConfig.describe ?? null,
+    // The operator's workflow rules, transported only and config-only, like
+    // `describe`. Null sends nothing -- which is not `[]`, a retraction. The
+    // control plane validates them; see `AttachTransport.registerRulebook`.
+    rules: pluginConfig.rules ?? null,
     contributing: Boolean(apiKey),
   };
 }

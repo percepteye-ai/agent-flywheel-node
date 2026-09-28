@@ -20,7 +20,7 @@ import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
   productionIdentifier, productionTurnIdentifier, rolloutOutputToWire,
-  rolloutRequestFromWire,
+  rolloutRequestFromWire, rulebookReceiptFromWire, rulebookRequestToWire,
 } from "./wire.js";
 
 /**
@@ -29,10 +29,11 @@ import {
  * named below rather than left to be found by a digest that does not match.
  *
  * THE IDEMPOTENCY KEY IS A CROSS-SDK CONTRACT, and this function is the whole
- * of it. Both packages hash a batch of turns and send the digest as that
- * batch's `Idempotency-Key`; a customer who migrates harnesses with turns
- * still on disk gets each SDK defeating the other's de-duplication if the two
- * hash the same payload differently.
+ * of it. Both packages hash a batch of turns -- and a rulebook declaration,
+ * through the same `bodyDigest` -- and send the digest as that body's
+ * `Idempotency-Key`; a customer who migrates harnesses with turns still on
+ * disk gets each SDK defeating the other's de-duplication if the two hash the
+ * same payload differently.
  *
  * `JSON.stringify` differs from Python's default in three ways that ARE
  * handled here, and this shipped claiming a parity it did not have until a
@@ -86,6 +87,20 @@ function stableStringify(value) {
   return JSON.stringify(value);
 }
 
+/**
+ * The digest an idempotency key carries for a request body: a sha256 over
+ * `stableStringify`, first 32 hex characters. ONE DERIVATION for every keyed
+ * body -- the turn batch and the rulebook -- as the Python SDK's
+ * `_body_digest` is one, so the same body gets the same key from either
+ * package.
+ */
+function bodyDigest(value) {
+  return createHash("sha256")
+    .update(stableStringify(value))
+    .digest("hex")
+    .slice(0, 32);
+}
+
 /** Everything `ensure_ascii=True` escapes and `JSON.stringify` does not. */
 const NON_ASCII = new RegExp("[\\u007f-\\uffff]", "g");
 
@@ -128,6 +143,64 @@ function rolloutPath(rollout, suffix) {
   } catch {
     throw new ContractError("rollout_id contains invalid Unicode");
   }
+}
+
+/**
+ * Why a rulebook declaration registered nothing, as one sentence.
+ *
+ * ONE builder, for the transport's own failures and for a caller holding a
+ * transport that threw instead: both lanes report what happened to the rules
+ * the same way. The error's message is kept whole because it carries the
+ * cause -- `http.js` puts the control plane's refusal (`rulebook_invalid`
+ * with the rule's cause and index, `rulebook_unattributed` with the binding
+ * status) or the transport failure after the status.
+ */
+export function rulebookRefusal(err) {
+  return (
+    `this agent's rules were not registered: ${err?.message ?? err}. The ` +
+    "rulebook in force, if any, is unchanged."
+  );
+}
+
+/**
+ * Declare the operator's `rules` once, after this agent's registration, and
+ * say what happened. Resolves to the refusal sentence, or `null` when the
+ * control plane registered them (or answered that they are already in force).
+ *
+ * THE ONE STEP BOTH LANES TAKE -- `capture.js:enrol` in production,
+ * `registerRolloutDriver` in training -- so the two cannot send, log or
+ * record a declaration differently.
+ *
+ * `null` RULES SEND NOTHING, which is not `[]`: an install that configures no
+ * rules must not retract the rulebook another surface registered.
+ *
+ * NEVER REJECTS, and never throws into its caller, whatever the transport
+ * does: a refused or undeliverable declaration costs the rules, never the
+ * registration, the verdict read, the policy read or local capture.
+ */
+export async function declareRulebook({
+  transport, rules, pluginId, logger = null,
+}) {
+  if (rules === null || rules === undefined) return null;
+  let outcome;
+  try {
+    outcome = await transport.registerRulebook(rules);
+  } catch (err) {
+    outcome = { receipt: null, refusal: rulebookRefusal(err) };
+  }
+  if (outcome?.refusal) {
+    logger?.warn?.(`[${pluginId}] ${outcome.refusal}`);
+    return outcome.refusal;
+  }
+  const receipt = outcome?.receipt ?? {};
+  logger?.info?.(
+    `[${pluginId}] declared this agent's workflow rules for its Product: ` +
+    `${receipt.status ?? "accepted"}` +
+    (receipt.version != null
+      ? ` (version ${receipt.version}, ${receipt.rule_count} rule(s))`
+      : "") + ".",
+  );
+  return null;
 }
 
 /** Bounded, header-safe idempotency identity for an opaque rollout id. */
@@ -179,6 +252,64 @@ export class AttachTransport {
       ? executionSha
       : null;
     return response;
+  }
+
+  /**
+   * Declare the workflow rules this agent follows as its Product's rulebook
+   * (`$defs.RulebookRequest`). `[]` retracts the rulebook in force. Resolves
+   * to `{receipt, refusal}`, exactly one of them non-null.
+   *
+   * THE PRODUCT IS NOT SENT. The control plane writes to the one Product whose
+   * Flywheel spec declares this agent; an agent declared by none, or by more
+   * than one, is refused (409 `rulebook_unattributed`) and nothing is written.
+   *
+   * ITS OWN ROUTE, not the registration body and not `describe`: the
+   * registration is persisted whole on every restart, and a declaration
+   * withholds this agent's execution identity. Rules have neither cost here.
+   *
+   * FAILS OPEN, like `policyCurrent`: rules the control plane refuses, or a
+   * control plane that cannot answer, must not stop the agent, its capture or
+   * its policy read -- the rulebook in force is simply unchanged. Nothing the
+   * control plane does or fails to do rejects from here; `refusal` is the
+   * sentence saying why there is no receipt, carrying the control plane's own
+   * cause (the rule it refused and its index, or the binding that attributes
+   * the agent to no single Product) rather than one message for every cause.
+   * Only `rules` that are not a list of strings reject, with a
+   * `ContractError`, before anything is sent: that is a caller's mistake, not
+   * the control plane's answer. The Python SDK's
+   * `AttachTransport.register_rulebook`, refusal for refusal.
+   *
+   * REPLAYABLE. The same rules answer `unchanged` and register nothing, so an
+   * ambiguous retry is harmless and the client's retries stay ON. The key is
+   * `bodyDigest` over the body, so both SDKs send one key for one
+   * declaration, non-ASCII rules included (strings are the one wire type, so
+   * the float gap `stableStringify` names cannot reach it).
+   */
+  async registerRulebook(rules) {
+    const jsonBody = rulebookRequestToWire(rules);
+    const agent = quoteIdentifier(this.agentId);
+    let reply;
+    try {
+      reply = await this._c.request("POST", `/agents/${agent}/rulebook`, {
+        jsonBody,
+        idempotencyKey: `rulebook-${agent}-${bodyDigest(jsonBody)}`,
+      });
+    } catch (err) {
+      return { receipt: null, refusal: rulebookRefusal(err) };
+    }
+    try {
+      return { receipt: rulebookReceiptFromWire(reply), refusal: null };
+    } catch (err) {
+      // The control plane ANSWERED 2xx, so "not registered" would be a guess.
+      // A receipt outside the published contract is named as what it is.
+      return {
+        receipt: null,
+        refusal:
+          "the control plane answered this agent's rules with a receipt " +
+          `this SDK cannot read (${err.message}), so whether they are in ` +
+          "force is unknown.",
+      };
+    }
   }
 
   /**
@@ -339,13 +470,9 @@ export class AttachTransport {
         throw new ContractError(`production turn ${index} has an invalid task_id`);
       }
     });
-    const digest = createHash("sha256")
-      .update(stableStringify(turns))
-      .digest("hex")
-      .slice(0, 32);
     return this._c.request("POST", "/turns", {
       jsonBody: { agent_id: agentId, turns },
-      idempotencyKey: `turns-${quoteIdentifier(agentId)}-${digest}`,
+      idempotencyKey: `turns-${quoteIdentifier(agentId)}-${bodyDigest(turns)}`,
     });
   }
 
