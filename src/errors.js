@@ -19,11 +19,21 @@ export class TransportError extends Error {
    * network blip that retired a rollout's only copy of its result would be a
    * worse failure than the one the split exists to handle. Python's half of
    * this contract spells it `status_code`.
+   *
+   * `ambiguous` is true when the control plane MAY HAVE PERFORMED the request
+   * although this error was thrown: some attempt failed after the request
+   * could have reached it -- a timeout, a dropped connection, a 5xx other
+   * than 503 -- or it answered 2xx with a body that could not be read. False
+   * means no attempt can have been performed: each was never sent, or was
+   * refused (a 4xx, or a 503 saying it was not handled). Only the client
+   * knows, because only it saw every attempt; a caller about to tell someone
+   * "that did not happen" asks this. Python spells it `ambiguous` too.
    */
   constructor(message, options) {
     super(message, options);
     this.name = "TransportError";
     this.statusCode = options?.statusCode ?? null;
+    this.ambiguous = options?.ambiguous === true;
   }
 }
 

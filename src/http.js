@@ -56,6 +56,18 @@ export const SDK_VERSION = JSON.parse(
 
 export const SDK_UA = `agent-flywheel-node/${SDK_VERSION}`;
 
+/**
+ * Might a request answered with this status have been PERFORMED? A 4xx is the
+ * server refusing it and a 503 the server saying it was not handled -- the
+ * control plane's own store failures answer 503 and register nothing. Any
+ * other 5xx may come after the work was done: a 500 raised after a commit, a
+ * 502 or 504 from a proxy whose upstream finished and lost the answer. Read by
+ * `TransportError.ambiguous`; the Python client's `_may_have_performed`.
+ */
+function mayHavePerformed(status) {
+  return status >= 500 && status !== 503;
+}
+
 function neverSent(err) {
   // An AbortError is our own timeout firing. The request was in flight; the
   // server may have completed it. Ambiguous, never "never sent".
@@ -213,6 +225,10 @@ export class ControlPlaneClient {
     if (jsonBody !== undefined) headers["Content-Type"] = "application/json";
 
     let lastErr = null;
+    // Whether ANY attempt so far may have been performed -- see
+    // `TransportError.ambiguous`. Over every attempt, not the last: a retry
+    // that was never sent says nothing about the one before it.
+    let ambiguous = false;
 
     for (let attempt = 1; attempt <= this._maxAttempts; attempt += 1) {
       const controller = new AbortController();
@@ -230,6 +246,7 @@ export class ControlPlaneClient {
         });
       } catch (err) {
         lastErr = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+        ambiguous = ambiguous || !neverSent(err);
         if (attempt === this._maxAttempts || !(retryIfAmbiguous || neverSent(err))) break;
         await sleep(backoffMs(attempt));
         continue;
@@ -239,8 +256,9 @@ export class ControlPlaneClient {
 
       if (response.status === 410) {
         throw new LeaseLost((await detail(response)) || "lease lost",
-                            { statusCode: response.status });
+                            { statusCode: response.status, ambiguous });
       }
+      ambiguous = ambiguous || mayHavePerformed(response.status);
 
       // 429 retries EVEN WHEN ambiguous retries are off: it is the server
       // explicitly telling us it did not do the work. Python has the same
@@ -264,7 +282,7 @@ export class ControlPlaneClient {
         // the retry set. See `outbox.js:REDELIVERY_CANNOT_FIX`.
         throw new TransportError(
           `${method} ${path} -> HTTP ${response.status}: ${await detail(response)}`,
-          { statusCode: response.status },
+          { statusCode: response.status, ambiguous },
         );
       }
 
@@ -274,8 +292,11 @@ export class ControlPlaneClient {
       try {
         body = JSON.parse(text);
       } catch (err) {
+        // PERFORMED: the control plane answered 2xx. What it did is
+        // unreadable, not undone.
         throw new TransportError(
           `${method} ${path} -> HTTP ${response.status} with unparseable body: ${err.message}`,
+          { ambiguous: true },
         );
       }
       return body && typeof body === "object" && !Array.isArray(body)
@@ -285,6 +306,7 @@ export class ControlPlaneClient {
 
     throw new TransportError(
       `${method} ${path} failed after ${this._maxAttempts} attempts: ${lastErr}`,
+      { ambiguous },
     );
   }
 }

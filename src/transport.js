@@ -16,6 +16,7 @@
  */
 import { createHash } from "node:crypto";
 
+import { TransportError } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
@@ -146,7 +147,7 @@ function rolloutPath(rollout, suffix) {
 }
 
 /**
- * Why a rulebook declaration registered nothing, as one sentence.
+ * Why a rulebook declaration came back with no receipt, as one sentence.
  *
  * ONE builder, for the transport's own failures and for a caller holding a
  * transport that threw instead: both lanes report what happened to the rules
@@ -154,8 +155,23 @@ function rolloutPath(rollout, suffix) {
  * cause -- `http.js` puts the control plane's refusal (`rulebook_invalid`
  * with the rule's cause and index, `rulebook_unattributed` with the binding
  * status) or the transport failure after the status.
+ *
+ * "NOT REGISTERED" ONLY WHEN IT IS KNOWN. A failure after the request may
+ * have landed -- a timeout, a dropped connection, a 502 from a proxy whose
+ * upstream finished -- is `TransportError.ambiguous`, and the rules may be in
+ * force: saying the rulebook is unchanged would send an operator to believe
+ * the old one still is. That failure is named as unknown, with the one remedy
+ * that is safe either way. The Python SDK's `rulebook_refusal`, word for word.
  */
 export function rulebookRefusal(err) {
+  if (err instanceof TransportError && err.ambiguous) {
+    return (
+      "whether this agent's rules were registered is unknown: " +
+      `${err.message}. The control plane may have received them before the ` +
+      "failure; declaring the same rules again is safe, because rules equal " +
+      "to the ones in force are answered unchanged."
+    );
+  }
   return (
     `this agent's rules were not registered: ${err?.message ?? err}. The ` +
     "rulebook in force, if any, is unchanged."
