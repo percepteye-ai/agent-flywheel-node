@@ -4,11 +4,12 @@
  *
  * The rules reach the control plane on their own route
  * (`POST /agents/{id}/rulebook`), once per start, after the agent registers,
- * in production (`capture.js:enrol`) and in training (`registerRolloutDriver`)
- * alike. A refused or undeliverable declaration costs the rules and nothing
- * else -- never the registration, the verdict read, a claim, or the plugin
- * load -- and says why in `rulebookRefusal`, naming the control plane's own
- * cause.
+ * in production (`registerTurnCapture`, after the verdict read) and in
+ * training (`registerRolloutDriver`) alike. A refused, slow or undeliverable
+ * declaration costs the rules and nothing else -- never the registration, the
+ * verdict read, the approved serving policy, a claim, or the plugin load --
+ * and says why in `rulebookRefusal`, naming the control plane's own cause, or
+ * the reason they were never sent at all.
  *
  * The rules and products here are deliberately generic and obviously fake.
  * The golden idempotency keys were derived by the Python SDK's rule
@@ -318,7 +319,7 @@ describe("declareRulebook", () => {
   });
 });
 
-// ── production: capture.js enrol ──────────────────────────────────────────
+// ── production: capture.js registerTurnCapture ────────────────────────────
 
 /** A production control plane: registration, the verdict read, the rules. */
 function productionTransport({ registerFails = false, rulebook = null } = {}) {
@@ -346,29 +347,32 @@ function productionTransport({ registerFails = false, rulebook = null } = {}) {
   };
 }
 
-function wireProduction(tr, config = {}) {
+function wireProduction(tr, config = {}, { makeTransport = () => tr, prepare = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pe-rulebook-prod-"));
+  const turns = createTurnCapture({ root });
+  prepare?.(turns);
   const warns = [];
-  const api = { on() {}, logger: { info() {}, warn: (m) => warns.push(m) },
+  const infos = [];
+  const api = { on() {}, logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
                 config: {} };
   const out = registerTurnCapture(api, {
     config: { apiKey: "k", agentId: "a1", ...config },
-    turns: createTurnCapture({ root }),
+    turns,
     pluginId: PLUGIN_ID,
     logger: api.logger,
     env: { PERCEPTEYE_CAPTURE_DIR: root },
-    makeTransport: () => tr,
+    makeTransport,
   });
-  return { out, warns, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { out, warns, infos, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 describe("the production lane declares the rules after registering", () => {
-  it("registers, declares the rules, THEN reads the verdict", async () => {
+  it("registers, reads the verdict, THEN declares the rules", async () => {
     const tr = productionTransport();
     const { out, cleanup } = wireProduction(tr, { rules: RULES });
     try {
-      await out.started;
-      assert.deepEqual(tr.calls, ["register", "registerRulebook", "captureCurrent"]);
+      await out.rulebook;
+      assert.deepEqual(tr.calls, ["register", "captureCurrent", "registerRulebook"]);
       assert.deepEqual(tr.declared, [RULES]);
       assert.equal(out.rulebookRefusal, null);
       assert.equal(out.uploader.mayUpload, true);
@@ -390,7 +394,7 @@ describe("the production lane declares the rules after registering", () => {
       rules: "Always confirm the order number first.",
     });
     try {
-      await out.started;
+      await out.rulebook;
       assert.deepEqual(sent, []);
       assert.match(out.rulebookRefusal, /a single string is one rule: pass it inside a list/);
       assert.ok(warns.some((w) => w.includes(out.rulebookRefusal)));
@@ -402,7 +406,7 @@ describe("the production lane declares the rules after registering", () => {
     const tr = productionTransport();
     const { out, cleanup } = wireProduction(tr);
     try {
-      await out.started;
+      await out.rulebook;
       assert.deepEqual(tr.calls, ["register", "captureCurrent"]);
       assert.equal(out.rulebookRefusal, null);
     } finally { cleanup(); }
@@ -420,8 +424,8 @@ describe("the production lane declares the rules after registering", () => {
     const tr = productionTransport({ rulebook: (r) => refusing.registerRulebook(r) });
     const { out, warns, cleanup } = wireProduction(tr, { rules: RULES });
     try {
-      await out.started;
-      assert.deepEqual(tr.calls, ["register", "registerRulebook", "captureCurrent"]);
+      await out.rulebook;
+      assert.deepEqual(tr.calls, ["register", "captureCurrent", "registerRulebook"]);
       assert.match(out.rulebookRefusal, /rulebook_unattributed/);
       assert.ok(warns.some((w) => w.includes(out.rulebookRefusal)),
         "the refusal must reach the operator's log");
@@ -436,9 +440,35 @@ describe("the production lane declares the rules after registering", () => {
     const tr = productionTransport({ registerFails: true });
     const { out, cleanup } = wireProduction(tr, { rules: RULES });
     try {
-      await out.started;
-      assert.deepEqual(tr.calls, ["register", "registerRulebook", "captureCurrent"]);
+      await out.rulebook;
+      assert.deepEqual(tr.calls, ["register", "captureCurrent", "registerRulebook"]);
+      assert.equal(out.rulebookRefusal, null);
     } finally { cleanup(); }
+  });
+
+  it("the startup chain never waits on the rules -- a route that does not answer holds back nothing", async () => {
+    // `started` is what the serving-policy read waits on (index.js), so a
+    // rulebook route that is slow or down must not be on it: the approved
+    // prompt and model would wait out four 30s attempts behind rules a
+    // teacher reads, not this install.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const tr = productionTransport({ rulebook: async (r) => {
+      await gate;
+      return new AttachTransport(recordingClient(), { agentId: "a1" }).registerRulebook(r);
+    } });
+    const { out, cleanup } = wireProduction(tr, { rules: RULES });
+    try {
+      await out.started;
+      assert.equal(out.uploader.mayUpload, true,
+        "the verdict read waited on the rules");
+      await settle();
+      assert.deepEqual(tr.calls, ["register", "captureCurrent", "registerRulebook"]);
+      assert.equal(out.rulebookRefusal, null, "the declaration has not settled yet");
+      release();
+      await out.rulebook;
+      assert.equal(out.rulebookRefusal, null);
+    } finally { release(); cleanup(); }
   });
 
   it("never rejects -- a transport that THROWS on the declaration still settles the chain", async () => {
@@ -449,7 +479,7 @@ describe("the production lane declares the rules after registering", () => {
     tr.registerRulebook = () => { throw new Error("socket closed"); };
     const { out, cleanup } = wireProduction(tr, { rules: RULES });
     try {
-      await out.started;
+      await out.rulebook;
       await settle();
       assert.deepEqual(rejections, []);
       assert.match(out.rulebookRefusal, /socket closed/);
@@ -458,6 +488,86 @@ describe("the production lane declares the rules after registering", () => {
       process.off("unhandledRejection", onUnhandled);
       cleanup();
     }
+  });
+});
+
+describe("the production lane names rules it could never send", () => {
+  // Nothing registers on these paths, so `declareRulebook` is never reached;
+  // the refusal is named at once, with the cause that stopped the lane -- the
+  // Python SDK's `Attachment.rulebook_refusal` names the same paths.
+  it("with no API key: said on the handle and in the startup line", () => {
+    const { out, infos, cleanup } = wireProduction(null, { apiKey: undefined, rules: RULES });
+    try {
+      assert.equal(out.transport, null);
+      assert.equal(out.started, null);
+      assert.equal(out.rulebook, null);
+      assert.equal(out.rulebookRefusal,
+        "no API key is configured, so the configured rules were never sent " +
+        "to the control plane.");
+      assert.ok(infos.some((l) => l.includes("No API key is configured") &&
+        l.includes("the configured rules were never sent")),
+        `the operator was not told: ${infos.join(" | ")}`);
+    } finally { cleanup(); }
+  });
+
+  it("with no API key and no rules: nothing was owed, so nothing is named", () => {
+    const { out, infos, cleanup } = wireProduction(null, { apiKey: undefined });
+    try {
+      assert.equal(out.rulebookRefusal, null);
+      assert.ok(!infos.some((l) => l.includes("rules")),
+        `a line named rules nobody configured: ${infos.join(" | ")}`);
+    } finally { cleanup(); }
+  });
+
+  it("with no API key, a value that is no list of strings is named as THAT", () => {
+    // It would be refused once a key is set too, so the key is not its cause.
+    const { out, cleanup } = wireProduction(null, {
+      apiKey: undefined, rules: "Always confirm the order number first.",
+    });
+    try {
+      assert.match(out.rulebookRefusal, /^this agent's rules were not registered: /);
+      assert.match(out.rulebookRefusal, /a single string is one rule: pass it inside a list/);
+      assert.ok(!out.rulebookRefusal.includes("API key"));
+    } finally { cleanup(); }
+  });
+
+  it("with a control-plane client that would not build: said, with its cause", () => {
+    const { out, warns, infos, cleanup } = wireProduction(null, { rules: RULES }, {
+      makeTransport: () => { throw new TransportError("control-plane base URL is required"); },
+    });
+    try {
+      assert.equal(out.uploader, null);
+      assert.equal(out.started, null);
+      assert.equal(out.rulebook, null);
+      assert.equal(out.rulebookRefusal,
+        "the control plane could not be set up for this install " +
+        "(control-plane base URL is required), so the configured rules were " +
+        "never sent to the control plane.");
+      assert.ok(warns.some((w) => w.includes(`Local recording to ${out.root} is unaffected.`) &&
+        w.includes("the configured rules were never sent")),
+        `the operator was not told: ${warns.join(" | ")}`);
+      assert.ok(!infos.some((l) => l.includes("No API key")),
+        `an install with a key was told it has none: ${infos.join(" | ")}`);
+    } finally { cleanup(); }
+  });
+
+  it("a setup failure AFTER the uploader was built does not claim the rules went unsent", async () => {
+    // The uploader exists, so the chain below still registers and declares:
+    // "never sent" would be false, in the log and on the handle.
+    const tr = productionTransport();
+    const { out, warns, cleanup } = wireProduction(tr, { rules: RULES }, {
+      prepare: (turns) => { turns.gateModelContent = () => { throw new Error("gate broke"); }; },
+    });
+    try {
+      assert.ok(out.uploader, "the uploader was built");
+      assert.equal(out.rulebookRefusal, null);
+      assert.ok(warns.some((w) => w.includes("gate broke")));
+      assert.ok(!warns.some((w) => w.includes("never sent")),
+        `a warning claimed the rules went unsent: ${warns.join(" | ")}`);
+      await out.rulebook;
+      assert.deepEqual(tr.declared, [RULES]);
+      assert.equal(out.rulebookRefusal, null);
+    } finally { cleanup(); }
   });
 });
 
@@ -565,14 +675,35 @@ describe("the training lane declares the rules after registering", () => {
     assert.deepEqual(tr.order, ["health", "register", "registerRulebook"]);
   });
 
-  it("a lane that never registers says the rules were not declared either", () => {
+  it("a lane that never registers says the rules were never sent either", () => {
     const tr = trainingTransport();
     const api = trainingApi({ conversationAccess: false });
     const { driver } = wireTraining(tr, { rules: RULES }, api);
     assert.equal(driver, null);
     assert.deepEqual(tr.order, []);
-    assert.ok(api.logs.some((l) => /rules .* not declared either/.test(l)),
+    assert.ok(api.logs.includes(
+      `[${PLUGIN_ID}] this install registers only to claim rollouts, and it ` +
+      "claims none, so the configured rules were never sent to the control plane."),
       `the operator was not told: ${api.logs.join(" | ")}`);
+  });
+
+  it("a lane with no injection API says so too, and names a malformed value as malformed", () => {
+    const tr = trainingTransport();
+    const api = trainingApi();
+    delete api.session;
+    const { driver } = wireTraining(tr, { rules: "Always confirm the order number first." }, api);
+    assert.equal(driver, null);
+    assert.ok(api.logs.some((l) => l.includes(
+      "a single string is one rule: pass it inside a list")),
+      `the malformed value was not named: ${api.logs.join(" | ")}`);
+  });
+
+  it("a lane that never registers and has no rules names none", () => {
+    const api = trainingApi({ conversationAccess: false });
+    const { driver } = wireTraining(trainingTransport(), {}, api);
+    assert.equal(driver, null);
+    assert.ok(!api.logs.some((l) => l.includes("rules")),
+      `a line named rules nobody configured: ${api.logs.join(" | ")}`);
   });
 });
 
@@ -602,8 +733,7 @@ async function throughRegister({ mode, rulebookStatus = 200, rulebookBody = RECE
       PERCEPTEYE_AGENT_MODE: mode, PERCEPTEYE_CAPTURE_DIR: root,
       PERCEPTEYE_HOME: root,
     });
-    if (mode === "production") await out.capture.started;
-    else await out.rollouts.rulebook;
+    await (mode === "production" ? out.capture.rulebook : out.rollouts.rulebook);
     return { out, requests };
   } finally {
     globalThis.fetch = realFetch;
@@ -612,6 +742,44 @@ async function throughRegister({ mode, rulebookStatus = 200, rulebookBody = RECE
 }
 
 describe("from register(), the path an operator actually gets", () => {
+  it("production: the approved serving policy is read while the rules are still in flight", async () => {
+    // The consumer that waits on the startup chain is `registerServingPolicy`
+    // (index.js passes it `capture.started`). A rulebook route that has not
+    // answered must not stand between this install and its approved prompt.
+    const root = mkdtempSync(join(tmpdir(), "pe-rulebook-e2e-"));
+    const realFetch = globalThis.fetch;
+    const requests = [];
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    globalThis.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      requests.push(`${init.method} ${path}`);
+      if (path.endsWith("/rulebook")) { await gate; return json(200, RECEIPT); }
+      return json(200, {});
+    };
+    try {
+      const out = register(trainingApi(), { apiKey: "pefw_x", agentId: "support", rules: RULES }, {
+        PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
+      });
+      await out.capture.started;
+      for (let i = 0; i < 50 && !requests.includes("GET /api/flywheel/v1/policy/current"); i += 1) {
+        await settle();
+      }
+      assert.ok(requests.includes("POST /api/flywheel/v1/agents/support/rulebook"),
+        `the rules were never sent: ${requests.join(", ")}`);
+      assert.ok(requests.includes("GET /api/flywheel/v1/policy/current"),
+        `the serving-policy read waited on the rules: ${requests.join(", ")}`);
+      release();
+      await out.capture.rulebook;
+      assert.equal(out.capture.rulebookRefusal, null);
+    } finally {
+      release();
+      globalThis.fetch = realFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+
   for (const mode of ["production", "training"]) {
     it(`${mode}: the configured rules reach the rulebook route after the registration`, async () => {
       const { out, requests } = await throughRegister({ mode });

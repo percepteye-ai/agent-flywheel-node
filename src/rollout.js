@@ -114,7 +114,7 @@ import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
 import { createOutbox, outboxDir } from "./outbox.js";
-import { declareRulebook } from "./transport.js";
+import { declareRulebook, rulesNeverSent } from "./transport.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
 
@@ -816,18 +816,22 @@ export function registerRolloutDriver(api, {
   env = process.env,
   declaration = null,
 }) {
-  // The configured `rules` ride this lane's registration, so a lane that
-  // never registers never declares them -- said, rather than left for the
-  // operator to find missing from the Product.
-  const rulesNotDeclared = config?.rules != null
-    ? " The configured rules are declared after this agent registers, so " +
-      "they are not declared either."
-    : "";
+  // The configured `rules` follow this lane's registration, so a lane that
+  // never registers never sends them -- said, by the sentence the production
+  // lane uses for the same question (`rulesNeverSent`), rather than left for
+  // the operator to find missing from the Product. No handle carries it: this
+  // function returns none on either path below.
+  const rulesUnsent = () => {
+    const unsent = rulesNeverSent(
+      config?.rules,
+      "this install registers only to claim rollouts, and it claims none",
+    );
+    if (unsent) logger?.info?.(`[${pluginId}] ${unsent}`);
+  };
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
-    logger?.info?.(
-      `[${pluginId}] not claiming rollouts: ${verdict.reason}${rulesNotDeclared}`,
-    );
+    logger?.info?.(`[${pluginId}] not claiming rollouts: ${verdict.reason}`);
+    rulesUnsent();
     return null;
   }
   const enqueueFn = api?.session?.workflow?.enqueueNextTurnInjection
@@ -835,9 +839,9 @@ export function registerRolloutDriver(api, {
   if (typeof enqueueFn !== "function") {
     logger?.warn?.(
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
-      `claimed task could not be delivered to the agent. Not claiming.` +
-      rulesNotDeclared,
+      `claimed task could not be delivered to the agent. Not claiming.`,
     );
+    rulesUnsent();
     return null;
   }
 

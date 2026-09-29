@@ -163,13 +163,37 @@ export function rulebookRefusal(err) {
 }
 
 /**
+ * Why the configured `rules` were never SENT, as one sentence, for a lane that
+ * cannot reach `declareRulebook` at all -- or `null` when no rules are
+ * configured, since then nothing was owed.
+ *
+ * `cause` names what stopped the lane (no API key or a client that would not
+ * build, in production; a training install that claims no rollouts, and so
+ * never registers). ONE sentence for both lanes, as `declareRulebook` is one
+ * step. A value that is no list of strings is named INSTEAD, by the same
+ * reader `registerRulebook` refuses it with: it would be refused once the
+ * cause is fixed too, and the Python SDK refuses it at startup before asking
+ * about credentials at all.
+ */
+export function rulesNeverSent(rules, cause) {
+  if (rules === null || rules === undefined) return null;
+  try {
+    rulebookRequestToWire(rules);
+  } catch (err) {
+    return rulebookRefusal(err);
+  }
+  return `${cause}, so the configured rules were never sent to the control plane.`;
+}
+
+/**
  * Declare the operator's `rules` once, after this agent's registration, and
  * say what happened. Resolves to the refusal sentence, or `null` when the
  * control plane registered them (or answered that they are already in force).
  *
- * THE ONE STEP BOTH LANES TAKE -- `capture.js:enrol` in production,
- * `registerRolloutDriver` in training -- so the two cannot send, log or
- * record a declaration differently.
+ * THE ONE STEP BOTH LANES TAKE -- `registerTurnCapture` in production (after
+ * the verdict read), `registerRolloutDriver` in training (after the
+ * registration) -- so the two cannot send, log or record a declaration
+ * differently. Neither lane puts it on a chain another call waits on.
  *
  * `null` RULES SEND NOTHING, which is not `[]`: an install that configures no
  * rules must not retract the rulebook another surface registered.

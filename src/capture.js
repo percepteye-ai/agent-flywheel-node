@@ -70,7 +70,7 @@ import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
 import { percepteyeHome } from "./session.js";
-import { AttachTransport, declareRulebook } from "./transport.js";
+import { AttachTransport, declareRulebook, rulesNeverSent } from "./transport.js";
 import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readTaskId, recordConversationId,
@@ -703,11 +703,14 @@ export const GATEWAY_STOP = "gateway_stop";
 /**
  * Subscribe production turn capture. Called only in production mode.
  *
- * Returns `{turns, uploader, root, transport, started, rulebookRefusal}`, or
- * `null` when nothing was wired. `transport` is null without an API key;
- * `started` is the registration chain, or null when there was nothing to
- * register; `rulebookRefusal` says why the configured `rules` were not
- * registered once `started` has settled (see `enrol`).
+ * Returns `{turns, uploader, root, transport, started, rulebook,
+ * rulebookRefusal}`, or `null` when nothing was wired. `transport` is null
+ * without an API key; `started` is the registration chain (registration, then
+ * the verdict read), or null when there was nothing to register; `rulebook` is
+ * the declaration of the configured `rules`, chained after `started` and null
+ * whenever `started` is; `rulebookRefusal` says why those rules are not
+ * registered -- at once when they could never be sent, otherwise once
+ * `rulebook` settles.
  *
  * CAPTURE RUNS WITHOUT A KEY; only UPLOADING needs one. That is the ordinary
  * first install -- local recording, no account, no traffic -- which is why the
@@ -734,9 +737,12 @@ export function registerTurnCapture(api, {
   // plugin load is three chances to be rate-limited on a cold start, and the
   // policy answer is not needed until the first turn arrives.
   let started = null;
-  // Why the operator's `rules` were not registered, settled once `started`
-  // resolves; null when they were, or when none are configured. The Python
-  // SDK's `Attachment.rulebook_refusal`.
+  // The operator's `rules`, declared once after `started` -- see below.
+  let rulebook = null;
+  // Why those rules are not registered; null when they were, or when none are
+  // configured. NAMED for every way they can go unsent -- no key, a client
+  // that would not build -- and otherwise settled by `rulebook`. The Python
+  // SDK's `Attachment.rulebook_refusal`, which names the same paths.
   let rulebookRefusal = null;
 
   // THE TURN OPENS, and this is the UNGATED half -- the only hook of the three
@@ -769,9 +775,18 @@ export function registerTurnCapture(api, {
       // A misconfigured control plane must not take local recording down with
       // it, and `register` must not throw -- the host treats that as a failed
       // plugin load.
+      //
+      // With no uploader nothing below registers, so the rules are never
+      // sent either -- said here, with this cause, rather than left null. The
+      // capture directory is named here too: the keyless line below, which
+      // names it otherwise, would say "no API key" of an install that has one.
+      rulebookRefusal = uploader ? null : rulesNeverSent(config.rules,
+        `the control plane could not be set up for this install ` +
+        `(${err?.message ?? err})`);
       logger?.warn?.(
         `[${pluginId}] captured turns will not be uploaded: ` +
-        `${err?.message ?? err}. Local recording is unaffected.`);
+        `${err?.message ?? err}. Local recording to ${root} is unaffected.` +
+        (rulebookRefusal ? ` ${sentence(rulebookRefusal)}` : ""));
     }
   }
 
@@ -807,14 +822,31 @@ export function registerTurnCapture(api, {
     // NOT AWAITED: `register()` must return to the host synchronously, and a
     // control plane that is slow or down must not delay a plugin load.
     started = enrol({ transport, config, pluginId, logger, declaration })
-      .then((enrolled) => {
-        rulebookRefusal = enrolled.rulebookRefusal;
-        return announce({ transport, uploader, config, pluginId, logger, env });
-      });
-  } else {
+      .then(() => announce({ transport, uploader, config, pluginId, logger, env }));
+    // THE RULES, after the verdict read and OFF the chain every other startup
+    // read waits on. `registerServingPolicy` reads the approved prompt and
+    // model behind `started`, and a rulebook route that is slow or down --
+    // four attempts of up to 30s each -- must not keep this install serving
+    // its own prompt meanwhile: the rules cost the rules and nothing else.
+    // The Python SDK's `attach()` declares them last, after its policy read,
+    // for the same reason. So this is the one startup call allowed to OVERLAP
+    // another -- it runs alongside the serving-policy read, not ahead of it --
+    // and what that costs is at most a retried 429 (the client honours
+    // Retry-After), where sequencing it ahead cost the approved prompt and
+    // model. After a registration, whatever its outcome: the rulebook belongs
+    // to the Product that declares this agent, not to the agent row.
+    // `declareRulebook` never rejects, so neither does this.
+    rulebook = started
+      .then(() => declareRulebook({
+        transport, rules: config.rules, pluginId, logger,
+      }))
+      .then((refusal) => { rulebookRefusal = refusal; });
+  } else if (!config.apiKey) {
+    rulebookRefusal = rulesNeverSent(config.rules, "no API key is configured");
     logger?.info?.(
       `[${pluginId}] capturing production turns to ${root}. No API key is ` +
-      `configured, so nothing is uploaded.`);
+      `configured, so nothing is uploaded.` +
+      (rulebookRefusal ? ` ${sentence(rulebookRefusal)}` : ""));
   }
 
   if (!answersExpected) {
@@ -832,9 +864,14 @@ export function registerTurnCapture(api, {
   // `transport` is handed out so the serving-policy read reuses THIS client
   // rather than constructing a second one against the same base URL and key.
   return {
-    turns, uploader, root, transport, started,
+    turns, uploader, root, transport, started, rulebook,
     get rulebookRefusal() { return rulebookRefusal; },
   };
+}
+
+/** A refusal sentence as the start of a log sentence. */
+function sentence(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /** The real control-plane transport. Replaced in tests, never in production. */
@@ -888,19 +925,17 @@ function defaultTransport(config) {
  *   process re-registering on every restart cannot erase what a training run
  *   established.
  *
- * THEN THE OPERATOR'S `rules`, when configured (`declareRulebook`), as their
- * own call on their own route -- never in this registration body. Resolves to
- * `{registered, rulebookRefusal}`: whether the registration landed, and the
- * sentence saying why the rules were not registered (null when they were, or
- * when none are configured).
+ * NOT THE OPERATOR'S `rules`. They are their own call on their own route,
+ * declared by `registerTurnCapture` after the verdict read and off the chain
+ * the other startup reads wait on -- so a rulebook route that is slow or down
+ * cannot hold back the verdict or the approved serving policy.
  *
  * NEVER REJECTS, and never throws into its caller. A refused or unreachable
  * control plane must not cost the verdict read, local capture (which needs no
  * account at all), or the plugin load -- the host treats a throw from
  * `register()` as a failed plugin load. The Python SDK's `attach()` splits the
  * same two calls for the same reason: a registration intake dislikes must not
- * also cost that process its policy read. A refused rulebook costs nothing
- * but the rules.
+ * also cost that process its policy read.
  *
  * NOT EXPORTED, unlike `announce` beside it. Its tests drive it through
  * `registerTurnCapture`, which is the path a customer actually gets, and this
@@ -951,18 +986,7 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
         `locally. Until a registration lands, no operator can enable upload ` +
         `for this agent, because the control has no agent to act on.`);
       return false;
-    })
-    // THE RULES, after the registration and whatever its outcome -- the
-    // rulebook belongs to the Product that declares this agent, not to the
-    // agent row, so a refused registration does not refuse it. Declared by
-    // the step the training lane takes too, which never rejects, so neither
-    // does this.
-    .then(async (registered) => ({
-      registered,
-      rulebookRefusal: await declareRulebook({
-        transport, rules: config.rules, pluginId, logger,
-      }),
-    }));
+    });
 }
 
 /**

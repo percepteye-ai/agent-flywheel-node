@@ -198,3 +198,35 @@ describe("bodies", () => {
     assert.equal(seen.length, 0, "an override reached fetch");
   });
 });
+
+describe("an error body is cut at 300 CODE POINTS, as Python's text[:300] cuts it", () => {
+  // Every path through `detail` that keeps the body's own text, not only the
+  // structured one: a UTF-16 `.slice(0, 300)` keeps fewer characters than
+  // Python wherever an astral character comes first, and can halve one.
+  const BOX = "\u{1f4e6}";
+
+  it("an unparseable (text/plain) body keeps exactly its first 300 code points", async () => {
+    // 400 code points, 600 UTF-16 units.
+    const body = BOX.repeat(200) + "x".repeat(200);
+    const { c } = client([{
+      status: 422, body, headers: { "content-type": "text/plain" },
+    }]);
+    await assert.rejects(() => c.request("POST", "/x"), (err) => {
+      assert.equal(err.message,
+        `POST /x -> HTTP 422: ${BOX.repeat(200)}${"x".repeat(100)}`);
+      return true;
+    });
+  });
+
+  it("a JSON body naming no detail key is kept whole under 300 code points", async () => {
+    // 211 code points, 411 UTF-16 units: a cut by units dropped its end.
+    const body = JSON.stringify({ note: BOX.repeat(200) });
+    const { c } = client([{
+      status: 422, body, headers: { "content-type": "application/json" },
+    }]);
+    await assert.rejects(() => c.request("POST", "/x"), (err) => {
+      assert.equal(err.message, `POST /x -> HTTP 422: ${body}`);
+      return true;
+    });
+  });
+});
