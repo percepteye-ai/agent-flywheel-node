@@ -8,6 +8,7 @@
  * `x-contract-version`, because two copies of a contract with no mechanism
  * keeping them in sync is not a contract.
  */
+import { jsonType } from "./declaration.js";
 import { isLowerSha256 } from "./execution-identity.js";
 
 export const CONTRACT_VERSION = "flywheel/1";
@@ -233,13 +234,13 @@ export function rulebookRequestToWire(rules) {
       : "";
     throw new ContractError(
       "rules must be a list of strings, one rule per string; got " +
-      `${jsonTypeName(rules)}${hint}`,
+      `${jsonType(rules)}${hint}`,
     );
   }
   rules.forEach((rule, index) => {
     if (typeof rule !== "string") {
       throw new ContractError(
-        `rule ${index} must be a string; got ${jsonTypeName(rule)}`,
+        `rule ${index} must be a string; got ${jsonType(rule)}`,
       );
     }
   });
@@ -285,13 +286,3 @@ export function rulebookReceiptFromWire(raw) {
 
 /** A list of field names as Python prints one, so both SDKs say it alike. */
 const pyList = (names) => `[${names.map((n) => `'${n}'`).join(", ")}]`;
-
-/** The Python type name of a JSON value, as `type(v).__name__` prints it. */
-function jsonTypeName(value) {
-  if (value === null || value === undefined) return "NoneType";
-  if (typeof value === "boolean") return "bool";
-  if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
-  if (typeof value === "string") return "str";
-  if (Array.isArray(value)) return "list";
-  return typeof value === "object" ? "dict" : typeof value;
-}

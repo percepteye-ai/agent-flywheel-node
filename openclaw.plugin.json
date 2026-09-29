@@ -145,7 +145,7 @@
         "description": "The agent's own description, for what this plugin cannot observe (OpenClaw's llm_input carries no tools): system_prompt, tools (the list the agent sends its model -- OpenAI function specs, Anthropic tools, or {name, description, input_schema, read_only}) and model (a name, or {model_name, provider, temperature, max_tokens}). What you declare wins where given; it anchors no execution identity."
       },
       "rules": {
-        "description": "The workflow rules this agent follows, one prose rule per string (a list of strings), registered after this agent registers as the rulebook of the one Product that declares it -- training guidance, never added to the served agent's prompt. Every start that sets it declares it again, so the last writer wins; [] retracts. Unset sends nothing and leaves the rulebook in force alone."
+        "description": "The workflow rules this agent follows, one prose rule per string (a list of strings), registered once per start, with an API key and capture on, as the rulebook of the one Product that declares it -- training guidance, never added to the served agent's prompt. Every start that sets it declares it again, so the last writer wins; [] retracts. Unset sends nothing and leaves the rulebook in force alone."
       }
     }
   },

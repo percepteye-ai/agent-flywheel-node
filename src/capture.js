@@ -70,7 +70,9 @@ import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
 import { percepteyeHome } from "./session.js";
-import { AttachTransport, declareRulebook, rulesNeverSent } from "./transport.js";
+import {
+  AttachTransport, declareRulebook, rulesNeverSent, sentence,
+} from "./transport.js";
 import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readTaskId, recordConversationId,
@@ -867,11 +869,6 @@ export function registerTurnCapture(api, {
     turns, uploader, root, transport, started, rulebook,
     get rulebookRefusal() { return rulebookRefusal; },
   };
-}
-
-/** A refusal sentence as the start of a log sentence. */
-function sentence(text) {
-  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /** The real control-plane transport. Replaced in tests, never in production. */

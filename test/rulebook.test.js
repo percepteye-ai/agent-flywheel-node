@@ -5,11 +5,13 @@
  * The rules reach the control plane on their own route
  * (`POST /agents/{id}/rulebook`), once per start, after the agent registers,
  * in production (`registerTurnCapture`, after the verdict read) and in
- * training (`registerRolloutDriver`) alike. A refused, slow or undeliverable
- * declaration costs the rules and nothing else -- never the registration, the
- * verdict read, the approved serving policy, a claim, or the plugin load --
- * and says why in `rulebookRefusal`, naming the control plane's own cause, or
- * the reason they were never sent at all.
+ * training (`registerRolloutDriver`) alike -- and at once from a training
+ * install that does not drive, since the route needs a key, not a worker.
+ * `[]` is sent as a retraction through every lane. A refused, slow or
+ * undeliverable declaration costs the rules and nothing else -- never the
+ * registration, the verdict read, the approved serving policy, a claim, or the
+ * plugin load -- and says why in `rulebookRefusal`, naming the control plane's
+ * own cause, or the reason they were never sent at all.
  *
  * The rules and products here are deliberately generic and obviously fake.
  * The golden idempotency keys were derived by the Python SDK's rule
@@ -183,13 +185,19 @@ describe("the declaration on the wire", () => {
   });
 
   it("refuses what cannot be a list of rules BEFORE sending anything, as Python does", async () => {
+    // Types are named in JSON's words -- the vocabulary `describe`'s
+    // refusals use in both SDKs (declaration.js `jsonType`) -- never in
+    // Python's: an operator wrote JSON, not `NoneType` or `dict`.
     for (const [rules, message] of [
       ["Always confirm the order number first.",
-        "rules must be a list of strings, one rule per string; got str " +
+        "rules must be a list of strings, one rule per string; got string " +
         "(a single string is one rule: pass it inside a list)"],
-      [{ rules: [] }, "rules must be a list of strings, one rule per string; got dict"],
-      [["Confirm the order number first, always.", 7], "rule 1 must be a string; got int"],
-      [[null], "rule 0 must be a string; got NoneType"],
+      [{ rules: [] }, "rules must be a list of strings, one rule per string; got object"],
+      [["Confirm the order number first, always.", 7], "rule 1 must be a string; got number"],
+      [["Confirm the order number first, always.", 1.5], "rule 1 must be a string; got number"],
+      [[null], "rule 0 must be a string; got null"],
+      [[true], "rule 0 must be a string; got boolean"],
+      [[["Confirm the order number first, always."]], "rule 0 must be a string; got array"],
     ]) {
       const c = recordingClient();
       await assert.rejects(
@@ -208,6 +216,14 @@ describe("the declaration on the wire", () => {
         "'version', 'content_sha256', 'parent_sha256', 'rule_count']"],
       [{ ...RECEIPT, version: 0, content_sha256: "A".repeat(64) },
         "RulebookReceipt carries invalid field(s): ['version', 'content_sha256']"],
+      // One row per field check, so each is pinned on its own: a receipt
+      // Python refuses as unreadable must not read as registered here.
+      [{ ...RECEIPT, product_id: "" },
+        "RulebookReceipt carries invalid field(s): ['product_id']"],
+      [{ ...RECEIPT, version_id: 7 },
+        "RulebookReceipt carries invalid field(s): ['version_id']"],
+      [{ ...RECEIPT, parent_sha256: "B".repeat(64) },
+        "RulebookReceipt carries invalid field(s): ['parent_sha256']"],
       [{}, "RulebookReceipt missing required field(s): ['status', 'product_id', " +
         "'version_id', 'version', 'content_sha256', 'parent_sha256', 'rule_count']"],
     ]) {
@@ -399,6 +415,16 @@ describe("the production lane declares the rules after registering", () => {
       assert.match(out.rulebookRefusal, /a single string is one rule: pass it inside a list/);
       assert.ok(warns.some((w) => w.includes(out.rulebookRefusal)));
       assert.equal(out.uploader.mayUpload, true);
+    } finally { cleanup(); }
+  });
+
+  it("[] is a retraction, sent as one -- never nothing", async () => {
+    const tr = productionTransport();
+    const { out, cleanup } = wireProduction(tr, { rules: [] });
+    try {
+      await out.rulebook;
+      assert.deepEqual(tr.calls, ["register", "captureCurrent", "registerRulebook"]);
+      assert.deepEqual(tr.declared, [[]]);
     } finally { cleanup(); }
   });
 
@@ -624,7 +650,7 @@ function wireTraining(transport, config = {}, api = trainingApi()) {
   return { driver, api };
 }
 
-describe("the training lane declares the rules after registering", () => {
+describe("the training lane declares the rules after registering, or at once when it does not drive", () => {
   it("health, registration, then the rules -- once", async () => {
     const tr = trainingTransport();
     const { driver } = wireTraining(tr, { rules: RULES });
@@ -675,35 +701,69 @@ describe("the training lane declares the rules after registering", () => {
     assert.deepEqual(tr.order, ["health", "register", "registerRulebook"]);
   });
 
-  it("a lane that never registers says the rules were never sent either", () => {
+  // A lane that does not DRIVE still has what the rulebook route needs -- a
+  // key and a client. The conversation opt-in and an injection API gate the
+  // claiming, not the rules: production declares them whatever its
+  // registration's outcome, and so does this lane, without registering.
+  it("a lane that does not drive still declares the rules -- the route needs a key, not a worker", async () => {
     const tr = trainingTransport();
     const api = trainingApi({ conversationAccess: false });
     const { driver } = wireTraining(tr, { rules: RULES }, api);
     assert.equal(driver, null);
-    assert.deepEqual(tr.order, []);
-    assert.ok(api.logs.includes(
-      `[${PLUGIN_ID}] this install registers only to claim rollouts, and it ` +
-      "claims none, so the configured rules were never sent to the control plane."),
+    await settle();
+    assert.deepEqual(tr.order, ["registerRulebook"],
+      "the rules were withheld, or a worker that claims nothing registered");
+    assert.deepEqual(tr.declared, [RULES]);
+    assert.ok(api.logs.some((l) => l.includes(
+      "declared this agent's workflow rules for its Product: registered")),
       `the operator was not told: ${api.logs.join(" | ")}`);
+    assert.ok(!api.logs.some((l) => l.includes("never sent")),
+      `a line claimed the rules went unsent: ${api.logs.join(" | ")}`);
   });
 
-  it("a lane with no injection API says so too, and names a malformed value as malformed", () => {
+  it("a lane with no injection API declares them too, and names a malformed value as malformed", async () => {
     const tr = trainingTransport();
     const api = trainingApi();
     delete api.session;
     const { driver } = wireTraining(tr, { rules: "Always confirm the order number first." }, api);
     assert.equal(driver, null);
+    await settle();
+    assert.deepEqual(tr.order, ["registerRulebook"]);
     assert.ok(api.logs.some((l) => l.includes(
       "a single string is one rule: pass it inside a list")),
       `the malformed value was not named: ${api.logs.join(" | ")}`);
   });
 
-  it("a lane that never registers and has no rules names none", () => {
-    const api = trainingApi({ conversationAccess: false });
-    const { driver } = wireTraining(trainingTransport(), {}, api);
+  it("a lane with no API key says the rules were never sent, and why", async () => {
+    const api = trainingApi();
+    const { driver } = wireTraining(null, { apiKey: undefined, rules: RULES }, api);
     assert.equal(driver, null);
+    assert.ok(api.logs.includes(
+      `[${PLUGIN_ID}] no API key is configured, so the configured rules were ` +
+      "never sent to the control plane."),
+      `the operator was not told: ${api.logs.join(" | ")}`);
+  });
+
+  it("a lane that does not drive and has no rules sends and names none", async () => {
+    const tr = trainingTransport();
+    const api = trainingApi({ conversationAccess: false });
+    const { driver } = wireTraining(tr, {}, api);
+    assert.equal(driver, null);
+    await settle();
+    assert.deepEqual(tr.order, []);
     assert.ok(!api.logs.some((l) => l.includes("rules")),
       `a line named rules nobody configured: ${api.logs.join(" | ")}`);
+  });
+
+  it("[] is a retraction, sent as one -- never nothing, driving or not", async () => {
+    const tr = trainingTransport();
+    const { driver } = wireTraining(tr, { rules: [] });
+    await driver.rulebook;
+    assert.deepEqual(tr.declared, [[]]);
+    const idle = trainingTransport();
+    wireTraining(idle, { rules: [] }, trainingApi({ conversationAccess: false }));
+    await settle();
+    assert.deepEqual(idle.declared, [[]]);
   });
 });
 
@@ -714,7 +774,9 @@ describe("the training lane declares the rules after registering", () => {
  * scripted `globalThis.fetch` (the client captures it at construction; there
  * is no other seam through `register`, as policy.test.js explains).
  */
-async function throughRegister({ mode, rulebookStatus = 200, rulebookBody = RECEIPT }) {
+async function throughRegister({
+  mode, rulebookStatus = 200, rulebookBody = RECEIPT, rules = RULES,
+}) {
   const root = mkdtempSync(join(tmpdir(), "pe-rulebook-e2e-"));
   const realFetch = globalThis.fetch;
   const requests = [];
@@ -729,7 +791,7 @@ async function throughRegister({ mode, rulebookStatus = 200, rulebookBody = RECE
   };
   try {
     const api = trainingApi();
-    const out = register(api, { apiKey: "pefw_x", agentId: "support", rules: RULES }, {
+    const out = register(api, { apiKey: "pefw_x", agentId: "support", rules }, {
       PERCEPTEYE_AGENT_MODE: mode, PERCEPTEYE_CAPTURE_DIR: root,
       PERCEPTEYE_HOME: root,
     });
@@ -793,6 +855,17 @@ describe("from register(), the path an operator actually gets", () => {
       assert.equal(handle.rulebookRefusal, null);
     });
 
+    it(`${mode}: rules: [] in the plugin config is sent as a retraction, never as nothing`, async () => {
+      const { out, requests } = await throughRegister({
+        mode, rules: [],
+        rulebookBody: { ...RECEIPT, status: "retracted", version: 3, rule_count: 0 },
+      });
+      const declared = requests.filter((r) => r.path.endsWith("/rulebook"));
+      assert.deepEqual(declared.map((r) => r.body), ["{\"rules\":[]}"]);
+      const handle = mode === "production" ? out.capture : out.rollouts;
+      assert.equal(handle.rulebookRefusal, null);
+    });
+
     it(`${mode}: a refusal from the control plane lands on the handle, named`, async () => {
       const { out } = await throughRegister({
         mode, rulebookStatus: 409, rulebookBody: UNATTRIBUTED,
@@ -802,4 +875,59 @@ describe("from register(), the path an operator actually gets", () => {
       assert.match(handle.rulebookRefusal, /ambiguous_shared_agent/);
     });
   }
+
+  /** `register()` against a scripted fetch, with the host api given. */
+  async function registerWith(api, pluginConfig, env) {
+    const root = mkdtempSync(join(tmpdir(), "pe-rulebook-e2e-"));
+    const realFetch = globalThis.fetch;
+    const requests = [];
+    globalThis.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      requests.push({ method: init.method, path, body: init.body ?? null });
+      return path.endsWith("/rulebook") ? json(200, RECEIPT) : json(200, {});
+    };
+    try {
+      const out = register(api, { apiKey: "pefw_x", agentId: "support", ...pluginConfig }, {
+        PERCEPTEYE_CAPTURE_DIR: root, PERCEPTEYE_HOME: root, ...env,
+      });
+      for (let i = 0; i < 50 && !requests.length; i += 1) await settle();
+      await settle();
+      return { out, requests };
+    } finally {
+      globalThis.fetch = realFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it("training without the conversation opt-in claims nothing and still declares the rules", async () => {
+    const api = trainingApi({ conversationAccess: false });
+    const { out, requests } = await registerWith(api, { rules: RULES }, {
+      PERCEPTEYE_AGENT_MODE: "training",
+    });
+    assert.equal(out.rollouts, null);
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.path}`),
+      ["POST /api/flywheel/v1/agents/support/rulebook"]);
+    assert.equal(requests[0].body, JSON.stringify({ rules: RULES }));
+  });
+
+  it("capture disabled: nothing is sent, and the startup line says the rules were not", async () => {
+    for (const [pluginConfig, env] of [
+      [{ rules: RULES, capture: false }, { PERCEPTEYE_AGENT_MODE: "production" }],
+      [{ rules: RULES }, { PERCEPTEYE_AGENT_MODE: "training", PERCEPTEYE_CAPTURE: "0" }],
+    ]) {
+      const api = trainingApi();
+      const { out, requests } = await registerWith(api, pluginConfig, env);
+      assert.equal(out, null);
+      assert.deepEqual(requests, []);
+      const line = api.logs.find((l) => l.includes("capture is disabled by configuration"));
+      assert.ok(line?.endsWith(
+        " This install registers nothing while capture is disabled, so the " +
+        "configured rules were never sent to the control plane."),
+        `the operator was not told: ${api.logs.join(" | ")}`);
+    }
+    const api = trainingApi();
+    await registerWith(api, { capture: false }, { PERCEPTEYE_AGENT_MODE: "production" });
+    assert.ok(!api.logs.some((l) => l.includes("rules")),
+      `a line named rules nobody configured: ${api.logs.join(" | ")}`);
+  });
 });

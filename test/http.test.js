@@ -5,7 +5,7 @@
  */
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { ControlPlaneClient } from "../src/http.js";
+import { ControlPlaneClient, cut } from "../src/http.js";
 import { LeaseLost, TransportError } from "../src/errors.js";
 
 /** A fetch stub that replays a scripted sequence and records what it saw. */
@@ -228,5 +228,28 @@ describe("an error body is cut at 300 CODE POINTS, as Python's text[:300] cuts i
       assert.equal(err.message, `POST /x -> HTTP 422: ${body}`);
       return true;
     });
+  });
+
+  it("reads no further into a body than the 300 code points it keeps", () => {
+    // Every refused and retried attempt cuts its body, and an error body can
+    // be megabytes: a cut that spread the whole body into one string per
+    // character paid heap in proportion to it, on every attempt. Pinned on
+    // what is READ, which a timing could not pin: this body refuses to be
+    // read past its 301st code point (the one the loop stops on).
+    let pulled = 0;
+    const endless = {
+      *[Symbol.iterator]() {
+        for (;;) {
+          pulled += 1;
+          if (pulled > 301) throw new Error(`read code point ${pulled}`);
+          yield BOX;
+        }
+      },
+    };
+    assert.equal(cut(endless), BOX.repeat(300));
+    assert.equal(pulled, 301);
+    const huge = BOX.repeat(2_000_000);
+    assert.equal(cut(huge), BOX.repeat(300));
+    assert.equal(cut("short"), "short");
   });
 });

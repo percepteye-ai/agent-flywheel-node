@@ -90,6 +90,11 @@ test("the schema accepts the settings the manifest tells customers to set", () =
   // the host refuse the whole plugin load -- local capture included -- over a
   // malformed rule list the control plane would have refused and named.
   assert.equal("type" in plugin.configSchema.properties.rules, false);
+  // And carried as given: `[]` is a retraction, which is not unset (null,
+  // sends nothing). Reading an empty list as unset would leave the rules an
+  // operator retracted in force.
+  assert.deepEqual(resolveConfig({ rules: [] }).rules, []);
+  assert.equal(resolveConfig({}).rules, null);
   const startup = plugin.configSchema.properties.executionSnapshot
     .properties.startupObservation;
   assert.deepEqual(

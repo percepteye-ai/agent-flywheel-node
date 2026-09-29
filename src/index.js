@@ -75,7 +75,7 @@ import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
 import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
 import { ControlPlaneClient } from "./http.js";
-import { AttachTransport } from "./transport.js";
+import { AttachTransport, rulesNeverSent, sentence } from "./transport.js";
 import { PRODUCTION, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
@@ -213,10 +213,16 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
   if (!config.captureEnabled) {
+    // Nothing below runs, so configured `rules` are never declared either --
+    // said here, by the sentence every such path uses, or an operator who
+    // switched capture off would believe the Product's rulebook was updated.
+    const unsent = rulesNeverSent(
+      config.rules, "this install registers nothing while capture is disabled",
+    );
     logger?.info?.(
       `[${PLUGIN_ID}] capture is disabled by configuration; recording nothing. ` +
       `Unset PERCEPTEYE_CAPTURE (or plugins.entries.${PLUGIN_ID}.config.capture) ` +
-      `to re-enable.`,
+      `to re-enable.` + (unsent ? ` ${sentence(unsent)}` : ""),
     );
     return null;
   }

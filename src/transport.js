@@ -163,13 +163,15 @@ export function rulebookRefusal(err) {
 }
 
 /**
- * Why the configured `rules` were never SENT, as one sentence, for a lane that
- * cannot reach `declareRulebook` at all -- or `null` when no rules are
+ * Why the configured `rules` were never SENT, as one sentence, for an install
+ * that cannot reach `declareRulebook` at all -- or `null` when no rules are
  * configured, since then nothing was owed.
  *
- * `cause` names what stopped the lane (no API key or a client that would not
- * build, in production; a training install that claims no rollouts, and so
- * never registers). ONE sentence for both lanes, as `declareRulebook` is one
+ * The declaration needs a key and a control-plane client, and nothing else:
+ * so `cause` names which of those is missing (no API key, in either lane; a
+ * client that would not build, in production), or that the operator switched
+ * the whole plugin off (`capture` disabled, where `index.js` registers
+ * nothing). ONE sentence for every such path, as `declareRulebook` is one
  * step. A value that is no list of strings is named INSTEAD, by the same
  * reader `registerRulebook` refuses it with: it would be refused once the
  * cause is fixed too, and the Python SDK refuses it at startup before asking
@@ -185,6 +187,11 @@ export function rulesNeverSent(rules, cause) {
   return `${cause}, so the configured rules were never sent to the control plane.`;
 }
 
+/** A refusal sentence as the start of a sentence in a longer log line. */
+export function sentence(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 /**
  * Declare the operator's `rules` once, after this agent's registration, and
  * say what happened. Resolves to the refusal sentence, or `null` when the
@@ -192,7 +199,8 @@ export function rulesNeverSent(rules, cause) {
  *
  * THE ONE STEP BOTH LANES TAKE -- `registerTurnCapture` in production (after
  * the verdict read), `registerRolloutDriver` in training (after the
- * registration) -- so the two cannot send, log or record a declaration
+ * registration, or at once when the install does not drive: the route needs
+ * a key, not a worker) -- so the two cannot send, log or record a declaration
  * differently. Neither lane puts it on a chain another call waits on.
  *
  * `null` RULES SEND NOTHING, which is not `[]`: an install that configures no

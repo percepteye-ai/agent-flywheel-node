@@ -183,8 +183,9 @@ export const CONFIG_SCHEMA = {
     rules: {
       description:
         "The workflow rules this agent follows, one prose rule per string " +
-        "(a list of strings), registered after this agent registers as the " +
-        "rulebook of the one Product that declares it -- training guidance, " +
+        "(a list of strings), registered once per start, with an API key " +
+        "and capture on, as the rulebook of the one Product that declares " +
+        "it -- training guidance, " +
         "never added to the served agent's prompt. Every start that sets it " +
         "declares it again, so the last writer wins; [] retracts. Unset sends " +
         "nothing and leaves the rulebook in force alone.",

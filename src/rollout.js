@@ -805,7 +805,9 @@ export function createRolloutDriver({
  *
  * Returns `null` when this install must not drive, having said why once. The
  * caller does not branch on mode -- `index.js` decides that -- so there is one
- * place where "may this install claim work" is answered.
+ * place where "may this install claim work" is answered. An install that does
+ * not drive still declares the configured `rules` when it has a transport;
+ * with no handle to carry the outcome, its log line is the record.
  */
 export function registerRolloutDriver(api, {
   config, transport, pluginId, logger = null, executionIdentity = null,
@@ -816,22 +818,28 @@ export function registerRolloutDriver(api, {
   env = process.env,
   declaration = null,
 }) {
-  // The configured `rules` follow this lane's registration, so a lane that
-  // never registers never sends them -- said, by the sentence the production
-  // lane uses for the same question (`rulesNeverSent`), rather than left for
-  // the operator to find missing from the Product. No handle carries it: this
-  // function returns none on either path below.
-  const rulesUnsent = () => {
-    const unsent = rulesNeverSent(
-      config?.rules,
-      "this install registers only to claim rollouts, and it claims none",
-    );
+  // THE CONFIGURED `rules` ON A LANE THAT DOES NOT DRIVE. What stops this
+  // install claiming -- the conversation-access opt-in, an injection API --
+  // is not what the rulebook route needs: that is a key and a client, and the
+  // Product comes from this agent's binding, not from a worker row (the
+  // production lane declares them whatever its registration's outcome, for
+  // the same reason). So with a transport they are declared here, at once, by
+  // the one step (`declareRulebook`, which never rejects and logs what
+  // happened); without one they were never sent, and that is said by the
+  // sentence every such path uses (`rulesNeverSent`). No handle carries it:
+  // this function returns none on either path below.
+  const declareWithoutDriving = () => {
+    if (transport) {
+      declareRulebook({ transport, rules: config?.rules, pluginId, logger });
+      return;
+    }
+    const unsent = rulesNeverSent(config?.rules, "no API key is configured");
     if (unsent) logger?.info?.(`[${pluginId}] ${unsent}`);
   };
   const verdict = driveVerdict(config, api, pluginId);
   if (!verdict.canDrive) {
     logger?.info?.(`[${pluginId}] not claiming rollouts: ${verdict.reason}`);
-    rulesUnsent();
+    declareWithoutDriving();
     return null;
   }
   const enqueueFn = api?.session?.workflow?.enqueueNextTurnInjection
@@ -841,7 +849,7 @@ export function registerRolloutDriver(api, {
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
       `claimed task could not be delivered to the agent. Not claiming.`,
     );
-    rulesUnsent();
+    declareWithoutDriving();
     return null;
   }
 

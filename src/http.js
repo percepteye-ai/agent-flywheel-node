@@ -85,8 +85,22 @@ function retryAfterMs(response) {
  * `.slice` kept fewer characters wherever an emoji or other astral character
  * came first -- so the same answer read shorter here -- and could cut one in
  * half.
+ *
+ * READS NO FURTHER THAN IT KEEPS. Every refused and retried attempt passes
+ * its body through here, and an error body can be an HTML page or a dump of
+ * megabytes: spreading all of it into one string per character to keep 300
+ * cost the gateway process heap in proportion to the body, on every attempt.
  */
-const cut = (text) => [...text].slice(0, 300).join("");
+export function cut(text) {
+  let out = "";
+  let kept = 0;
+  for (const character of text) {
+    if (kept === 300) break;
+    out += character;
+    kept += 1;
+  }
+  return out;
+}
 
 async function detail(response) {
   let text = "";

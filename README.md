@@ -37,16 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 633 was true on 2026-09-28 (it had drifted to 596, 490, and before
-     that 373, while the suite grew). Re-derive with `npm test` (prints
-     "tests 633" / "skipped 0")
+     its 652 was true on 2026-09-28 (it had drifted to 633, 596, 490, and
+     before that 373, while the suite grew). Re-derive with `npm test` (prints
+     "tests 652" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-633_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-652_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -363,10 +363,10 @@ It is the Python SDK's `describe=`, read by the same rules, and a cross-language
 ] } } } }
 ```
 
-- **Declared once per start**, after this agent registers, on their own route (`POST /agents/{id}/rulebook`) — never inside the registration and never in `describe`. That is every keyed production install (after its verdict read, and never ahead of the approved serving policy: a rulebook route that is slow or down delays nothing else), and a training install that drives rollouts. An install that cannot send them — no API key, a control plane that could not be set up, a training install that does not drive — says so at startup. It is the Python SDK's `rules=`, and the two send the same bytes under the same idempotency key.
+- **Declared once per start**, on their own route (`POST /agents/{id}/rulebook`) — never inside the registration and never in `describe`. The route needs an API key and nothing else, so that is every keyed install with capture on: in production after the agent registers and reads its verdict (and never ahead of the approved serving policy: a rulebook route that is slow or down delays nothing else); in training after the agent registers when it drives rollouts, and at once when it does not (no conversation-access opt-in, no injection API). An install that cannot send them — no API key, a control plane that could not be set up, `capture` disabled — says so at startup. It is the Python SDK's `rules=`, and the two send the same bytes under the same idempotency key.
 - **The last writer wins.** Every start that sets `rules` declares them again: the same rules change nothing, different rules become a new version. Leaving `rules` unset sends nothing and leaves whatever is in force alone; `[]` retracts it. A Product admin can also set them through Mission Control's API (`PUT /api/v2/products/{product_id}/rulebook`), and both writes are kept in the Product's history.
 - **The control plane decides what a rule may be**, and says which rule it refused and why; this plugin refuses only a value that is not a list of strings, before sending anything. The agent must be declared by exactly one Product, or nothing is written.
-- **A refused declaration does not stop the plugin**: it costs the rules and nothing else, and the warning names the cause — also readable as `rulebookRefusal` on the handle `register()` returns (`capture` in production, where it also names why rules were never sent; `rollouts` in training). The config schema accepts any `rules` value for the same reason it accepts any `describe`.
+- **A refused declaration does not stop the plugin**: it costs the rules and nothing else, and the warning names the cause — also readable as `rulebookRefusal` on the handle `register()` returns (`capture` in production, where it also names why rules were never sent; `rollouts` in a training install that drives — one that does not returns no handle, so its startup line is the record). The config schema accepts any `rules` value for the same reason it accepts any `describe`.
 
 Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
 
@@ -404,7 +404,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 633 tests, no install step — node:test, zero dependencies
+npm test     # 652 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

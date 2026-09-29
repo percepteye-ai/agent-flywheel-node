@@ -85,8 +85,13 @@ function isMapping(v) {
   return proto === Object.prototype || proto === null;
 }
 
-/** The JSON type a refusal names: one vocabulary both SDKs print alike. */
-function jsonType(v) {
+/**
+ * The JSON type a refusal names: one vocabulary both SDKs print alike (the
+ * Python SDK's `declaration._json_type`). Every refusal in this package that
+ * names a value's type asks this one -- `describe` here, `rules` in
+ * `wire.js` -- so an operator reads "got null", never a Python spelling.
+ */
+export function jsonType(v) {
   if (v === null || v === undefined) return "null";
   if (typeof v === "boolean") return "boolean";
   if (typeof v === "number") return "number";
