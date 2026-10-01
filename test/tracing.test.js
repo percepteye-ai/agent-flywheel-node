@@ -14,7 +14,9 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   MAX_ATTRIBUTE_CHARS,
@@ -252,42 +254,178 @@ describe("the projection is actually WIRED, not merely present", () => {
   });
 });
 
+// ── the recorder: which ids a tool call is stamped with ─────────────────────
+
+/**
+ * One tool call through the recorder, with the mode given to it (`mode`, as
+ * the plugin config passes it) and/or set in the environment (`env`;
+ * `undefined` unsets it). Returns the span's attributes.
+ */
+async function recordOne({ mode = null, env, rolloutFor = null, ctx, identity = null }) {
+  const { createRecorder } = await import("../src/record.js");
+  const prior = process.env.PERCEPTEYE_AGENT_MODE;
+  const t = fakeTracer();
+  __resetTracerForTests(t, { SpanStatusCode: { ERROR: 2 } });
+  if (env === undefined) delete process.env.PERCEPTEYE_AGENT_MODE;
+  else process.env.PERCEPTEYE_AGENT_MODE = env;
+  try {
+    createRecorder({
+      writer: { write: () => true }, mode, rolloutFor,
+      executionIdentity: identity,
+    }).handle(
+      { toolName: "book", params: { day: "tue" }, toolCallId: "call_9",
+        result: { id: 7 }, durationMs: 42 },
+      ctx,
+    );
+    assert.equal(t.spans.length, 1);
+    return t.spans[0].attributes;
+  } finally {
+    __resetTracerForTests();
+    if (prior === undefined) delete process.env.PERCEPTEYE_AGENT_MODE;
+    else process.env.PERCEPTEYE_AGENT_MODE = prior;
+  }
+}
+
 describe("which id a tool call is stamped with", () => {
   /**
    * The bug the two ids exist to prevent: a production turn stamped as a
    * rollout, which makes a customer's own telemetry unable to answer "how
    * much of my traffic was training" — every served turn looks like
-   * contributed work. Python guards it by REQUIRING the kind rather than
-   * defaulting it; Node resolves it from the mode, so the mode must be
-   * pinned here or the same defect reappears with a green suite.
+   * contributed work, and a consumer that drops self-emitted spans drops
+   * every production tool call. Python decides by the scope's kind and
+   * stamps the control plane's rollout id; Node must do the same.
    */
-  async function spanFor(mode) {
-    const { createRecorder } = await import("../src/record.js");
-    const prior = process.env.PERCEPTEYE_AGENT_MODE;
-    const t = fakeTracer();
-    __resetTracerForTests(t, { SpanStatusCode: { ERROR: 2 } });
-    process.env.PERCEPTEYE_AGENT_MODE = mode;
-    try {
-      createRecorder({ writer: { write: () => true } }).handle(
-        { toolName: "book", params: {}, result: {} }, { runId: "scope_1" },
-      );
-      return t.spans[0].attributes;
-    } finally {
-      __resetTracerForTests();
-      if (prior === undefined) delete process.env.PERCEPTEYE_AGENT_MODE;
-      else process.env.PERCEPTEYE_AGENT_MODE = prior;
-    }
-  }
+  const CTX = { runId: "run_1", sessionKey: "agent:main:slack:c1",
+                agentId: "main", taskId: "case-3" };
 
-  it("production traffic is a TURN, never a rollout", async () => {
-    const a = await spanFor("production");
+  it("production traffic from the ENVIRONMENT is a TURN, never a rollout", async () => {
+    const a = await recordOne({ env: "production", ctx: { runId: "scope_1" } });
     assert.equal(a["percepteye.turn.id"], "scope_1");
     assert.equal("percepteye.rollout.id" in a, false);
   });
 
-  it("training traffic is a ROLLOUT, never a turn", async () => {
-    const a = await spanFor("training");
-    assert.equal(a["percepteye.rollout.id"], "scope_1");
+  it("a production mode from the PLUGIN CONFIG is honoured with the env unset", async () => {
+    // THE P0 DEFECT: the recorder read only PERCEPTEYE_AGENT_MODE, so with the
+    // mode set in the plugin config and the variable unset it fell back to
+    // training and stamped the host's run id as a rollout id.
+    const a = await recordOne({ mode: "production", env: undefined, ctx: CTX });
+    assert.equal("percepteye.rollout.id" in a, false);
+    assert.equal(a["percepteye.turn.id"], "run_1");
+  });
+
+  it("the plugin config's mode outranks the environment's", async () => {
+    const a = await recordOne({ mode: "production", env: "training", ctx: CTX });
+    assert.equal("percepteye.rollout.id" in a, false);
+    assert.equal(a["percepteye.turn.id"], "run_1");
+  });
+
+  it("a production tool call carries its conversation, task and identity", async () => {
+    const sha = "b".repeat(64);
+    const a = await recordOne({
+      mode: "production", ctx: CTX,
+      identity: { fingerprintFor: () => ({ execution_sha256: sha }) },
+    });
+    assert.equal(a["percepteye.conversation.id"], "agent:main:slack:c1");
+    assert.equal(a["percepteye.task.id"], "case-3");
+    assert.equal(a["percepteye.agent.execution_sha256"], sha);
+  });
+
+  it("a training rollout carries the CONTROL PLANE's rollout id, not the run id", async () => {
+    const a = await recordOne({
+      mode: "training", ctx: CTX,
+      identity: { fingerprintFor: () => ({ execution_sha256: "c".repeat(64) }) },
+      rolloutFor: (ctx) => (ctx.sessionKey === CTX.sessionKey
+        ? { rolloutId: "rl_mc_77" } : null),
+    });
+    assert.equal(a["percepteye.rollout.id"], "rl_mc_77");
     assert.equal("percepteye.turn.id" in a, false);
+    // A rollout carries no production correlation, as in Python's serve().
+    assert.equal("percepteye.conversation.id" in a, false);
+    assert.equal("percepteye.task.id" in a, false);
+    assert.equal("percepteye.agent.execution_sha256" in a, false);
+  });
+
+  it("a training install's ordinary session is the customer's own turn", async () => {
+    const a = await recordOne({ mode: "training", ctx: CTX, rolloutFor: () => null });
+    assert.equal("percepteye.rollout.id" in a, false);
+    assert.equal(a["percepteye.turn.id"], "run_1");
+  });
+
+  it("the plugin hands the recorder its CONFIG mode", async () => {
+    // Wiring, not the unit: register the plugin with production in its config
+    // and PERCEPTEYE_AGENT_MODE unset, fire after_tool_call, read the span.
+    const { default: plugin, HOOK_NAME } = await import("../src/index.js");
+    const hooks = {};
+    const api = { on: (name, fn) => { (hooks[name] ??= []).push(fn); } };
+    const prior = process.env.PERCEPTEYE_AGENT_MODE;
+    delete process.env.PERCEPTEYE_AGENT_MODE;
+    const t = fakeTracer();
+    __resetTracerForTests(t, { SpanStatusCode: { ERROR: 2 } });
+    try {
+      plugin.register(api, { mode: "production" }, {
+        PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "pe-cap-")),
+      });
+      for (const fn of hooks[HOOK_NAME]) {
+        fn({ toolName: "book", params: {}, runId: "run_5" },
+           { runId: "run_5", sessionKey: "s1" });
+      }
+      const span = t.spans.find((s) => s.name === "execute_tool book");
+      assert.ok(span, "no tool span was emitted");
+      assert.equal("percepteye.rollout.id" in span.attributes, false);
+      assert.equal(span.attributes["percepteye.turn.id"], "run_5");
+      // Read as training, a production call also loses its production
+      // correlation -- the conversation its turn belongs to.
+      assert.equal(span.attributes["percepteye.conversation.id"], "s1");
+    } finally {
+      __resetTracerForTests();
+      if (prior !== undefined) process.env.PERCEPTEYE_AGENT_MODE = prior;
+    }
+  });
+});
+
+describe("the plugin wires the rollout driver to the recorder", () => {
+  it("a tool call in a claimed rollout's session carries that rollout's id", async () => {
+    const { default: plugin, HOOK_NAME, PLUGIN_ID } = await import("../src/index.js");
+    const hooks = {};
+    const api = {
+      on: (name, fn) => { (hooks[name] ??= []).push(fn); },
+      config: { plugins: { entries: {
+        [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
+      session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+      logger: { info() {}, warn() {} },
+    };
+    const t = fakeTracer();
+    __resetTracerForTests(t, { SpanStatusCode: { ERROR: 2 } });
+    try {
+      const out = plugin.register(api, {
+        mode: "training", apiKey: "pefw_test",
+        // Refused at once: nothing in this test may reach a real control plane.
+        controlPlaneUrl: "http://127.0.0.1:9/api/flywheel/v1",
+      }, { PERCEPTEYE_TRAJECTORY_DIR: "" });
+      assert.ok(out.rollouts, "the rollout driver was not constructed");
+      out.rollouts.track("s1", { rolloutId: "rl_mc_9" });
+      try {
+        for (const fn of hooks[HOOK_NAME]) {
+          fn({ toolName: "book", params: {}, runId: "run_host_1" },
+             { runId: "run_host_1", sessionKey: "s1" });
+          // The same install's OTHER session holds no rollout: its calls are
+          // the customer's own.
+          fn({ toolName: "lookup", params: {}, runId: "run_host_2" },
+             { runId: "run_host_2", sessionKey: "s2" });
+        }
+      } finally {
+        out.rollouts.inFlight.delete("s1");
+      }
+      const span = t.spans.find((s) => s.name === "execute_tool book");
+      assert.ok(span, "no tool span was emitted");
+      assert.equal(span.attributes["percepteye.rollout.id"], "rl_mc_9");
+      assert.equal("percepteye.turn.id" in span.attributes, false);
+      const other = t.spans.find((s) => s.name === "execute_tool lookup");
+      assert.ok(other, "no tool span was emitted for the other session");
+      assert.equal("percepteye.rollout.id" in other.attributes, false);
+      assert.equal(other.attributes["percepteye.turn.id"], "run_host_2");
+    } finally {
+      __resetTracerForTests();
+    }
   });
 });

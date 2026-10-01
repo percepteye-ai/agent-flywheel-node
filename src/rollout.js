@@ -782,13 +782,26 @@ export function createRolloutDriver({
     return rollout;
   }
 
+  /**
+   * The rollout this driver claimed for a host context's session, or null.
+   *
+   * What makes a tool call OUR work rather than the customer's: its span
+   * carries this rollout's control-plane id. The host's run id names a turn,
+   * not a rollout, and stamping it as one told a consumer every call was ours.
+   * Keyed exactly as every other hook here keys a session.
+   */
+  function rolloutFor(ctx = {}) {
+    const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
+    return sessionKey ? (inFlight.get(sessionKey) ?? null) : null;
+  }
+
   // `track` and `giveBack` are what the UNATTENDED runner needs: it does its
   // own claiming and turn-starting, but reporting and typed abandon must stay
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
   return {
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
-    onBeforeToolCall,
+    onBeforeToolCall, rolloutFor,
     onModelCallStarted, onModelCallEnded,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,

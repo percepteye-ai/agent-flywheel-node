@@ -66,14 +66,16 @@ import { join } from "node:path";
 import { applyDeclaration } from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { nowUnixNano } from "./genai-otlp.js";
-import { conversationAccessGranted, lastAssistantText } from "./host.js";
+import {
+  conversationAccessGranted, conversationIdOf, lastAssistantText, taskIdOf,
+} from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
 import { percepteyeHome } from "./session.js";
 import {
   AttachTransport, declareRulebook, rulesNeverSent, sentence,
 } from "./transport.js";
-import { CONTRACT_VERSION, productionIdentifier } from "./wire.js";
+import { CONTRACT_VERSION } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readTaskId, recordConversationId,
   recordModelBoundary, recordTaskId, recordTurnText,
@@ -295,12 +297,6 @@ export function createTurnCapture({ root, logger = null }) {
     }
     return generated;
   };
-  const taskIdFrom = (event, ctx) => productionIdentifier(
-    event?.taskId ?? event?.task_id ?? ctx?.taskId ?? ctx?.task_id,
-  );
-  const conversationIdFrom = (event, ctx) => productionIdentifier(
-    event?.sessionKey ?? ctx?.sessionKey,
-  );
   const warnOnce = (err) => {
     if (warned) return;
     warned = true;
@@ -316,8 +312,8 @@ export function createTurnCapture({ root, logger = null }) {
     const text = event?.content;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
-    const conversationId = conversationIdFrom(event, ctx);
-    const taskId = taskIdFrom(event, ctx);
+    const conversationId = conversationIdOf(event, ctx);
+    const taskId = taskIdOf(event, ctx);
     const dir = turnDir(root, turnId);
     try {
       const wroteConversation = conversationId
@@ -380,8 +376,8 @@ export function createTurnCapture({ root, logger = null }) {
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
     const dir = turnDir(root, turnId);
-    const conversationId = conversationIdFrom(event, ctx);
-    const taskId = taskIdFrom(event, ctx);
+    const conversationId = conversationIdOf(event, ctx);
+    const taskId = taskIdOf(event, ctx);
     const wroteConversation = conversationId
       ? recordConversationId(dir, conversationId) : false;
     const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
@@ -408,15 +404,19 @@ export function createTurnCapture({ root, logger = null }) {
    * putting it in a shared directory. An unattributable call landing in some
    * other turn's trajectory is the misattribution this package refuses
    * everywhere else.
+   *
+   * `callCtx` is the call's whole host context with its run id resolved, so
+   * the conversation and task it names are recorded here as well: a turn
+   * with no `message_received` (a terminal session) has no other writer.
    */
   function resolveToolDir(callCtx) {
     const runId = callCtx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return null;
     const dir = turnDir(root, turnId);
-    const taskId = taskIdFrom(null, callCtx);
+    const taskId = taskIdOf(null, callCtx);
     if (taskId) recordTaskId(dir, taskId);
-    const conversationId = conversationIdFrom(null, callCtx);
+    const conversationId = conversationIdOf(null, callCtx);
     if (conversationId) recordConversationId(dir, conversationId);
     return dir;
   }

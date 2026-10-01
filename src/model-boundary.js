@@ -51,6 +51,7 @@
  * Zero dependencies.
  */
 import { newSpanId } from "./genai-otlp.js";
+import { lastUserIndex } from "./host.js";
 
 /** OpenClaw's provider ids, as the GenAI conventions name them. Anything else
  * is passed through verbatim: the attribute is an open enum. */
@@ -243,8 +244,7 @@ function isRunPrompt(message, prompt) {
  */
 export function operationsFromRun(first, messages, endAt) {
   if (!first || !Array.isArray(messages)) return null;
-  let lastUser = -1;
-  messages.forEach((m, i) => { if (isObject(m) && m.role === "user") lastUser = i; });
+  const lastUser = lastUserIndex(messages);
   if (lastUser < 0) return null;
   if (!isRunPrompt(messages[lastUser], first.prompt)) return null;
   const run = messages.slice(lastUser + 1);

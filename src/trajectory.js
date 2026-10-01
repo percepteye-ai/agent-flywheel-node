@@ -71,7 +71,8 @@ export function createWriter({ dir = null, resolveDir = null,
   // `resolveDir` lets a caller route each record to its OWN directory -- which
   // is what production turn capture needs, because there a trajectory belongs
   // to one turn rather than to one rollout. It receives the record's context
-  // (`{runId}`) and may return null to drop the record.
+  // (the tool call's host context with its `runId` resolved) and may return
+  // null to drop the record.
   //
   // An OPTION rather than a second writer module: the append semantics below
   // are the wire ABI shared with the Python SDK, and a second implementation

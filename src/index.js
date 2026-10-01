@@ -284,7 +284,22 @@ export function register(api, pluginConfig = {}, env = process.env) {
       `recorded for this run: ${err?.message ?? err}`,
     ),
   });
-  const recorder = createRecorder({ writer });
+  // Declared here, before the recorder that reads them: the rollout driver is
+  // built further down, and a tool call is a rollout's only while the driver
+  // holds one for that session.
+  let rollouts = null;
+  let capture = null;
+  let serving = null;
+  const recorder = createRecorder({
+    writer,
+    // THE PLUGIN CONFIG'S MODE, already resolved against the `env` this
+    // plugin was registered with. Without it the recorder read the process
+    // environment alone, so an install set to production in its plugin
+    // config stamped every tool span as a rollout.
+    mode: config.mode,
+    rolloutFor: (ctx) => rollouts?.rolloutFor?.(ctx) ?? null,
+    executionIdentity,
+  });
 
   api.on(HOOK_NAME, (event, ctx) => {
     // The host already isolates hook failures, but it logs a warning per
@@ -311,9 +326,6 @@ export function register(api, pluginConfig = {}, env = process.env) {
   //
   // Local capture above is UNAFFECTED by mode. It never leaves the machine,
   // and it is the plugin's day-one value with no account at all.
-  let rollouts = null;
-  let capture = null;
-  let serving = null;
   if (config.mode === TRAINING) {
     // WRAPPED, because the host requires `register` to be SYNCHRONOUS and
     // treats a throw here as a failed plugin load (loader-D8d2EvVh.js:762).

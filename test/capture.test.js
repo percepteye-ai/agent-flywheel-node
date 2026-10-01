@@ -964,6 +964,29 @@ describe("the production lane is wired", () => {
   });
 });
 
+describe("a production tool call", () => {
+  it("records the conversation and task its host context names", async () => {
+    // The recorder handed the writer only `{runId}`, so the half of
+    // `resolveToolDir` that records the conversation read fields that were
+    // never there: a turn with no `message_received` (a terminal session)
+    // was uploaded with no conversation at all.
+    const { createRecorder } = await import("../src/record.js");
+    const { createWriter } = await import("../src/trajectory.js");
+    const root = tmp();
+    const cap = createTurnCapture({ root });
+    createRecorder({
+      writer: createWriter({ resolveDir: cap.resolveToolDir }), mode: "production",
+    }).handle(
+      { toolName: "read", params: {}, runId: "r1" },
+      { runId: "r1", sessionKey: "agent:main:cli:x", taskId: "case-1" },
+    );
+    const dir = turnDir(root, "r1");
+    assert.equal(readFileSync(join(dir, CONVERSATION_ID_FILENAME), "utf8"),
+                 "agent:main:cli:x");
+    assert.equal(readTaskId(dir), "case-1");
+  });
+});
+
 describe("reading the answer", () => {
   it("takes the last assistant message and joins parts", () => {
     assert.equal(lastAssistantText([
@@ -975,6 +998,36 @@ describe("reading the answer", () => {
   it("returns empty rather than inventing one", () => {
     assert.equal(lastAssistantText(null), "");
     assert.equal(lastAssistantText([{ role: "user", content: "x" }]), "");
+  });
+
+  it("never takes the PREVIOUS turn's answer for a run that produced none", () => {
+    // The host hands over the whole session. A run that failed mid-tool has
+    // no text of its own, and a search that ran to the start of the session
+    // returned the answer to the user's previous question instead.
+    assert.equal(lastAssistantText([
+      { role: "user", content: "first question" },
+      { role: "assistant", content: "the previous answer" },
+      { role: "user", content: "second question" },
+      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "f" }] },
+      { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "boom" }] },
+    ]), "");
+  });
+
+  it("takes the answer to a message steered into the run, and none when it got none", () => {
+    // A steered message is a user message too: the run's answer is the one
+    // after it, and a run that ended before answering it has none -- not the
+    // text that came before the steer.
+    const steered = [
+      { role: "user", content: "book tuesday" },
+      { role: "assistant", content: [{ type: "text", text: "Checking." },
+        { type: "toolCall", id: "c1", name: "slots" }] },
+      { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "[]" }] },
+      { role: "user", content: "actually wednesday" },
+    ];
+    assert.equal(lastAssistantText(steered), "");
+    assert.equal(lastAssistantText([
+      ...steered, { role: "assistant", content: "Booked Wednesday." },
+    ]), "Booked Wednesday.");
   });
 });
 
