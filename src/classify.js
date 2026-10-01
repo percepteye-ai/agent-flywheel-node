@@ -16,6 +16,7 @@
  * downstream looking like success. We inherit the lesson rather than the bug:
  * a verdict nobody stated is `unknown`, never `ok`.
  */
+import { bounded } from "./body-bound.js";
 
 /**
  * Tools whose silence really does mean the operation succeeded. These have no
@@ -81,7 +82,9 @@ export function classify(name, error, result) {
     return {
       outcome: "failed",
       status_code: null,
-      error: error.slice(0, 1000),
+      // Both ends: a stated error is often a traceback, whose last line is
+      // the part worth keeping. The Python SDK bounds it identically.
+      error: bounded(error),
       error_class: "ToolError",
     };
   }

@@ -16,6 +16,7 @@
  * discriminating foreground from background. That is enough to be honest about
  * three cases a cruder reading collapses into one.
  */
+import { bounded } from "./body-bound.js";
 import { readExit } from "./classify.js";
 
 /** dsh's exec tools, by their registered names. */
@@ -48,7 +49,7 @@ export function classifyDsh(name, result) {
       outcome: "failed",
       status_code: null,
       error: typeof failure.message === "string"
-        ? failure.message.slice(0, 1000)
+        ? bounded(failure.message)
         : undefined,
       // dsh carries an internal error class on `info`; it is far more useful
       // downstream than a generic label when it is a plain string.
