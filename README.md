@@ -61,7 +61,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
 **Your agent already does real work. This turns that work into training data, and hands back a model trained on it.**
 
-No container to build. No cluster to run. No GPU to provision. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you.
+No container to build. No cluster to run. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you. GRPO trains on compute you connect, and OPSD's first artifact runs on PerceptEye's.
 
 <br/>
 
@@ -143,7 +143,7 @@ That last beat is what makes it a flywheel rather than a pipeline: **the better 
 > [!IMPORTANT]
 > **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` once at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
 >
-> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. Separately, if the served endpoint requires a credential it comes from your own `models.providers.percepteye-flywheel.apiKey`.
+> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. The credential is supplied for you when the control plane names `PERCEPTEYE_API_KEY` for the served endpoint — the case for every model PerceptEye serves, which arrives as Mission Control's constant gateway URL for this agent: the registered provider authenticates with this plugin's own flywheel key (`plugins.entries.agent-flywheel.config.apiKey`, or `PERCEPTEYE_API_KEY`). For an endpoint the control plane names any other credential for, it comes from your own `models.providers.percepteye-flywheel.apiKey`, and an `apiKey` you set there always takes precedence.
 
 <br/>
 
@@ -249,7 +249,7 @@ With a key set, a `production` install also asks the control plane, **once at st
 - `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
 - `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
 
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does.
+Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does. A model PerceptEye serves is delivered as Mission Control's constant gateway URL for this agent, and the control plane resolves which checkpoint answers behind it, so only the **first** delivery needs that restart; a later promotion or rollback between trained checkpoints reaches the running agent without one. A withdrawal (`endpoint: null, withdrawn: true`) puts the agent back on the model your host configures, at its next restart.
 
 **What stops the prompt being applied**, each logged with its own reason:
 
@@ -270,6 +270,7 @@ Once, not per turn: a policy that moves under a running agent splits a process's
 | `PERCEPTEYE_APPLY_MODEL=0` | you switched it off |
 | the conversation opt-in missing | `before_model_resolve` is a conversation hook; without `hooks.allowConversationAccess: true` this host never delivers it |
 | no provider could be registered | the registered provider is the only thing that can supply the served `base_url`, so if your host has no provider surface or refuses the id, the model half is refused rather than pointing your agent at a provider the host does not know |
+| the model withdrawn | the control plane took the approved model away (`withdrawn: true` — for instance, this agent was moved back to the base arm and there is no champion to serve), so the model your host configures stands. The log line carries the control plane's own reason |
 | no endpoint served | this agent is on the champion arm, or its candidate is not deployed anywhere — nothing to point at |
 | an archive reference as the model | a `gs://` or `s3://` path is a stored artifact, not a name an endpoint can serve; sending it would 404 every completion |
 
