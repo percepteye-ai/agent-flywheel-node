@@ -1037,13 +1037,21 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
     // A tenant-owned provider endpoint is named by the PROVIDER's variable,
     // or by nothing when its key travels in the body. Our key there is a
     // credential handed to a third party -- and it 401s anyway.
+    //
+    // AT THE CONTROL PLANE'S OWN ADDRESS, so the NAME is the only thing that
+    // can refuse here: without `controlPlaneUrl` every row would be null for
+    // the address's reason, and this test would pass with the name check
+    // deleted.
     for (const api_key_env of ["FIREWORKS_API_KEY", "OPENAI_API_KEY", "",
       undefined, "percepteye_api_key"]) {
       const endpoint = { ...GATEWAY.endpoint, api_key_env };
       if (api_key_env === undefined) delete endpoint.api_key_env;
-      const d = modelDecision({ ...GATEWAY, endpoint });
+      const d = modelDecision({ ...GATEWAY, endpoint },
+        { controlPlaneUrl: CONTROL_PLANE_URL });
       assert.equal(d.apply, true, "the credential never refuses the address");
       assert.equal(d.credential, null, `api_key_env=${JSON.stringify(api_key_env)}`);
+      assert.match(d.credentialReason, /does not name PERCEPTEYE_API_KEY/,
+        "the cause is the name, not the address");
     }
   });
 
@@ -1132,12 +1140,17 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
     assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID }),
       undefined, "nothing is named before the control plane has answered");
 
-    const { provider, logger } = await delivered(SERVED);
+    // The gateway's own address with NO variable named: only the name can
+    // refuse the key here (SERVED would be refused by its address too).
+    const unnamed = { ...GATEWAY, endpoint: { ...GATEWAY.endpoint } };
+    delete unnamed.endpoint.api_key_env;
+    const { provider, logger } = await delivered(unnamed);
     assert.equal(provider.resolveSyntheticAuth({ provider: PROVIDER_ID }), undefined,
       "an endpoint with no api_key_env gets the host's own credential, not ours");
     const line = logger.lines.find((l) => l.includes("applying the approved model"));
     assert.ok(line.includes(`models.providers.${PROVIDER_ID}`),
       "and the startup line says where that credential has to come from");
+    assert.match(line, /does not name PERCEPTEYE_API_KEY/);
     assert.ok(!line.includes(`plugins.entries.${PLUGIN_ID}.config.apiKey`));
   });
 
