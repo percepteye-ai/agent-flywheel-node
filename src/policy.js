@@ -119,8 +119,8 @@
  *   provider in the loaded registry). That hook returns
  *   `{apiKey, source, mode}` (types-DaHgOqFX.d.ts:532-537), so the plugin can
  *   hand the host its own flywheel key for an endpoint the control plane
- *   names it for, and an operator's explicit entry still wins. See
- *   `resolveSyntheticAuth` below for why it answers so narrowly.
+ *   names it for AT ITS OWN ADDRESS, and an operator's explicit entry still
+ *   wins. See `resolveSyntheticAuth` below for why it answers so narrowly.
  *
  *   BOTH hook contexts carry `agentId` and `sessionKey`
  *   (lifecycle-hook-helpers-BwL6869q.js:9-34,
@@ -169,14 +169,39 @@ export const PROVIDER_TRANSPORT_API = "openai-completions";
  * The variable the control plane names when the served endpoint takes THIS
  * plugin's own flywheel key.
  *
- * `/policy/current` names `PERCEPTEYE_API_KEY` exactly when the endpoint is
- * Mission Control's own -- its gateway URL for this agent, or a self-hosted
- * endpoint with no provider stamped -- and a provider's own variable (or
- * nothing) for a tenant-owned provider endpoint. Only the first is ours: the
- * flywheel key sent to anybody else's endpoint is a credential handed to a
- * third party, and it would 401 there anyway.
+ * `/policy/current` names `PERCEPTEYE_API_KEY` whenever NO PROVIDER IS
+ * STAMPED on the served artifact, and a provider's own variable, or nothing,
+ * for a tenant-owned provider endpoint. "No provider stamped" covers two very
+ * different addresses: Mission Control's gateway URL for this agent, which
+ * the flywheel key opens, AND a self-hosted endpoint -- a GPU box a tenant
+ * registered, say -- whose raw address a control plane without the gateway
+ * projection still hands out as is, often over plain http. The name alone
+ * therefore does not say the endpoint is ours, so `modelDecision` asks one
+ * more thing before it names the flywheel key: that the endpoint sits at the
+ * control plane's own origin, the one address this plugin already sends that
+ * key to on every call (`controlPlaneOrigin`). Anywhere else the key would be
+ * a credential handed somewhere it never went before.
  */
 export const FLYWHEEL_KEY_ENV = "PERCEPTEYE_API_KEY";
+
+/**
+ * The origin (`scheme://host[:port]`) of an absolute http(s) URL, or null for
+ * anything else.
+ *
+ * `URL.origin` lowercases the host and drops a default port, so
+ * `https://Launch.example:443/x` and `https://launch.example/y` are ONE
+ * origin, while a different scheme, port or host -- `http://` for `https://`,
+ * a suffix like `launch.example.evil` -- is a different one. Userinfo is not
+ * part of an origin and never decides anything here.
+ */
+export function controlPlaneOrigin(url) {
+  try {
+    const u = new URL(str(url));
+    return u.protocol === "https:" || u.protocol === "http:" ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
 
 /** `modelDecision`'s `credential` when the endpoint takes the flywheel key. */
 export const FLYWHEEL_KEY_CREDENTIAL = "flywheel_key";
@@ -373,17 +398,30 @@ export function promptDecision(prompt) {
  * to a champion, because there is none.
  *
  * THE CREDENTIAL is the one other thing read here, and only read: it is
- * `FLYWHEEL_KEY_CREDENTIAL` when the control plane names `FLYWHEEL_KEY_ENV`
- * for the endpoint -- the gateway, or our own self-hosted endpoint -- and
- * `null` for everything else, which leaves the credential to the host's own
- * `models.providers` entry exactly as before. It never refuses: whether an
+ * `FLYWHEEL_KEY_CREDENTIAL` when BOTH of these hold, and `null` otherwise,
+ * which leaves the credential to the host's own `models.providers` entry
+ * exactly as before:
+ *
+ *   the control plane names `FLYWHEEL_KEY_ENV` for the endpoint, exactly;
+ *   the endpoint is at `controlPlaneUrl`'s origin -- the address the key
+ *   already goes to on every call. The name alone also covers a self-hosted
+ *   box's raw address (see `FLYWHEEL_KEY_ENV`), and the key must not travel
+ *   anywhere it does not already go. No `controlPlaneUrl`, no key: a caller
+ *   that cannot say where the key goes cannot have it sent anywhere.
+ *
+ * `credentialReason` says which of the two failed, for the startup line, and
+ * is null when the key is named. Neither ever refuses the ADDRESS: whether an
  * endpoint needs a key at all is the host's question.
  *
  * @param {object} policy the `/policy/current` body, possibly `{}`
+ * @param {object} [opts]
+ * @param {string|null} [opts.controlPlaneUrl] the URL this plugin's transport
+ *   authenticates to with its flywheel key (`config.controlPlaneUrl`)
  * @returns {{apply: boolean, baseUrl: string|null, model: string|null,
- *            credential: string|null, reason: string}}
+ *            credential: string|null, credentialReason: string|null,
+ *            reason: string}}
  */
-export function modelDecision(policy) {
+export function modelDecision(policy, { controlPlaneUrl = null } = {}) {
   const p = policy && typeof policy === "object" ? policy : {};
   const ep = p.endpoint && typeof p.endpoint === "object" ? p.endpoint : {};
   const baseUrl = str(ep.base_url);
@@ -400,6 +438,7 @@ export function modelDecision(policy) {
   if (p.withdrawn === true) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
+      credentialReason: null,
       reason: "the control plane WITHDREW the approved model for this agent " +
         `(withdrawn=true${str(p.reason) ? `, ${str(p.reason)}` : ""}), so ` +
         "this agent runs on the model its host configures",
@@ -409,6 +448,7 @@ export function modelDecision(policy) {
   if (!baseUrl || !model) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
+      credentialReason: null,
       reason: "the control plane is serving no endpoint for this agent " +
         "(nothing is deployed for it, or no policy resolved), so there is " +
         "nothing to point it at",
@@ -422,18 +462,52 @@ export function modelDecision(policy) {
   if (isArchiveRef(model)) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
+      credentialReason: null,
       reason: `the served model ${JSON.stringify(model)} is a stored-artifact ` +
         "reference, not a name an endpoint can serve; that address would 404 " +
         "on every completion",
     };
   }
 
+  return {
+    apply: true, baseUrl, model,
+    ...flywheelKeyDecision(ep, baseUrl, controlPlaneUrl),
+    reason: "",
+  };
+}
+
+/**
+ * Whether the served endpoint takes THIS plugin's flywheel key:
+ * `{credential, credentialReason}`. See `modelDecision`.
+ */
+function flywheelKeyDecision(ep, baseUrl, controlPlaneUrl) {
   // EXACT, not "absent means ours". The control plane OMITS `api_key_env`
   // when it cannot honestly name a variable -- a provider whose key travels
   // in the body -- and a provider's endpoint must never be sent our key.
-  const credential = str(ep.api_key_env) === FLYWHEEL_KEY_ENV
-    ? FLYWHEEL_KEY_CREDENTIAL : null;
-  return { apply: true, baseUrl, model, credential, reason: "" };
+  if (str(ep.api_key_env) !== FLYWHEEL_KEY_ENV) {
+    return {
+      credential: null,
+      credentialReason: "the control plane does not name " +
+        `${FLYWHEEL_KEY_ENV} for that endpoint`,
+    };
+  }
+  // AND AT OUR OWN ADDRESS. The control plane names the same variable for an
+  // unstamped self-hosted endpoint's raw address as for its gateway, so the
+  // name is necessary, not sufficient: the key goes only where the transport
+  // already sends it.
+  const home = controlPlaneOrigin(controlPlaneUrl);
+  const there = controlPlaneOrigin(baseUrl);
+  if (!home || there !== home) {
+    return {
+      credential: null,
+      credentialReason: `the control plane names ${FLYWHEEL_KEY_ENV} for ` +
+        `that endpoint, but it is at ${there ?? JSON.stringify(baseUrl)}, ` +
+        `not at ${home ?? "a known control-plane address"} -- the one ` +
+        "address this plugin already sends its flywheel key to -- so the " +
+        "key is not sent there",
+    };
+  }
+  return { credential: FLYWHEEL_KEY_CREDENTIAL, credentialReason: null };
 }
 
 /**
@@ -531,13 +605,15 @@ export function pairNote({
  * @param {string|null} [opts.unwired]  why no seam was wired, when none was
  * @param {string|null} [opts.flywheelKey] this plugin's own key (`config.
  *   apiKey`), handed to the host ONLY through `resolveSyntheticAuth` and only
- *   for an endpoint the control plane names it for. Held in this closure:
- *   no getter returns it and no line logs it.
+ *   for an endpoint the control plane names it for, at its own address. Held
+ *   in this closure: no getter returns it and no line logs it.
+ * @param {string|null} [opts.controlPlaneUrl] where the transport already
+ *   sends that key (`config.controlPlaneUrl`); see `modelDecision`.
  */
 export function createPolicySource({
   pluginId, logger = null, applyPrompt = true, applyModel = true,
   servedAgent = resolveServedAgent({}), modelBlocked = null,
-  unwired = null, flywheelKey = null,
+  unwired = null, flywheelKey = null, controlPlaneUrl = null,
 }) {
   let policy = {};
   let prompt = {};
@@ -663,7 +739,7 @@ export function createPolicySource({
       // to use, and an endpoint that has no provider to reach it is not
       // applied however good the answer is.
       if (applyModel && !modelBlocked) {
-        const decision = modelDecision(policy);
+        const decision = modelDecision(policy, { controlPlaneUrl });
         if (decision.apply) {
           appliedModel = {
             provider: PROVIDER_ID,
@@ -677,15 +753,18 @@ export function createPolicySource({
           refusedModel = decision.reason;
         }
         // WHICH KEY OPENS IT, said exactly: the operator reading this line is
-        // the one who has to supply it when we do not.
+        // the one who has to supply it when we do not, and WHY we do not is
+        // the cause they act on -- a provider's own key, or an address that
+        // is not the control plane's.
         const credentialLine = appliedModel?.credential === FLYWHEEL_KEY_CREDENTIAL
           ? `The control plane names ${FLYWHEEL_KEY_ENV} for that endpoint, ` +
-            `so the provider authenticates with ${flywheelKeyOrigin(pluginId)}` +
-            `; a models.providers.${PROVIDER_ID}.apiKey you set yourself ` +
-            "takes precedence. "
-          : "The control plane does not name this plugin's flywheel key for " +
-            "that endpoint, so if it needs a credential it comes from your " +
-            `host's own models.providers.${PROVIDER_ID} entry. `;
+            "which is at its own address, so the provider authenticates with " +
+            `${flywheelKeyOrigin(pluginId)}; a models.providers.` +
+            `${PROVIDER_ID}.apiKey you set yourself takes precedence. `
+          : `This plugin's flywheel key is not supplied: ` +
+            `${decision.credentialReason}. If that endpoint needs a ` +
+            "credential it comes from your host's own " +
+            `models.providers.${PROVIDER_ID} entry. `;
         logger?.info?.(appliedModel
           ? `[${pluginId}] applying the approved model ` +
             `'${appliedModel.model}' at ${appliedModel.baseUrl} via ` +
@@ -863,9 +942,12 @@ export function createPolicySource({
      *   an applied model     nothing is named before the read, and a refused
      *                        or withdrawn answer points nowhere.
      *   credential named     the control plane named FLYWHEEL_KEY_ENV for
-     *                        THIS endpoint. A tenant-owned provider endpoint
-     *                        gets its own key from the host; ours there is a
-     *                        credential handed to a third party.
+     *                        THIS endpoint, and the endpoint is at the
+     *                        control plane's own origin (`modelDecision`).
+     *                        A tenant-owned provider endpoint gets its own
+     *                        key from the host, and a self-hosted box named
+     *                        the same way gets none from us; ours there is a
+     *                        credential sent where it never went before.
      *   our provider id      the host also asks the plugins behind a
      *                        provider's other refs, its model `api` among
      *                        them (provider-runtime-CLQOjLJ6.js:344-353),
@@ -967,10 +1049,10 @@ export function registerServingPolicy(api, {
           label: "API key",
           kind: "api_key",
           hint: `Supplied for you when the control plane names ` +
-            `${FLYWHEEL_KEY_ENV} for the served endpoint: the provider ` +
-            `authenticates with ${flywheelKeyOrigin(pluginId)}. Set ` +
-            `models.providers.${PROVIDER_ID}.apiKey only for an endpoint ` +
-            "that takes a different credential; yours takes precedence.",
+            `${FLYWHEEL_KEY_ENV} for a served endpoint at its own address: ` +
+            `the provider authenticates with ${flywheelKeyOrigin(pluginId)}. ` +
+            `Set models.providers.${PROVIDER_ID}.apiKey for any other ` +
+            "endpoint that needs a credential; yours takes precedence.",
         }],
         normalizeTransport: (ctx) => source?.normalizeTransport(ctx),
         // THE CREDENTIAL, supplied rather than asked for: the host's last
@@ -995,8 +1077,11 @@ export function registerServingPolicy(api, {
     pluginId, logger, applyPrompt, applyModel, servedAgent,
     modelBlocked, unwired,
     // The same key the transport authenticates to the control plane with:
-    // the gateway URL the control plane hands out is opened by it.
+    // the gateway URL the control plane hands out is opened by it. And the
+    // same URL the transport sends it to, which is the only address the key
+    // may be supplied for (`modelDecision`).
     flywheelKey: config?.apiKey ?? null,
+    controlPlaneUrl: config?.controlPlaneUrl ?? null,
   });
 
   // THE CONSENT BOUNDARY, again. With no key there is no transport, nothing
