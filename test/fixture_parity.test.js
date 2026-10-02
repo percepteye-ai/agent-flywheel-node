@@ -9,7 +9,8 @@
  * copy gains a field the other's lacks, each SDK is green against an answer
  * the other never sees. So the bytes are what is held equal.
  *
- * Two mechanisms, because the sibling checkout is not always there:
+ * Two mechanisms in ONE test per fixture, because the sibling checkout is not
+ * always there:
  *
  *   THE DIGESTS, always. They are the digests every copy was made from, so a
  *   copy edited here alone is red in this repo's own CI, where no sibling
@@ -17,6 +18,12 @@
  *   THE PYTHON SDK'S COPY, whenever its checkout sits beside this one. Present
  *   means its copy must exist and match: a sibling that lacks the file is the
  *   drift this test exists to catch, not a reason to skip.
+ *
+ * NOT a test of its own that skips without the sibling: that was a visible
+ * skip in every standalone checkout and in CI, against a suite that publishes
+ * "0 skips", and the Python SDK folded its own sibling comparison into its
+ * digest test for the same reason. `wire.test.js` and `genai-otlp.test.js`
+ * compare against the sibling the same way, inside the test that always runs.
  */
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
@@ -49,17 +56,12 @@ const pythonRoot = [
 
 describe("the shared /policy/current fixtures", () => {
   for (const [name, digest] of Object.entries(SHARED)) {
-    it(`${name} is the shared copy, by digest`, () => {
+    it(`${name} is the shared copy, by digest and against the Python SDK's`, () => {
       assert.equal(createHash("sha256").update(ours(name)).digest("hex"), digest,
         `test/fixtures/${name} is not the shared fixture -- change every copy ` +
         "together (both SDKs and the control plane), never one alone");
-    });
 
-    it(`${name} is byte-equal to the Python SDK's copy`, (t) => {
-      if (!pythonRoot) {
-        t.skip("no Python SDK checkout beside this one");
-        return;
-      }
+      if (!pythonRoot) return;
       const theirs = new URL(`tests/fixtures/${name}`, pythonRoot);
       assert.ok(existsSync(theirs),
         `the Python SDK checkout at ${pythonRoot.pathname} has no ` +
