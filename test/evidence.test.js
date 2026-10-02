@@ -6,6 +6,7 @@
  * depending on which harness ran it -- and the divergence surfaces months
  * later as a read-back confirming the wrong entity.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

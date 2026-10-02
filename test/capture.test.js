@@ -9,6 +9,7 @@
  * keys and the exact wire keys, because "keep these in sync" written in a
  * comment is not a mechanism and both sides have drifted before.
  */
+import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
@@ -910,7 +911,7 @@ describe("the production lane is wired", () => {
 
   it("subscribes the two turn hooks in production mode", () => {
     const a = api();
-    register(a, {}, { PERCEPTEYE_AGENT_MODE: "production" });
+    register(a, {}, testEnv({ PERCEPTEYE_AGENT_MODE: "production" }));
     const names = a.hooks.map((h) => h.name);
     for (const h of ["message_received", "agent_end", "after_tool_call"]) {
       assert.ok(names.includes(h), `production did not subscribe '${h}'`);

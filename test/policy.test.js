@@ -31,6 +31,7 @@
  *   changes the transport -- so answering unconditionally would redirect the
  *   customer's Anthropic or OpenAI traffic to our gateway.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

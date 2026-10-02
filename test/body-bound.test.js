@@ -8,6 +8,7 @@
  * shared with the Python SDK; that SDK's parity test drives this module and
  * both classifiers and requires the same strings it produces.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { bounded, elision, MAX_BODY_CHARS } from "../src/body-bound.js";

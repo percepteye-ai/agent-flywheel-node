@@ -1,6 +1,7 @@
 /**
  * The consent boundary, and the reader's two load-bearing distinctions.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

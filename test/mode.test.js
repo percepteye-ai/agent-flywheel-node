@@ -8,6 +8,7 @@
  * nothing in Node, the switch silently stops working on the harness they
  * happened to choose.
  */
+import "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 

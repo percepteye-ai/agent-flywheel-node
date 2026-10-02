@@ -5,6 +5,7 @@
  * mechanism keeping the vendored schema from silently diverging from the
  * Python end. A comment saying "keep these in sync" is not a mechanism.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";

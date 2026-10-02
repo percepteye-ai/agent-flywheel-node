@@ -9,6 +9,7 @@
  * reads it. The Python SDK's client and `rulebook_refusal` answer the same
  * cases the same way; `test_rulebook_parity.py` there compares the sentences.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { ControlPlaneClient } from "../src/http.js";

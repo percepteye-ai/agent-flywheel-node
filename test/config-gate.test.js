@@ -13,6 +13,7 @@
  * them: a customer following the manifest and setting `apiKey` would have had
  * it refused by the schema the module itself publishes.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -304,7 +305,7 @@ test("PERCEPTEYE_AGENT_MODE=production keeps the rollout driver unregistered und
   api.pluginConfig = hydrateAsHostWould(manifest.configSchema, {});
   const out = register(api, {}, {
     PERCEPTEYE_AGENT_MODE: "production",
-    PERCEPTEYE_CAPTURE_DIR: join(tmpdir(), "percepteye-config-gate-test"),
+    PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "percepteye-config-gate-")),
   });
   assert.equal(out.mode, PRODUCTION);
   assert.equal(out.rollouts, null, "production must not construct the rollout driver");

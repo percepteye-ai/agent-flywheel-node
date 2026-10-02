@@ -12,6 +12,7 @@
  * nothing recorded; a prefix this plugin cannot see, nothing rendered; a
  * revocation, nothing more sent.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import {
   existsSync, mkdtempSync, readFileSync, readdirSync, statSync,

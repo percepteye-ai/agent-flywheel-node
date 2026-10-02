@@ -52,6 +52,7 @@
  * This file is exempt from the scan: it has to name the internals in order to
  * forbid them.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
