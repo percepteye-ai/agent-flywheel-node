@@ -1213,6 +1213,68 @@ describe("resolved once — no timer re-polls the recorded decision", () => {
       providerOverride: PROVIDER_ID, modelOverride: GATEWAY.endpoint.model,
     }, "the startup answer is the answer for the life of the process");
   });
+
+  it("never re-reads it through the plugin's real entry point either", async (t) => {
+    // The test above holds `registerServingPolicy`. `register()` in index.js
+    // is the other place a re-poll could be added -- it holds the source AND
+    // the transport -- so this drives the real entry point, the real HTTP
+    // client and the real capture lane, and counts the requests that reach
+    // the wire: a timer there, one riding a turn hook, or one riding the
+    // capture flush is caught here, where the test above cannot see it.
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const root = mkdtempSync(join(tmpdir(), "percepteye-no-repoll-"));
+    const realFetch = globalThis.fetch;
+    const paths = [];
+    globalThis.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      paths.push(path);
+      const body = path.endsWith("/policy/current") ? GATEWAY
+        : path.endsWith("/prompt/current") ? APPROVED
+          : {};
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    const reads = (suffix) => paths.filter((p) => p.endsWith(suffix)).length;
+    const settle = async () => {
+      for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
+    };
+    try {
+      const api = hostApi({
+        logger: fakeLogger(),
+        config: { plugins: { entries: { [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
+      });
+      const out = register(api, { apiKey: "pefw_x" }, {
+        PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
+      });
+      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
+        await new Promise((r) => setImmediate(r));
+      }
+      assert.equal(out.serving.resolved, true, "the startup read never completed");
+      assert.equal(reads("/policy/current"), 1);
+      assert.ok(api.hooks.length > 2, "the capture lane's hooks are subscribed too");
+
+      for (let i = 0; i < 10; i += 1) {
+        t.mock.timers.tick(GATEWAY.ttl_s * 1000);
+        await settle();
+        // EVERY hook the plugin subscribed, not only the two policy ones: a
+        // turn is where a lazily re-read answer would hide.
+        for (const [, fn] of api.hooks) {
+          try {
+            await fn({ prompt: "hi", messages: [] }, TURN);
+          } catch { /* a hook given a thin event may refuse it; not the question */ }
+        }
+        await out.capture?.uploader?.flush?.().catch(() => {});
+        await settle();
+      }
+      assert.equal(reads("/policy/current"), 1,
+        `/policy/current was re-read after ${GATEWAY.ttl_s}s: ${paths.join(", ")}`);
+      assert.equal(reads("/prompt/current"), 1);
+    } finally {
+      globalThis.fetch = realFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 
