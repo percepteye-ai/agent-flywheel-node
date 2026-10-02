@@ -41,7 +41,7 @@ import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveConfig } from "../src/config.js";
 import { resolveServedAgent } from "../src/scope.js";
 import {
-  FLYWHEEL_KEY_CREDENTIAL, FLYWHEEL_KEY_ENV,
+  FLYWHEEL_KEY_CREDENTIAL, FLYWHEEL_KEY_ENV, controlPlaneOrigin,
   MODEL_HOOK_NAME, MODEL_OFF_REASON, NO_KEY_REASON, PROMPT_HOOK_NAME,
   PROMPT_OFF_REASON, PROVIDER_ID, PROVIDER_TRANSPORT_API,
   NO_PROVIDER_SURFACE_REASON, SERVABLE_PROMPT_STATUSES, createPolicySource,
@@ -63,6 +63,12 @@ const fixture = (name) => JSON.parse(readFileSync(
   new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 const GATEWAY = fixture("policy_current_gateway.json");
 const WITHDRAWN = fixture("policy_current_withdrawn.json");
+
+/**
+ * Where an install's transport sends its flywheel key when nothing overrides
+ * it: the production control plane, whose gateway URL the GATEWAY fixture is.
+ */
+const CONTROL_PLANE_URL = resolveConfig({}, {}).controlPlaneUrl;
 
 /** A `/prompt/current` body that passes every check. */
 const APPROVED = {
@@ -919,14 +925,112 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
   };
 
   it("modelDecision(gateway) applies the gateway URL with the FLYWHEEL key", () => {
-    const d = modelDecision(GATEWAY);
+    const d = modelDecision(GATEWAY, { controlPlaneUrl: CONTROL_PLANE_URL });
     assert.equal(d.apply, true);
     assert.equal(d.baseUrl, GATEWAY.endpoint.base_url);
     assert.equal(d.model, GATEWAY.endpoint.model);
     assert.equal(d.credential, FLYWHEEL_KEY_CREDENTIAL);
     assert.equal(d.credential, "flywheel_key");
+    assert.equal(d.credentialReason, null);
     assert.equal(GATEWAY.endpoint.api_key_env, FLYWHEEL_KEY_ENV,
       "the fixture is the case this credential exists for");
+    assert.equal(controlPlaneOrigin(GATEWAY.endpoint.base_url),
+      controlPlaneOrigin(CONTROL_PLANE_URL),
+      "the gateway is served at the control plane's own address");
+  });
+
+  it("names the flywheel key ONLY at the control plane's own address", () => {
+    // `/policy/current` names PERCEPTEYE_API_KEY for EVERY endpoint with no
+    // provider stamped, which is the gateway AND a self-hosted box's raw address -- a tenant's own server,
+    // often over plain http -- on a control plane without the gateway
+    // projection. The name is necessary, not sufficient: the key goes only
+    // where the transport already sends it.
+    const at = (base_url, controlPlaneUrl = CONTROL_PLANE_URL) => modelDecision(
+      { ...GATEWAY, endpoint: { ...GATEWAY.endpoint, base_url } },
+      { controlPlaneUrl });
+    const gatewayPath = new URL(GATEWAY.endpoint.base_url).pathname;
+
+    // The same origin however it is spelled.
+    assert.equal(at(`https://LAUNCH.percepteye.ai:443${gatewayPath}`).credential,
+      FLYWHEEL_KEY_CREDENTIAL);
+
+    for (const base_url of [
+      "http://203.0.113.7:8001/v1",                      // a raw self-hosted box
+      `http://launch.percepteye.ai${gatewayPath}`,        // the scheme downgraded
+      `https://launch.percepteye.ai:8443${gatewayPath}`,  // another port
+      `https://launch.percepteye.ai.evil.example${gatewayPath}`,
+      "https://gpu.example/v1",
+    ]) {
+      const d = at(base_url);
+      assert.equal(d.apply, true, "the credential never refuses the address");
+      assert.equal(d.credential, null, base_url);
+      assert.ok(d.credentialReason.includes(controlPlaneOrigin(base_url)),
+        `the reason names where the endpoint is: ${d.credentialReason}`);
+      assert.ok(d.credentialReason.includes(controlPlaneOrigin(CONTROL_PLANE_URL)),
+        `and where the key already goes: ${d.credentialReason}`);
+    }
+
+    // No control-plane address, no key: there is nothing to compare against.
+    for (const controlPlaneUrl of [null, undefined, "", "not a url",
+      "ftp://launch.percepteye.ai/"]) {
+      assert.equal(modelDecision(GATEWAY, { controlPlaneUrl }).credential, null,
+        `controlPlaneUrl=${JSON.stringify(controlPlaneUrl)}`);
+    }
+    assert.equal(modelDecision(GATEWAY).credential, null,
+      "a caller that cannot say where the key goes cannot have it sent anywhere");
+  });
+
+  it("a raw self-hosted endpoint is applied WITHOUT the flywheel key, end to end", async () => {
+    const RAW = { ...GATEWAY, endpoint: { ...GATEWAY.endpoint,
+      base_url: "http://203.0.113.7:8001/v1" } };
+    const { provider, logger, src } = await delivered(RAW);
+    assert.equal(src.appliedModel?.baseUrl, RAW.endpoint.base_url,
+      "the address is still the control plane's answer to apply");
+    assert.equal(src.appliedModel.credential, null);
+    assert.equal(provider.resolveSyntheticAuth({ provider: PROVIDER_ID }), undefined,
+      "the flywheel key must not travel to an address it never went to");
+    const line = logger.lines.find((l) => l.includes("applying the approved model"));
+    assert.ok(line, logger.text());
+    assert.match(line, /flywheel key is not supplied/);
+    assert.ok(line.includes("http://203.0.113.7:8001"), line);
+    assert.ok(line.includes(controlPlaneOrigin(CONTROL_PLANE_URL)), line);
+    assert.ok(line.includes(`models.providers.${PROVIDER_ID}`), line);
+    assert.ok(!logger.text().includes(SECRET));
+  });
+
+  it("supplies the key through a real register(), at the configured control plane", async () => {
+    // `controlPlaneUrl` reaches the source from the plugin's own config, the
+    // same value its transport authenticates to: through `index.js`, not a
+    // test-built source.
+    const root = mkdtempSync(join(tmpdir(), "percepteye-gateway-key-"));
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      const body = path.endsWith("/policy/current") ? GATEWAY
+        : path.endsWith("/prompt/current") ? APPROVED
+          : {};
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    try {
+      const api = hostApi({
+        logger: fakeLogger(),
+        config: { plugins: { entries: { [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
+      });
+      const out = register(api, { apiKey: SECRET }, {
+        PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
+      });
+      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
+        await new Promise((r) => setImmediate(r));
+      }
+      assert.equal(out.serving.resolved, true);
+      assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID })?.apiKey,
+        SECRET, "the gateway at the configured control plane's address takes the key");
+    } finally {
+      globalThis.fetch = realFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("names NO flywheel credential for an endpoint the control plane did not name it for", () => {
