@@ -49,16 +49,25 @@
  * another, with nothing on either side recording where the seam was. The
  * control plane's own remedy for a moved answer is a restart, which is why
  * `serving_generation` supports equality and nothing else. Nothing here sits
- * on the path of a turn, and no timer re-reads it.
+ * on the path of a turn, and no timer re-reads it. That is a statement about
+ * THIS PROCESS changing what it applies; the one thing that moves without a
+ * restart moves on the control plane's side, which made the change:
  *
- * THE GATEWAY MAKES THAT RESTART A FIRST-DELIVERY COST, not a per-promotion
- * one. A model the platform serves is handed out as Mission Control's
- * CONSTANT gateway URL for this agent (`api_key_env: PERCEPTEYE_API_KEY`),
- * and the control plane resolves which checkpoint answers behind it, so a
- * later promotion or rollback between trained checkpoints reaches a running
- * agent without one. What still needs the restart is a change of ADDRESS:
- * the first delivery, and a withdrawal (`endpoint: null, withdrawn: true`),
- * which `modelDecision` refuses so the agent runs on its host's own model.
+ * THE GATEWAY MOVES THE MODEL HALF, AND ONLY THAT HALF. A model the platform
+ * serves is handed out as Mission Control's CONSTANT gateway URL for this
+ * agent (`api_key_env: PERCEPTEYE_API_KEY`), and the control plane decides
+ * behind it which checkpoint answers each call. So after the first delivery
+ * a promotion or rollback changes a running agent's MODEL without a restart
+ * and without this process re-reading anything. Nothing else follows it:
+ * the prompt half and the pair statement `announcePair` logged stay the
+ * startup answer's, so a promotion whose bundle carries a different prompt
+ * runs the old prompt over the new checkpoint -- not the certified pair --
+ * until a restart on `serving_generation`, which that promotion changes. A
+ * change of ADDRESS reaches a running agent not at all: the first delivery,
+ * and a withdrawal (`endpoint: null, withdrawn: true`), which `modelDecision`
+ * refuses at the next start so the agent runs on its host's own model. Until
+ * that restart a withdrawn agent keeps calling the gateway URL, which has no
+ * approved model to answer it with.
  *
  * ── TRAINING MODE DOES NOT REACH THIS FILE ────────────────────────────────
  *

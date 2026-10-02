@@ -1180,8 +1180,9 @@ describe("resolved once — no timer re-polls the recorded decision", () => {
   // that moves under a running agent splits its traffic across two
   // behaviours with nothing recording the seam, so `ttl_s` is not honoured
   // and the remedy for a moved answer is a restart on `serving_generation`.
-  // With the gateway's constant URL only the FIRST delivery needs it. This is
-  // what holds that decision against a re-poll being added back.
+  // The gateway's constant URL lets the control plane move the MODEL half
+  // behind it without one, on its own side; nothing in this process re-reads.
+  // This is what holds that decision against a re-poll being added back.
   it("never re-reads /policy/current, however far past ttl_s the clock runs", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     const api = hostApi();
