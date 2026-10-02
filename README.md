@@ -61,7 +61,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
 **Your agent already does real work. This turns that work into training data, and hands back a model trained on it.**
 
-No container to build. No cluster to run. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you. GRPO trains on compute you connect, and OPSD's first artifact runs on PerceptEye's.
+No container to build. No cluster to run. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you. GRPO trains on compute you connect; your first on-policy self-distillation (OPSD) model trains on PerceptEye's.
 
 <br/>
 
@@ -249,7 +249,11 @@ With a key set, a `production` install also asks the control plane, **once at st
 - `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
 - `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
 
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does. A model PerceptEye serves is delivered as Mission Control's constant gateway URL for this agent, and the control plane resolves which checkpoint answers behind it, so only the **first** delivery needs that restart; a later promotion or rollback between trained checkpoints reaches the running agent without one. A withdrawal (`endpoint: null, withdrawn: true`) puts the agent back on the model your host configures, at its next restart.
+Once, not per turn: this process never changes what it applies while it runs, because an answer that moved under a running agent would split its traffic across two behaviours with nothing in the process recording where the seam was. Restart to pick up a new answer — `serving_generation` changes when and only when the answer does.
+
+One thing does move without a restart, and it moves on the control plane's side, not in this process. A model PerceptEye serves is delivered as Mission Control's constant gateway URL for this agent, and the control plane decides behind that URL which checkpoint answers each call — so after the **first** delivery, a promotion or rollback between served checkpoints changes the *model* your running agent gets without a restart. It changes nothing else: the approved prompt this process read at startup stays applied, and the startup line's pair statement still describes the startup answer. A promotion whose bundle carries a different approved prompt therefore runs the old prompt over the new checkpoint — not the pair that was certified — until the agent restarts on the new `serving_generation`. So restart on `serving_generation` after a promotion or a rollback as well; the gateway only means the model does not wait for that restart.
+
+A withdrawal (`endpoint: null, withdrawn: true`) is the one change a running agent cannot reach at all without a restart. Until it restarts it keeps sending its completions to the gateway URL, where the control plane has no approved model to answer a withdrawn agent with; at its next start the plugin reads the withdrawal and leaves the model your host configures in place. Restart on the withdrawal's `serving_generation` as part of the rollback.
 
 **What stops the prompt being applied**, each logged with its own reason:
 
@@ -270,7 +274,7 @@ Once, not per turn: a policy that moves under a running agent splits a process's
 | `PERCEPTEYE_APPLY_MODEL=0` | you switched it off |
 | the conversation opt-in missing | `before_model_resolve` is a conversation hook; without `hooks.allowConversationAccess: true` this host never delivers it |
 | no provider could be registered | the registered provider is the only thing that can supply the served `base_url`, so if your host has no provider surface or refuses the id, the model half is refused rather than pointing your agent at a provider the host does not know |
-| the model withdrawn | the control plane took the approved model away (`withdrawn: true` — for instance, this agent was moved back to the base arm and there is no champion to serve), so the model your host configures stands. The log line carries the control plane's own reason |
+| the model withdrawn | the control plane took the approved model away (`withdrawn: true` — for instance, this agent was moved back to the base arm and there is no champion to serve), so the model your host configures stands from this start on — see above for the agent that was already running. The log line carries the control plane's own reason |
 | no endpoint served | this agent is on the champion arm, or its candidate is not deployed anywhere — nothing to point at |
 | an archive reference as the model | a `gs://` or `s3://` path is a stored artifact, not a name an endpoint can serve; sending it would 404 every completion |
 
