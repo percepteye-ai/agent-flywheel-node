@@ -32,7 +32,7 @@
  *   customer's Anthropic or OpenAI traffic to our gateway.
  */
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -41,12 +41,28 @@ import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveConfig } from "../src/config.js";
 import { resolveServedAgent } from "../src/scope.js";
 import {
+  FLYWHEEL_KEY_CREDENTIAL, FLYWHEEL_KEY_ENV,
   MODEL_HOOK_NAME, MODEL_OFF_REASON, NO_KEY_REASON, PROMPT_HOOK_NAME,
   PROMPT_OFF_REASON, PROVIDER_ID, PROVIDER_TRANSPORT_API,
   NO_PROVIDER_SURFACE_REASON, SERVABLE_PROMPT_STATUSES, createPolicySource,
   modelDecision, modelHookBlockedReason, pairNote, promptDecision,
   providerRefusedReason, registerServingPolicy, servedPolicySummary,
 } from "../src/policy.js";
+
+/**
+ * The control plane's own answers, shared BYTE FOR BYTE with the Python SDK
+ * and the control plane's tests (`fixture_parity.test.js` holds that):
+ *
+ *   GATEWAY    a platform-served model, delivered as the control plane's
+ *              constant gateway URL for this agent and opened with this
+ *              plugin's own flywheel key (`api_key_env: PERCEPTEYE_API_KEY`).
+ *   WITHDRAWN  an agent moved back to the base arm with no champion to serve:
+ *              `endpoint: null, withdrawn: true`.
+ */
+const fixture = (name) => JSON.parse(readFileSync(
+  new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
+const GATEWAY = fixture("policy_current_gateway.json");
+const WITHDRAWN = fixture("policy_current_withdrawn.json");
 
 /** A `/prompt/current` body that passes every check. */
 const APPROVED = {
@@ -288,6 +304,8 @@ describe("createPolicySource — resolve once, then serve the answer", () => {
     assert.equal(src.refusal, null);
     assert.deepEqual(src.appliedModel, {
       provider: PROVIDER_ID, model: "ckpt-7", baseUrl: "https://gpu.example/v1",
+      // SERVED names no key variable, so the host's own entry supplies it.
+      credential: null,
     });
     assert.equal(src.modelRefusal, null);
     assert.equal(src.resolved, true);
@@ -567,6 +585,7 @@ describe("registerServingPolicy — the seams, wired", () => {
     assert.equal(api.providers.length, 1);
     assert.equal(api.providers[0].id, PROVIDER_ID);
     assert.equal(typeof api.providers[0].normalizeTransport, "function");
+    assert.equal(typeof api.providers[0].resolveSyntheticAuth, "function");
     // ProviderPlugin requires {id, label, auth}.
     assert.equal(typeof api.providers[0].label, "string");
     assert.ok(Array.isArray(api.providers[0].auth));
@@ -879,6 +898,216 @@ describe("registerServingPolicy — the seams, wired", () => {
       note.includes(APPROVED.model_prompt_checksum.slice(0, 12)),
       "the checkpoint it was certified with must be recorded",
     );
+  });
+});
+
+
+describe("gateway delivery — the flywheel key opens the endpoint the control plane names", () => {
+  const SECRET = "pefw_s3cret-value-never-logged";
+
+  /** A real registration, a resolved answer, and the provider it registered. */
+  const delivered = async (policy = GATEWAY, { apiKey = SECRET } = {}) => {
+    const api = hostApi();
+    const logger = fakeLogger();
+    const transport = fakeTransport({ policy });
+    const src = registerServingPolicy(api, {
+      config: productionConfig({ apiKey }),
+      pluginId: PLUGIN_ID, logger, transport, hostConfig: {},
+    });
+    await src.resolve(transport);
+    return { api, logger, src, provider: api.providers[0] };
+  };
+
+  it("modelDecision(gateway) applies the gateway URL with the FLYWHEEL key", () => {
+    const d = modelDecision(GATEWAY);
+    assert.equal(d.apply, true);
+    assert.equal(d.baseUrl, GATEWAY.endpoint.base_url);
+    assert.equal(d.model, GATEWAY.endpoint.model);
+    assert.equal(d.credential, FLYWHEEL_KEY_CREDENTIAL);
+    assert.equal(d.credential, "flywheel_key");
+    assert.equal(GATEWAY.endpoint.api_key_env, FLYWHEEL_KEY_ENV,
+      "the fixture is the case this credential exists for");
+  });
+
+  it("names NO flywheel credential for an endpoint the control plane did not name it for", () => {
+    // A tenant-owned provider endpoint is named by the PROVIDER's variable,
+    // or by nothing when its key travels in the body. Our key there is a
+    // credential handed to a third party -- and it 401s anyway.
+    for (const api_key_env of ["FIREWORKS_API_KEY", "OPENAI_API_KEY", "",
+      undefined, "percepteye_api_key"]) {
+      const endpoint = { ...GATEWAY.endpoint, api_key_env };
+      if (api_key_env === undefined) delete endpoint.api_key_env;
+      const d = modelDecision({ ...GATEWAY, endpoint });
+      assert.equal(d.apply, true, "the credential never refuses the address");
+      assert.equal(d.credential, null, `api_key_env=${JSON.stringify(api_key_env)}`);
+    }
+  });
+
+  it("the withdrawn answer gives apply=false, naming the WITHDRAWAL", () => {
+    const d = modelDecision(WITHDRAWN);
+    assert.equal(d.apply, false);
+    assert.equal(d.baseUrl, null);
+    assert.equal(d.model, null);
+    assert.equal(d.credential, null);
+    assert.match(d.reason, /WITHDREW/);
+    assert.ok(d.reason.includes(WITHDRAWN.reason),
+      "the control plane's own reason must be carried");
+    assert.match(d.reason, /model its host configures/);
+    assert.doesNotMatch(d.reason, /no endpoint/,
+      "a withdrawal read as 'nothing deployed' sends an operator looking for a serving fault");
+  });
+
+  it("the withdrawal flag wins over an endpoint that arrives beside it", () => {
+    // The flag is the instruction; an endpoint left in the same body is not
+    // a reason to keep serving a model the control plane took away.
+    const d = modelDecision({ ...GATEWAY, withdrawn: true });
+    assert.equal(d.apply, false);
+    assert.match(d.reason, /WITHDREW/);
+    // And `withdrawn: false` is the ordinary answer, not a withdrawal.
+    assert.equal(modelDecision({ ...GATEWAY, withdrawn: false }).apply, true);
+  });
+
+  it("a withdrawn answer leaves the host's own model in place, end to end", async () => {
+    const { api, logger, src, provider } = await delivered(WITHDRAWN);
+    assert.equal(src.appliedModel, null);
+    assert.match(src.modelRefusal, /WITHDREW/);
+    assert.equal(api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN), undefined,
+      "no override: the host resolves its own provider and model");
+    assert.equal(provider.normalizeTransport({ provider: PROVIDER_ID }), undefined);
+    assert.equal(provider.resolveSyntheticAuth({ provider: PROVIDER_ID }), undefined);
+    assert.ok(logger.lines.some((l) => l.includes("approved model is NOT being applied")
+      && l.includes("WITHDREW")), "the startup line must name the withdrawal");
+    // The prompt half is its own answer and is untouched by the model's.
+    assert.equal(src.appliedPrompt, APPROVED.text);
+  });
+
+  it("the registered provider SUPPLIES the flywheel key for the gateway endpoint", async () => {
+    const { provider } = await delivered();
+    const auth = provider.resolveSyntheticAuth({ provider: PROVIDER_ID });
+    assert.ok(auth, "the provider must answer for its own id");
+    assert.equal(auth.apiKey, SECRET, "the key the plugin was configured with");
+    assert.equal(auth.mode, "api-key");
+    assert.ok(auth.source.includes(FLYWHEEL_KEY_ENV));
+    assert.ok(auth.source.includes(`plugins.entries.${PLUGIN_ID}.config.apiKey`));
+    assert.ok(!auth.source.includes(SECRET), "the source label is shown; never the key");
+  });
+
+  it("the key comes from PERCEPTEYE_API_KEY too, the same key the transport uses", async () => {
+    const api = hostApi();
+    const transport = fakeTransport({ policy: GATEWAY });
+    const src = registerServingPolicy(api, {
+      config: resolveConfig({}, { PERCEPTEYE_API_KEY: SECRET }),
+      pluginId: PLUGIN_ID, logger: fakeLogger(), transport, hostConfig: {},
+    });
+    await src.resolve(transport);
+    assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID })?.apiKey,
+      SECRET);
+  });
+
+  it("answers NOTHING for anybody else's provider", async () => {
+    // The host also asks the plugins behind a provider's other refs. Our key
+    // on the customer's Anthropic or OpenAI request is a credential handed to
+    // a third party.
+    const { provider } = await delivered();
+    for (const p of ["anthropic", "openai", "openai-completions", "", undefined,
+      `${PROVIDER_ID}-x`, PROVIDER_ID.toUpperCase()]) {
+      assert.equal(provider.resolveSyntheticAuth({ provider: p }), undefined,
+        `provider=${JSON.stringify(p)} must not be handed the flywheel key`);
+    }
+    assert.equal(provider.resolveSyntheticAuth(null), undefined);
+    assert.equal(provider.resolveSyntheticAuth(undefined), undefined);
+  });
+
+  it("answers NOTHING before the read, or for an endpoint not named for the key", async () => {
+    const api = hostApi();
+    registerServingPolicy(api, {
+      config: productionConfig({ apiKey: SECRET }),
+      pluginId: PLUGIN_ID, logger: fakeLogger(),
+      transport: fakeTransport({ policy: GATEWAY }), hostConfig: {},
+    });
+    assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID }),
+      undefined, "nothing is named before the control plane has answered");
+
+    const { provider, logger } = await delivered(SERVED);
+    assert.equal(provider.resolveSyntheticAuth({ provider: PROVIDER_ID }), undefined,
+      "an endpoint with no api_key_env gets the host's own credential, not ours");
+    const line = logger.lines.find((l) => l.includes("applying the approved model"));
+    assert.ok(line.includes(`models.providers.${PROVIDER_ID}`),
+      "and the startup line says where that credential has to come from");
+    assert.ok(!line.includes(`plugins.entries.${PLUGIN_ID}.config.apiKey`));
+  });
+
+  it("the startup line names the flywheel key EXACTLY", async () => {
+    const { logger } = await delivered();
+    const line = logger.lines.find((l) => l.includes("applying the approved model"));
+    assert.ok(line, logger.text());
+    assert.ok(line.includes(GATEWAY.endpoint.base_url));
+    assert.ok(line.includes(`names ${FLYWHEEL_KEY_ENV}`));
+    assert.ok(line.includes(`plugins.entries.${PLUGIN_ID}.config.apiKey`));
+    assert.ok(line.includes(FLYWHEEL_KEY_ENV));
+    assert.match(line, /takes precedence/,
+      "an operator's own models.providers entry still wins, and must be told so");
+  });
+
+  it("the provider's auth hint names the flywheel key EXACTLY", async () => {
+    const { provider } = await delivered();
+    const { hint } = provider.auth[0];
+    assert.ok(hint.includes(FLYWHEEL_KEY_ENV), hint);
+    assert.ok(hint.includes(`plugins.entries.${PLUGIN_ID}.config.apiKey`), hint);
+    assert.ok(hint.includes(`models.providers.${PROVIDER_ID}.apiKey`), hint);
+  });
+
+  it("the key is never logged and never exposed by a getter", async () => {
+    const { logger, src } = await delivered();
+    assert.ok(!logger.text().includes(SECRET), "a log line carried the flywheel key");
+    for (const key of ["policy", "prompt", "appliedPrompt", "appliedModel",
+      "refusal", "modelRefusal", "servedAgent"]) {
+      assert.ok(!JSON.stringify(src[key] ?? null).includes(SECRET),
+        `the ${key} getter exposes the flywheel key`);
+    }
+    assert.equal(src.appliedModel.credential, FLYWHEEL_KEY_CREDENTIAL,
+      "the handle says WHICH credential, never the credential");
+  });
+});
+
+
+describe("resolved once — no timer re-polls the recorded decision", () => {
+  // THE RECORDED DECISION (policy.js, "RESOLVED ONCE, NOT POLLED"): a policy
+  // that moves under a running agent splits its traffic across two
+  // behaviours with nothing recording the seam, so `ttl_s` is not honoured
+  // and the remedy for a moved answer is a restart on `serving_generation`.
+  // With the gateway's constant URL only the FIRST delivery needs it. This is
+  // what holds that decision against a re-poll being added back.
+  it("never re-reads /policy/current, however far past ttl_s the clock runs", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const api = hostApi();
+    const transport = fakeTransport({ policy: GATEWAY });
+    const src = registerServingPolicy(api, {
+      config: productionConfig(),
+      pluginId: PLUGIN_ID, logger: fakeLogger(), transport, hostConfig: {},
+    });
+    for (let i = 0; i < 20 && !src.resolved; i += 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+    assert.equal(src.resolved, true);
+    assert.equal(transport.calls.filter((c) => c === "policy").length, 1);
+
+    const ttlMs = GATEWAY.ttl_s * 1000;
+    for (let i = 0; i < 10; i += 1) {
+      t.mock.timers.tick(ttlMs);
+      await new Promise((r) => setImmediate(r));
+      // A turn is the other place a re-poll could hide: the hooks read the
+      // recorded answer and nothing else.
+      api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN);
+      api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN);
+      await new Promise((r) => setImmediate(r));
+    }
+    assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
+      `/policy/current was re-read after ${GATEWAY.ttl_s}s: ${transport.calls}`);
+    assert.equal(transport.calls.filter((c) => c === "prompt").length, 1);
+    assert.deepEqual(api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN), {
+      providerOverride: PROVIDER_ID, modelOverride: GATEWAY.endpoint.model,
+    }, "the startup answer is the answer for the life of the process");
   });
 });
 
