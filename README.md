@@ -255,6 +255,16 @@ One thing does move without a restart, and it moves on the control plane's side,
 
 A withdrawal (`endpoint: null, withdrawn: true`) is, like the first delivery, a change of *address*, which a running agent cannot reach at all without a restart. Until it restarts it keeps sending its completions to the gateway URL, where the control plane has no approved model to answer a withdrawn agent with; at its next start the plugin reads the withdrawal and leaves the model your host configures in place. Restart on the withdrawal's `serving_generation` as part of the rollback.
 
+**When the gateway cannot serve the delivered model it says why, by a code and whose it is.** The body is `{"detail": {"code": ..., ...}}`; the codes are part of the control plane's published contract (`GET /api/v2/contract`, `x-refusal-codes`), which also carries the control plane's own refusals (promote, rollback, launching a hill climb).
+
+| `code` | HTTP | Whose | What it means and what to do |
+|---|---|---|---|
+| `no_delivered_policy` | 404 | yours | The agent was moved back to the base model and has no upstream of its own registered, so there is nothing to call. Run your own configuration, or register an upstream. |
+| `policy_concurrency_limited` | 429 | yours | Your organization already has the allowed number of delivered-model calls in flight. Retry after `Retry-After`. |
+| `policy_host_unavailable` | 503 | environment | The host serving the delivered model cannot serve now, and no upstream of your own is registered to fall back to. Retry after `Retry-After`. |
+| `policy_resolution_unavailable` | 503 | environment | The control plane could not resolve which model to serve, so the gateway refuses rather than call a model nobody delivered. Retry after `Retry-After`. |
+| `policy_endpoint_key_unavailable` | 500 | PerceptEye | Not yours to fix: the gateway could not authenticate the delivered model's host. Give PerceptEye support the agent id and the time. |
+
 **What stops the prompt being applied**, each logged with its own reason:
 
 | | |
