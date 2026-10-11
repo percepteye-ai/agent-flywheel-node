@@ -97,13 +97,15 @@ Want it to start contributing? Add a key and one host setting:
 export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch.percepteye.ai
 ```
 
-**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. Connect your agent there and you get its key — shown once, and scoped to that one agent. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
+**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. There, choose **Add → An agent → Connect it with our SDK** and give it the agent id your agent reports as: you get its key — shown once, and scoped to that one agent. A lost key is replaced from the agent's own page: **Agents** → your agent → **Get a new key**. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
 
 <!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
      control plane, and sign-in is free and self-serve at
      https://launch.percepteye.ai (HTTP 200, "Mission Control · PerceptEye").
-     Connecting an agent there issues its key -- shown once, bound to that
-     agent. The Python README says the same; keep the two in step. -->
+     Adding the agent there (Add -> An agent -> Connect it with our SDK)
+     issues its key -- shown once, bound to that agent; capture is switched
+     on in that path's Permissions step (2026-10-11). The Python README says
+     the same; keep the two in step. -->
 
 ```jsonc
 // your OpenClaw config
@@ -192,7 +194,7 @@ export PERCEPTEYE_AGENT_MODE=production   # for the process serving your users
 | Puts a task into your agent's context | yes | **no** |
 | Starts turns by itself | yes | **no** |
 | Captures the turns you serve | n/a | yes |
-| Uploads them | n/a | only once an operator enables it |
+| Uploads them | n/a | only once an org admin switches capture on (the **Permissions** step of adding the agent) |
 | **Applies your approved system prompt** | **no** | **yes** — off with `PERCEPTEYE_APPLY_PROMPT=0` |
 | **Points your agent at the approved model** | **no** | **yes**, with `hooks.allowConversationAccess: true` — off with `PERCEPTEYE_APPLY_MODEL=0` |
 
@@ -236,11 +238,11 @@ adapters may supply it as `taskId`/`task_id` on an event or hook context. Invali
 or conflicting values are omitted rather than cleaned into another identifier;
 valid task-only turns still reach the control plane for downstream validation.
 
-**Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (an operator withdrew consent, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
+**Uploading is off until an org admin turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. Capture is switched on in the **Permissions** step of adding the agent (**Add → An agent → Connect it with our SDK**). There are two switches, its conversations and their message text, and training from the agent needs both. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear there — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (consent was withdrawn, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
 
 Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
 
-**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt with images, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
+**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent (the second switch in the same **Permissions** step), the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt with images, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
 
 ### The approved pair, applied
 
