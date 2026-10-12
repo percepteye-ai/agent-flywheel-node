@@ -102,7 +102,7 @@ export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch
 <!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
      control plane, and sign-in is free and self-serve at
      https://launch.percepteye.ai (HTTP 200, "Mission Control · PerceptEye").
-     Adding the agent there (Add -> An agent -> Connect it with our SDK)
+     Adding the agent there (New mission -> An agent -> Connect it with our SDK)
      issues its key -- shown once, bound to that agent; capture is switched
      on in that path's Permissions step (2026-10-11). The Python README says
      the same; keep the two in step. -->
