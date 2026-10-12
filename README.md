@@ -97,7 +97,7 @@ Want it to start contributing? Add a key and one host setting:
 export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch.percepteye.ai
 ```
 
-**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. There, choose **Add → An agent → Connect it with our SDK** and give it the agent id your agent reports as: you get its key — shown once, and scoped to that one agent. A lost key is replaced from the agent's own page: **Agents** → your agent → **Get a new key**. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
+**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. There, choose **New mission → An agent → Connect it with our SDK** and give it the agent id your agent reports as: you get its key — shown once, and scoped to that one agent. A lost key is replaced from the agent's own page: **Agents** → your agent → **Get a new key**. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
 
 <!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
      control plane, and sign-in is free and self-serve at
@@ -238,7 +238,7 @@ adapters may supply it as `taskId`/`task_id` on an event or hook context. Invali
 or conflicting values are omitted rather than cleaned into another identifier;
 valid task-only turns still reach the control plane for downstream validation.
 
-**Uploading is off until an org admin turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. Capture is switched on in the **Permissions** step of adding the agent (**Add → An agent → Connect it with our SDK**). There are two switches, its conversations and their message text, and training from the agent needs both. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear there — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (consent was withdrawn, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
+**Uploading is off until an org admin turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. Capture is switched on in the **Permissions** step of adding the agent (**New mission → An agent → Connect it with our SDK**). There are two switches, its conversations and their message text, and training from the agent needs both. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear there — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (consent was withdrawn, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
 
 Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
 
@@ -295,7 +295,7 @@ If your agent already records its model calls as OpenTelemetry spans — the [Ge
 POST $PERCEPTEYE_CONTROL_PLANE_URL/agents/<agent_id>/otlp/v1/traces
 ```
 
-In the dashboard, add the agent with **Add → An agent → It sends OpenTelemetry**: one click names it, gives it its key and registers it, then its **Permissions** step opens, then its full endpoint is shown, ready to copy (and again on the agent's own page, its **Agent** tab). With the OpenTelemetry SDK's exporter:
+In the dashboard, add the agent with **New mission → An agent → It sends OpenTelemetry**: one click names it, gives it its key and registers it, then its **Permissions** step opens, then its full endpoint is shown, ready to copy (and again on the agent's own page, its **Agent** tab). With the OpenTelemetry SDK's exporter:
 
 ```bash
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="$PERCEPTEYE_CONTROL_PLANE_URL/agents/support-agent/otlp/v1/traces"
@@ -317,7 +317,7 @@ service:
       exporters: [otlphttp/percepteye]
 ```
 
-**Auth** is the agent's own key (`pefw_…`), sent as a Bearer token: the key you get when you add the agent in the dashboard (**Add → An agent**). A key bound to a different agent is refused.
+**Auth** is the agent's own key (`pefw_…`), sent as a Bearer token: the key you get when you add the agent in the dashboard (**New mission → An agent**). A key bound to a different agent is refused.
 
 **Consent comes first, and nothing is read without it.** The agent has to be known to the control plane, and both capture switches have to be on in the **Permissions** step of adding it: its conversations, and their message text. Until both are on, every push is answered `403` and nothing in it is read. The model-content tier is granted only while exactly one active Product declares the agent, as for the SDK. The dashboard's **It sends OpenTelemetry** path registers the agent for you; the push endpoint never registers an agent itself. Through the API instead, an agent that never runs this SDK registers once, so that its Permissions can be switched on:
 
