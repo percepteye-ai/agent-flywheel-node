@@ -37,16 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 683 was true on 2026-10-01 (it had drifted to 666, 633, 596, 490,
-     and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 683" / "skipped 0")
+     its 705 was true on 2026-10-02 (it had drifted to 683, 666, 633, 596,
+     490, and before that 373, while the suite grew). Re-derive with
+     `npm test` (prints "tests 705" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-683_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-705_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -61,7 +61,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
 **Your agent already does real work. This turns that work into training data, and hands back a model trained on it.**
 
-No container to build. No cluster to run. No GPU to provision. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you.
+No container to build. No cluster to run. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you. GRPO trains on compute you connect; your first on-policy self-distillation (OPSD) model trains on PerceptEye's.
 
 <br/>
 
@@ -143,7 +143,7 @@ That last beat is what makes it a flywheel rather than a pipeline: **the better 
 > [!IMPORTANT]
 > **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` once at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
 >
-> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. Separately, if the served endpoint requires a credential it comes from your own `models.providers.percepteye-flywheel.apiKey`.
+> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. The credential is supplied for you when the control plane names `PERCEPTEYE_API_KEY` for a served endpoint at the control plane's own address — the case for every model PerceptEye serves, which arrives as Mission Control's constant gateway URL for this agent: the registered provider authenticates with this plugin's own flywheel key (`plugins.entries.agent-flywheel.config.apiKey`, or `PERCEPTEYE_API_KEY`). The address matters because the name alone does not settle it: a control plane without the gateway names the same variable for a self-hosted endpoint's raw address, and the key is never sent anywhere other than the control plane it already goes to — the startup line says so when that is the reason. For any other endpoint the credential comes from your own `models.providers.percepteye-flywheel.apiKey`, and an `apiKey` you set there always takes precedence. A key the control plane puts in the answer itself (`endpoint.api_key`, for a provider endpoint you own) is not used by this plugin, although the Python SDK uses it: set that provider's key in `models.providers.percepteye-flywheel.apiKey`.
 
 <br/>
 
@@ -249,7 +249,21 @@ With a key set, a `production` install also asks the control plane, **once at st
 - `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
 - `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
 
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does.
+Once, not per turn: this process never changes what it applies while it runs, because an answer that moved under a running agent would split its traffic across two behaviours with nothing in the process recording where the seam was. Restart to pick up a new answer — `serving_generation` changes when and only when the answer does.
+
+One thing does move without a restart, and it moves on the control plane's side, not in this process. A model PerceptEye serves is delivered as Mission Control's constant gateway URL for this agent, and the control plane decides behind that URL which checkpoint answers each call — so after the **first** delivery, a promotion or rollback between served checkpoints changes the *model* your running agent gets without a restart. It changes nothing else: the approved prompt this process read at startup stays applied, and the startup line's pair statement still describes the startup answer. A promotion whose bundle carries a different approved prompt therefore runs the old prompt over the new checkpoint — not the pair that was certified — until the agent restarts on the new `serving_generation`. So restart on `serving_generation` after a promotion or a rollback as well; the gateway only means the model does not wait for that restart.
+
+A withdrawal (`endpoint: null, withdrawn: true`) is, like the first delivery, a change of *address*, which a running agent cannot reach at all without a restart. Until it restarts it keeps sending its completions to the gateway URL, where the control plane has no approved model to answer a withdrawn agent with; at its next start the plugin reads the withdrawal and leaves the model your host configures in place. Restart on the withdrawal's `serving_generation` as part of the rollback.
+
+**When the gateway cannot serve the delivered model it says why, by a code and whose it is.** The body is `{"detail": {"code": ..., ...}}`; the codes are part of the control plane's published contract (`GET /api/v2/contract`, `x-refusal-codes`), which also carries the control plane's own refusals (promote, rollback, launching a hill climb).
+
+| `code` | HTTP | Whose | What it means and what to do |
+|---|---|---|---|
+| `no_delivered_policy` | 404 | yours | The agent was moved back to the base model and has no upstream of its own registered, so there is nothing to call. Run your own configuration, or register an upstream. |
+| `policy_concurrency_limited` | 429 | yours | Your organization already has the allowed number of delivered-model calls in flight. Retry after `Retry-After`. |
+| `policy_host_unavailable` | 503 | environment | The host serving the delivered model cannot serve now, and no upstream of your own is registered to fall back to. Retry after `Retry-After`. |
+| `policy_resolution_unavailable` | 503 | environment | The control plane could not resolve which model to serve, so the gateway refuses rather than call a model nobody delivered. Retry after `Retry-After`. |
+| `policy_endpoint_key_unavailable` | 500 | PerceptEye | Not yours to fix: the gateway could not authenticate the delivered model's host. Give PerceptEye support the agent id and the time. |
 
 **What stops the prompt being applied**, each logged with its own reason:
 
@@ -270,6 +284,7 @@ Once, not per turn: a policy that moves under a running agent splits a process's
 | `PERCEPTEYE_APPLY_MODEL=0` | you switched it off |
 | the conversation opt-in missing | `before_model_resolve` is a conversation hook; without `hooks.allowConversationAccess: true` this host never delivers it |
 | no provider could be registered | the registered provider is the only thing that can supply the served `base_url`, so if your host has no provider surface or refuses the id, the model half is refused rather than pointing your agent at a provider the host does not know |
+| the model withdrawn | the control plane took the approved model away (`withdrawn: true` — for instance, this agent was moved back to the base arm and there is no champion to serve), so the model your host configures stands from this start on — see above for the agent that was already running. The log line carries the control plane's own reason |
 | no endpoint served | this agent is on the champion arm, or its candidate is not deployed anywhere — nothing to point at |
 | an archive reference as the model | a `gs://` or `s3://` path is a stored artifact, not a name an endpoint can serve; sending it would 404 every completion |
 
@@ -376,7 +391,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 
 ## ✨ Why it earns its place
 
-- 🪶 **Zero runtime dependencies.** Node builtins only — no version conflict imposed on a customer who did not ask for one, enforced by a CI job.
+- 🪶 **Zero runtime dependencies.** Node builtins only — no version conflict imposed on a customer who did not ask for one, enforced by the test suite. The OpenTelemetry API is an *optional* peer, which npm never installs: when it is installed where this plugin can load it, spans go to your own tracer, and when it is not, nothing happens.
 - 🔌 **Kill switches that really are ones.** `PERCEPTEYE_CAPTURE=0` subscribes no hooks and records nothing; `PERCEPTEYE_APPLY_PROMPT=0` subscribes no prompt hook and does not even fetch the prompt text; `PERCEPTEYE_APPLY_MODEL=0` subscribes no model hook and registers no provider. In every case the guarantee is the absence of the subscription, not a branch inside a handler.
 - ⚖️ **It applies an approved pair, or says why it did not.** Every refusal names its own cause rather than one message covering all of them — and when only one half lands it warns and names *which*, because half of a certified combination is not the improvement that was measured.
 - 🎯 **One agent's approval changes one agent.** The approved prompt and model reach that agent's own served turns and nothing else — not its subagents, not its scheduled turns, not another agent in the same gateway. Where identity cannot be established, nothing is applied.
@@ -404,7 +419,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 683 tests, no install step — node:test, zero dependencies
+npm test     # 705 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

@@ -38,6 +38,11 @@
  * kind of term that arrives in a comment explaining a wire contract, which is
  * how three of them once reached a published schema description.
  *
+ * The lists stay identical; what is exempt is not a TERM but one (file, term)
+ * pair, `WIRE_FIXTURE_TERMS`: a fixture both SDKs vendor byte for byte from
+ * the control plane's public response. The Python package's copy of that
+ * fixture carries the same bytes, so its guard needs the same pair.
+ *
  * ── SCANNED AS BYTES, DECODED STRICTLY ────────────────────────────────────
  *
  * A binary asset carries no text and is skipped, rather than decoded
@@ -74,6 +79,26 @@ const INTERNAL_DETAILS = [
   "max-loras", "vllm", "offline_grpo", "bundle_materializer",
   "scored_suite_sha", "prompt_group_key", "doctrine",
 ];
+
+/**
+ * WIRE FIXTURES ONLY: a term a byte copy of the control plane's PUBLIC
+ * response carries, as `[file, term, why]`.
+ *
+ * Such a file discloses nothing: every customer's agent already receives
+ * those bytes from the endpoint. It also cannot be reworded here -- it is held
+ * byte-equal to the Python SDK's and the control plane's copies
+ * (`fixture_parity.test.js`) -- so the cheap way out, editing the fixture, is
+ * exactly the drift that test refuses. Narrow on purpose: one term, in one
+ * file, and `every wire-fixture exemption is still needed` below fails the
+ * day the term leaves the file, so an exemption cannot outlive its reason.
+ */
+const WIRE_FIXTURE_TERMS = [
+  ["test/fixtures/policy_current_gateway.json", "vllm",
+    "model.kind of a served adapter, exactly as GET /policy/current returns it"],
+];
+
+const isWireFixtureTerm = (rel, term) =>
+  WIRE_FIXTURE_TERMS.some(([file, t]) => file === rel && t === term);
 
 /** Extensions that are documentation assets, never package payload. */
 //: A developer's absolute home path, ANCHORED AT A PATH ROOT. Exported here
@@ -150,11 +175,25 @@ describe("the open-source boundary", () => {
       const text = textOf(rel);
       if (!text) continue;
       for (const name of INTERNAL_DETAILS) {
+        if (isWireFixtureTerm(rel, name)) continue;
         if (text.includes(name)) offenders.push(`${rel} -> ${name}`);
       }
     }
     assert.deepEqual(offenders, [],
       `internal detail disclosed in PUBLISHED files:\n${offenders.join("\n")}`);
+  });
+
+  it("every wire-fixture exemption is still needed", () => {
+    // An exemption whose term has left its file is a hole with no reason
+    // behind it: the next copy of that term into the file would pass unseen.
+    const published = new Set(publishedFiles());
+    for (const [file, term, why] of WIRE_FIXTURE_TERMS) {
+      assert.ok(why, `${file} -> ${term} must say why it is exempt`);
+      assert.ok(INTERNAL_DETAILS.includes(term), `${term} is not a forbidden term`);
+      assert.ok(published.has(file), `${file} is not a tracked file`);
+      assert.ok(textOf(file).includes(term),
+        `${file} no longer carries ${term}: remove its exemption`);
+    }
   });
 
   it("publishes no local developer path", () => {
