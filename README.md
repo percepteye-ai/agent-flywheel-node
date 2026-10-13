@@ -1,5 +1,6 @@
 <div align="center">
 
+<!-- lang -->
 <!-- FIGURE PATHS ARE RELATIVE, DELIBERATELY — and this is the second time it
      has been settled. They render on GitHub, which is what these GIFs are for.
      Absolute https://raw.githubusercontent.com/... URLs were tried, on the
@@ -17,17 +18,22 @@
 
      Held by a test, not by this comment: `test/oss-boundary.test.js` asserts every
      <img> src is relative AND names a file that exists. Shields badges are
-     markdown `![](https://…)`, not <img>, and are correctly absolute. -->
+     markdown `![](https://…)`, not <img>, and are correctly absolute.
+
+     SHARED WITH THE PYTHON README. Everything outside the lang markers is
+     the same text in both repositories, held by test/shared-docs.test.js;
+     only what sits between the markers is this package's own. -->
 
 # <img src="docs/assets/flywheel-spinner.gif" height="44" alt="" align="absmiddle"> Agent Flywheel — Node
+<!-- /lang -->
 
 Built and Maintained by **[PerceptEye](https://percepteye.ai)**
 
-### **Your agent gets better at its own job, on its own work, without you writing a training pipeline.**
+### **Your agent gets better at its own job, from its own conversations.**
 
-**It keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
-One plugin. Zero runtime dependencies. Zero lines changed in your agent.
+Your agent keeps running where it runs today, on your credentials, unchanged. We learn from its real conversations, test each new version against its current best, and you approve the winner.
 
+<!-- lang -->
 <!-- BADGES — `npm` is the only live-data badge in this README: it reads the
      registry, so it cannot claim a release that never happened. Never swap it
      for a static badge with a hand-written version — that asserts a release
@@ -37,442 +43,164 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 683 was true on 2026-10-01 (it had drifted to 666, 633, 596, 490,
+     its 692 was true on 2026-10-13 (it had drifted to 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 683" / "skipped 0")
+     (prints "tests 692" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
-[![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
-[![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-683_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-harnesses)
+[![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-start)
+[![tests](https://img.shields.io/badge/tests-692_·_0_skips-22c55e?style=for-the-badge)](#-development)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
      width="1040"
      alt="Your agent — prompt, tools and model — sits inside your infrastructure. The plugin loads beside it in your harness with zero lines changed inside. Rollouts and observed outcomes go out; a trained policy comes back. Both the system prompt row and the model row flip to what the control plane approved for this agent, while the tools row stays untouched.">
+<!-- /lang -->
 
-**[Install](#-install-in-one-call)** · [How the loop closes](#-how-the-loop-closes) · [Harnesses](#-harnesses) · [Modes](#-two-modes-one-switch) · [Production observability](#-production-observability) · [OpenTelemetry push](#-already-on-opentelemetry-push-your-spans-instead) · [Human approval](#-a-person-approves-every-change) · [Configuration](#-configuration) · [Python or Node?](#-python-or-node)
+**[Quickstart](docs/quickstart.md)** · [How it gets better](#-how-it-gets-better) · [Start](#-start) · [OpenTelemetry push](docs/otlp.md) · [What reaches us](#-what-reaches-us) · [Docs](#-docs)
 
 </div>
 
 ---
 
-**Your agent already does real work. This turns that work into training data, and hands back a model trained on it.**
+## 🔁 How it gets better
 
-No container to build. No cluster to run. No GPU to provision. No inbound port to open. No labelling team. No eval suite to write. Your agent does not move — a plugin loads beside it, watches what its tools actually did, and feeds a control plane that does the post-training for you.
+1. **We learn from your agent's real conversations.** The SDK records what your users asked, what the model saw, what the tools did and what your agent answered, and sends it to us once you allow it.
+2. **Each new version is tested against your agent's current best,** on conversations it has never seen.
+3. **You approve the winner in Decisions.** Nothing reaches your users before that.
+4. **The next round starts from the best so far.** Run it again whenever new conversations have arrived.
 
-<br/>
+No container to build, no cluster to run, no GPU to provision and no inbound port to open. Every connection is opened from your side.
 
-## 🎯 What you get
+## ⚡ Start
 
-| | |
-|:--|:--|
-| 🔁 **A continual-learning loop** | your agent runs graded tasks, its real outcomes go back, and the next model is trained on *this agent's* work — not a generic benchmark |
-| 🤖 **Autonomous post-training** | task generation, grading, dataset construction, training and promotion happen on our side. You build none of it |
-| 🧪 **Honest discovery** | the plugin reads the assembled prompt and effective model; current OpenClaw does not expose tools on `llm_input`, so the catalogue stays explicitly incomplete instead of being invented — until you declare it with [`describe`](#-configuration) |
-| 📈 **Honest telemetry on day one** | your agent's true tool-failure rate, recorded locally, with **no account and no network** |
-| 📡 **Production observability** | capture the turns you actually serve — the user's message, the tool calls, the answer — and turn live traffic into evidence |
-| ✅ **The approved pair, applied** | training co-optimizes a system prompt alongside the model. Once *a person on your side approves each*, your production install runs **both** — the prompt, and the checkpoint it was certified with. No redeploy; one switch each to stop |
-| 🙋 **A person approves every change** | nothing reaches your agent that a human with the operator role did not approve through an explicit control. Not a percentage rollout, not an automated promotion, and never a language model reading "sure, go ahead". [How that is enforced](#-a-person-approves-every-change) |
-| 🛡️ **It never touches a tool result** | the recording hook returns `void`. It can never change, block, delay or replace what a tool returns. The two things this plugin *does* change are the system prompt and the model — production mode only, approved bundles only, this agent's own turns only, and off with [`PERCEPTEYE_APPLY_PROMPT=0` / `PERCEPTEYE_APPLY_MODEL=0`](#-two-modes-one-switch) |
-
-<br/>
-
-## ⚡ Install in one call
-
-One package, two harnesses. Pick your line:
-
+<!-- lang -->
 ```bash
-openclaw plugins install @percepteye/agent-flywheel          # OpenClaw
-dsh plugin --profile <name> add @percepteye/agent-flywheel   # DeepSeek Harness
+openclaw plugins install @percepteye/agent-flywheel     # zero runtime dependencies
 ```
 
-**That's the integration.** No import, no wrapper process, no sidecar. Start your agent exactly the way you always did.
-
-Want it to start contributing? Add a key and one host setting:
-
 ```bash
-export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch.percepteye.ai
+export PERCEPTEYE_AGENT_MODE=production
+export PERCEPTEYE_AGENT_ID=support-agent      # the name you gave the agent in the dashboard
 ```
-
-**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. There, choose **New mission → An agent → Connect it with our SDK** and give it the agent id your agent reports as: you get its key — shown once, and scoped to that one agent. A lost key is replaced from the agent's own page: **Agents** → your agent → **Get a new key**. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
-
-<!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
-     control plane, and sign-in is free and self-serve at
-     https://launch.percepteye.ai (HTTP 200, "Mission Control · PerceptEye").
-     Adding the agent there (New mission -> An agent -> Connect it with our SDK)
-     issues its key -- shown once, bound to that agent; capture is switched
-     on in that path's Permissions step (2026-10-11). The Python README says
-     the same; keep the two in step. -->
 
 ```jsonc
-// your OpenClaw config
+// your OpenClaw config: lets the plugin read the conversation
 { "plugins": { "entries": { "agent-flywheel": {
     "hooks": { "allowConversationAccess": true } } } } }
 ```
+<!-- /lang -->
 
-That setting does **three** jobs, and every one of them is dropped without it. It lets the plugin read your agent's answer (`agent_end`), describe your agent (`llm_input`), and **point your agent at the approved model** (`before_model_resolve`) — OpenClaw classes all three as conversation hooks and drops them for non-bundled plugins unless you opt in. The plugin **refuses to claim work without it** rather than half-working, and says once, at startup, which capability it is missing and why. Applying the approved *prompt* is the one thing that does **not** need it.
+[Get your key](docs/dashboard.md#get-your-key), and put it in your agent's environment with the control-plane URL shown beside it:
 
-> [!TIP]
-> Scalar settings have both an OpenClaw config key and an environment variable, and config wins over the environment. Exact execution evidence is a nested, config-only adapter snapshot. The full table is under [Configuration](#-configuration).
+```bash
+export PERCEPTEYE_CONTROL_PLANE_URL=https://launch.percepteye.ai/api/flywheel/v1
+export PERCEPTEYE_API_KEY=pefw_...
+```
 
-> [!NOTE]
-> **Set `agentId` to the OpenClaw agent this install serves** if your host runs more than one. That name is how the control plane knows the agent *and* how the plugin decides whose approved prompt and model to apply. On a host running a single agent — the ordinary install — there is nothing to disambiguate and you can leave it alone. On a host running several with none of them named, the plugin applies **nothing** and says so at startup, because guessing would swap a bystander's prompt.
+Start your agent, give it [permission to learn from its conversations](docs/dashboard.md#allow-us-to-learn-from-its-conversations), and [start improving](docs/dashboard.md#start-improving). The [Quickstart](docs/quickstart.md) walks through it, including when your first trace appears.
 
-<br/>
+## 🧩 Harnesses
 
-## 🔁 How the loop closes
+<!-- lang -->
+| your agent | what the plugin records | your code |
+|:--|:--|:--|
+| **OpenClaw** | conversations, model calls, and every tool call's outcome; practice tasks in training mode; applies the approved prompt and model in production mode | none: install the plugin, set `hooks.allowConversationAccess` |
+| **DeepSeek Harness** | every tool call's outcome | none: `dsh plugin --profile <name> add @percepteye/agent-flywheel` |
 
+The plugin has zero runtime dependencies, and no hook it registers can change a tool result.
+<!-- /lang -->
+
+Running something else that exports OpenTelemetry traces? [Push them](docs/otlp.md), with nothing to install.
+
+## 📤 Already on OpenTelemetry?
+
+Send us the traces your agent already exports, as a second destination. With an OpenTelemetry Collector you add us as one more exporter, and your current destination keeps receiving everything. → [OpenTelemetry push](docs/otlp.md)
+
+## 🎯 Practice tasks
+
+Your agent can also work through practice tasks we write from its own tools and system prompt, graded as it goes. You [start them](docs/dashboard.md#run-practice-tasks) from your agent's page.
+
+<!-- lang -->
 <p align="center">
   <img src="docs/assets/flywheel-loop.gif" width="980"
        alt="The SDK inside the customer's agent, talking to the control plane. On the left, inside your infrastructure: install the plugin, your harness loads it, your agent runs unchanged, and its trajectory is recorded. A dashed trust boundary splits the picture. On the right, the control plane: it generates tasks from your tool surface, scores every rollout, trains the policy, and hands a candidate back as an endpoint you can call. A return arrow closes the ring — the better agent runs the next lap. The figure predates delivery: both halves — the approved system prompt and the model it was certified with — now return all the way into the agent, once a person has approved each.">
 </p>
 
-| beat | what happens | who does the work |
-|:--|:--|:--|
-| **⓪ Describe** | the plugin records the assembled prompt and effective model; tools remain `null` on the current host API unless an adapter supplies them | automatic, honestly incomplete |
-| **① Claim** | training mode registers this exact worker, then claims one graded task at a time; an exact startup snapshot binds claims to that execution | you dial out — no inbound port |
-| **② Run** | the task is delivered into your agent's context, in a dedicated `percepteye-rollout-*` session | your agent, unchanged |
-| **③ Record** | every executed tool call lands as `ok` / `failed` / **`unknown`** | the `after_tool_call` hook |
-| **④ Report** | the trajectory and answer go back; unsupported evidence stays absent | the plugin |
-| **⑤ Train** | tasks generated, rollouts graded, dataset built, policy trained and promoted | **PerceptEye — you build none of it** |
-| **⑥ Serve** | the approved system prompt **and** the model it was certified with are applied to your production install automatically, once a person has approved each | the plugin |
+In training mode, the default, the plugin claims practice tasks and runs each in its own `percepteye-rollout-*` session, never one you are using. Training mode needs `hooks.allowConversationAccess: true`; `PERCEPTEYE_AGENT_MODE=production` claims none. → [Reference](docs/reference.md#two-modes-one-switch)
+<!-- /lang -->
 
-That last beat is what makes it a flywheel rather than a pipeline: **the better agent generates the better evidence.**
+## 🔒 What reaches us
 
-> [!IMPORTANT]
-> **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` once at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
->
-> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. Separately, if the served endpoint requires a credential it comes from your own `models.providers.percepteye-flywheel.apiKey`.
+- **Nothing, until you allow it.** Conversations are sent only once an organization admin switches on the agent's [permissions](docs/dashboard.md#allow-us-to-learn-from-its-conversations). Until then they stay on your disk.
+- **Personal data is found, and never learned from.** We scan everything we receive. In tool-call records a match is masked; in messages and what the model saw, the turn is kept as sent and never learned from.
+- **Nothing is deleted unless you ask**, and your own copy on your machine is yours. → [What data do you keep?](docs/faq.md#what-data-do-you-keep-and-for-how-long)
+- **Never your code, and never your credentials.** Your agent runs where it runs today.
 
-<br/>
+## ✋ A person approves every change
 
-## 🧩 Harnesses
+- **A new version reaches Decisions only after it has beaten your agent's current best** on conversations it has never seen. You approve it or reject it there; until you approve, your agent keeps the version it has.
+- **No language model can approve anything.** Promoting a model and delivering a prompt are irreversible decisions: only the explicit approve and reject controls resolve them. A reply like "sure, go ahead" is recorded as an answer, never as an approval.
+- **The SDK checks too.** It refuses a model whose address is a stored file (`gs://`, `s3://`, `file://`) rather than a running endpoint, and a prompt that a person did not approve or that was approved against a different model.
 
-| harness | records outcomes | rollouts | production turn capture | applies the approved prompt | applies the approved model |
-|:--|:--|:--|:--|:--|:--|
-| **OpenClaw** | ✅ `after_tool_call` | ✅ training mode | ✅ | ✅ `before_prompt_build` | ✅ `before_model_resolve` + a registered provider (needs `allowConversationAccess`) |
-| **DeepSeek Harness** | ✅ `tools/result` | — | — | — | — |
-
-**Rollouts are the OpenClaw lane.** DeepSeek Harness exposes no seam for handing a task to a running agent, so on dsh this plugin records outcomes and nothing else, in every mode — it writes to `PERCEPTEYE_TRAJECTORY_DIR` and with that unset it writes nothing.
-
-**This OpenClaw adapter does not claim `llm_call_count`.** The host's public `llm_input` / `llm_output` hooks bracket a whole attempt and expose no provider-call id; one attempt may contain tool loops, retries, or compaction and therefore several provider calls. Counting those hooks or assistant messages would be a guess. The plugin reports no count, and Mission Control excludes the rollout from verified on-policy training even when its gateway has its own count. A future host adapter may use the framework-neutral counter only when its host exposes independently identified per-call start and terminal evidence. DeepSeek Harness also makes no model-call-count claim.
-
-**Every recording hook is structurally incapable of altering a run**: OpenClaw's `after_tool_call` returns `void`, and dsh's `tools/result` is `@mode emit` over deep-frozen objects. The tool-result mutation seams both harnesses expose — result middleware, `tools/post` — are deliberately unused, in every mode. A collector that can corrupt the run it is measuring is worse than no collector.
-
-**The behavior-changing seams are separate from recording.** In production,
-`before_prompt_build` returns the approved system prompt and
-`before_model_resolve` returns the approved provider and model — beat ⑥ of the
-loop rather than telemetry. In training, `before_agent_run` blocks a queued
-turn if its lease expired before model submission, and `before_tool_call`
-blocks any later side effects after an active lease is revoked. OpenClaw does
-not expose an ordinary-plugin API for aborting an already-active model loop,
-so that loop may wind down, but it cannot start another tool call or report a
-stale result. None of these gates is registered by the production rollout
-lane, because that lane does not exist in production mode.
-
-**The registered provider answers for its own id and nothing else.** OpenClaw asks every registered provider plugin to normalise a transport when the matched one declines, so a provider that answered unconditionally would silently redirect your Anthropic or OpenAI traffic. This one returns nothing unless the provider being assembled is `percepteye-flywheel` — the id it registers, and the id it names in `before_model_resolve`.
-
-<br/>
-
-## 🎚 Two modes, one switch
-
-Everything the plugin does beyond local recording is decided by `PERCEPTEYE_AGENT_MODE`.
-
-```bash
-export PERCEPTEYE_AGENT_MODE=training     # the default — claim rollouts and run them
-export PERCEPTEYE_AGENT_MODE=production   # for the process serving your users
-```
-
-| | `training` (default) | `production` |
-|---|---|---|
-| Records tool outcomes locally | yes | yes |
-| Alters a tool result | **never** | **never** |
-| Claims rollouts | yes | **no** |
-| Puts a task into your agent's context | yes | **no** |
-| Starts turns by itself | yes | **no** |
-| Captures the turns you serve | n/a | yes |
-| Uploads them | n/a | only once an org admin switches capture on (the **Permissions** step of adding the agent) |
-| **Applies your approved system prompt** | **no** | **yes** — off with `PERCEPTEYE_APPLY_PROMPT=0` |
-| **Points your agent at the approved model** | **no** | **yes**, with `hooks.allowConversationAccess: true` — off with `PERCEPTEYE_APPLY_MODEL=0` |
-
-**In `production` the rollout hooks are not registered at all** — the guarantee is the absence of the subscription, not a branch inside a handler that a later edit could invert. **`production` is not "observe-only"**, and this README used to say it was: applying a system prompt and a model changes what the agent does, which is the whole point of beat ⑥. What production mode still guarantees absolutely is that it **claims no work and starts no turn**.
-
-**Both halves apply to this agent's own served turns and to nothing else.** Not to a subagent it spawns, not to a scheduled (cron) turn, and not to another agent in the same gateway. Those are ordinary runs distinguished only by their session key, and the plugin reads the `agentId` and `sessionKey` OpenClaw puts on every hook context to tell them apart. If it cannot tell, it applies nothing.
-
-**In `training` neither half is applied**, deliberately. A rollout is evidence about the agent *as configured*; changing its prompt or its model mid-flight moves the behaviour with no weight change behind it, and the loop would attribute the difference to training.
-
-**In `training` the plugin works the flywheel on its own**, starting each rollout's turn in its own `percepteye-rollout-*` session — never one you are using. If the host closes that seam, it says so once and falls back to delivering the task into the next turn you start; rollouts keep working either way.
-
-`PERCEPTEYE_TRAJECTORY_DIR` names where a **training** rollout's outcomes are written, and the rollout driver sets it per rollout. It is not an off switch. These are:
-
-```bash
-export PERCEPTEYE_CAPTURE=0        # register nothing, record nothing, claim nothing
-export PERCEPTEYE_APPLY_PROMPT=0   # keep recording, but leave the system prompt alone
-export PERCEPTEYE_APPLY_MODEL=0    # keep recording, but leave the model alone
-```
-
-All three are also OpenClaw config settings (`capture`, `applyPrompt`, `applyModel`), where config wins over the environment. `PERCEPTEYE_APPLY_PROMPT=0` subscribes no prompt hook at all and does not even fetch the prompt text; `PERCEPTEYE_APPLY_MODEL=0` subscribes no model hook and registers no provider. Your host can also block them from the outside: `plugins.entries.agent-flywheel.hooks.allowPromptInjection: false` stops the prompt half, and simply not setting `allowConversationAccess` stops the model half.
-
-<br/>
-
-## 📡 Production observability
-
-In `production` mode the plugin records the turns your agent is already serving — one directory per turn, in the same on-disk format the Python SDK writes:
-
-```
-$PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured
-    turns.jsonl        {"kind":"task"|"answer","text","turn_id","conversation_id","task_id"}
-    conversation_id
-    task_id            # optional caller-authored case/work-item correlation
-    task_id.conflict   # present only when writers disagreed; task_id is then omitted
-    tool_calls.jsonl
-    genai_observation.jsonl   # only under the model-content tier, see below
-```
-
-`task_id` is opaque correlation evidence only. The SDK never interprets it as
-success, reward, a hint, policy identity, or permission to train. OpenClaw host
-adapters may supply it as `taskId`/`task_id` on an event or hook context. Invalid
-or conflicting values are omitted rather than cleaned into another identifier;
-valid task-only turns still reach the control plane for downstream validation.
-
-**Uploading is off until an org admin turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. Capture is switched on in the **Permissions** step of adding the agent (**New mission → An agent → Connect it with our SDK**). There are two switches, its conversations and their message text, and training from the agent needs both. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear there — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (consent was withdrawn, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
-
-Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
-
-**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent (the second switch in the same **Permissions** step), the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt with images, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
-
-### The approved pair, applied
-
-With a key set, a `production` install also asks the control plane, **once at startup**, what this agent should be running:
-
-- `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
-- `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
-
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does.
-
-**What stops the prompt being applied**, each logged with its own reason:
-
-| | |
-|:--|:--|
-| no API key | the ordinary first install: the control plane is never asked and no hook is subscribed |
-| `PERCEPTEYE_APPLY_PROMPT=0` | you switched it off — the hook is not subscribed and the prompt text is not even fetched |
-| an empty answer | nothing has passed the approval gate — your prompt stands. It never means "run with no prompt" |
-| `stale_baseline` | your own baseline prompt changed after the pair was certified, so the approved text was shaped against a prompt you no longer ship |
-| a status that is not `approved`/`delivered` | a draft or pending bundle never serves |
-| the bundle disagreeing with itself | its prompt checksum and the checkpoint it was certified against differ — that is not the pair anybody approved |
-
-**And what stops the model being applied**, each with its own reason too:
-
-| | |
-|:--|:--|
-| no API key | as above — the same one cause, said the same way |
-| `PERCEPTEYE_APPLY_MODEL=0` | you switched it off |
-| the conversation opt-in missing | `before_model_resolve` is a conversation hook; without `hooks.allowConversationAccess: true` this host never delivers it |
-| no provider could be registered | the registered provider is the only thing that can supply the served `base_url`, so if your host has no provider surface or refuses the id, the model half is refused rather than pointing your agent at a provider the host does not know |
-| no endpoint served | this agent is on the champion arm, or its candidate is not deployed anywhere — nothing to point at |
-| an archive reference as the model | a `gs://` or `s3://` path is a stored artifact, not a name an endpoint can serve; sending it would 404 every completion |
-
-**And either half can be refused for one run rather than for the process** — a subagent turn, a scheduled turn, another agent in the same gateway, or a host that named no agent for the run. Each of those is logged too, once per distinct reason, naming which half and which run.
-
-**The pair check is the line worth reading.** When both halves land, the startup log confirms it: the approved prompt is running on the checkpoint it was certified with, which is the combination that was evaluated. When only one lands, it *warns* and names **which** half is missing and why — because half of a validated combination is not the improvement anybody measured, and an operator who is not told will read the behaviour change as the certified one.
-
-A control plane that is unreachable costs the improvement and nothing else: no answer, no change, no error.
-
-<br/>
-
-## 📤 Already on OpenTelemetry? Push your spans instead
-
-If your agent already records its model calls as OpenTelemetry spans — the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/), with message content — you can point its OTLP exporter, or your OpenTelemetry Collector, at the control plane instead of installing this SDK. The control plane learns from the conversations those spans record as they arrive, exactly as it does from the turns this SDK uploads, and each improvement of your agent starts from them.
-
-**When to push instead of using the SDK.** Push when the agent is already instrumented with OpenTelemetry, or runs where this SDK cannot be installed, and what you want is for its production traffic to drive the improvement loop. Use the SDK when you also want rollouts — practice tasks written for your agent, which it works through and which are graded — because spans only carry what your agent already did. Send each conversation one way only: pushed spans and uploaded turns are both kept, so the same traffic sent both ways is learned from twice.
-
-**The endpoint** is per agent, under your control plane's URL (the `PERCEPTEYE_CONTROL_PLANE_URL` the dashboard shows when you add the agent):
-
-```
-POST $PERCEPTEYE_CONTROL_PLANE_URL/agents/<agent_id>/otlp/v1/traces
-```
-
-In the dashboard, add the agent with **New mission → An agent → It sends OpenTelemetry**: one click names it, gives it its key and registers it, then its **Permissions** step opens, then its full endpoint is shown, ready to copy (and again on the agent's own page, its **Agent** tab). With the OpenTelemetry SDK's exporter:
-
-```bash
-export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="$PERCEPTEYE_CONTROL_PLANE_URL/agents/support-agent/otlp/v1/traces"
-export OTEL_EXPORTER_OTLP_TRACES_HEADERS="Authorization=Bearer%20$PERCEPTEYE_API_KEY"
-export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
-```
-
-`%20` is the space: OpenTelemetry reads these headers URL-encoded. If the process exports only traces, `OTEL_EXPORTER_OTLP_ENDPOINT` set to the same URL without `/v1/traces` works too; the exporter appends it. From a Collector, add an exporter to the traces pipeline you already run:
-
-```yaml
-exporters:
-  otlphttp/percepteye:
-    traces_endpoint: ${env:PERCEPTEYE_CONTROL_PLANE_URL}/agents/support-agent/otlp/v1/traces
-    headers:
-      Authorization: "Bearer ${env:PERCEPTEYE_API_KEY}"
-service:
-  pipelines:
-    traces:
-      exporters: [otlphttp/percepteye]
-```
-
-**Auth** is the agent's own key (`pefw_…`), sent as a Bearer token: the key you get when you add the agent in the dashboard (**New mission → An agent**). A key bound to a different agent is refused.
-
-**Consent comes first, and nothing is read without it.** The agent has to be known to the control plane, and both capture switches have to be on in the **Permissions** step of adding it: its conversations, and their message text. Until both are on, every push is answered `403` and nothing in it is read. The model-content tier is granted only while exactly one active Product declares the agent, as for the SDK. The dashboard's **It sends OpenTelemetry** path registers the agent for you; the push endpoint never registers an agent itself. Through the API instead, an agent that never runs this SDK registers once, so that its Permissions can be switched on:
-
-```bash
-curl -X POST "$PERCEPTEYE_CONTROL_PLANE_URL/agents" \
-  -H "Authorization: Bearer $PERCEPTEYE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "support-agent", "mode": "production", "discovered_agent": null}'
-```
-
-`"discovered_agent": null` records that the agent describes nothing about itself, as a production process does, rather than that you switched that description off.
-
-**What the endpoint takes and answers**, per the OTLP/HTTP specification:
-
-- an `ExportTraceServiceRequest` as `application/x-protobuf` or `application/json`, optionally with `Content-Encoding: gzip`;
-- `200` with an `ExportTraceServiceResponse` in the same content type, whose `partial_success` counts the spans not kept and says why;
-- `429` when your organization's share of the endpoint is busy or over its rate, and `503` when the control plane is, each with `Retry-After`; the OpenTelemetry exporters and the Collector retry these on their own;
-- `400`, `403` and `415` for a request it will never take: retrying it does not help.
-
-There is no size cap. Each request is spooled to disk and read in bounded memory, and one this host's disk cannot hold is answered `507` with a `google.rpc.Status` before it is read. Batches, as the OpenTelemetry SDK's batch processor and the Collector send by default, are learned from soonest.
-
-**Personal data is kept, and never learned from.** The message content of every span is scanned for personal data. A request whose spans hold any is kept, recorded and excluded from training, and the response's `partial_success` message says so (with no span rejected). Spans that carry this SDK's own rollout marker (`percepteye.rollout.id`) are not kept, and are counted as rejected: rollouts reach the control plane through the SDK.
-
-**Seeing it arrive.** The agent's **Agent** tab in the dashboard counts the spans it has pushed, beside the turns the SDK uploaded, and how many of each are kept but not learned from, and why.
-
-<br/>
-
-## 🙋 A person approves every change
-
-**Both halves of an improvement require a human decision.** Neither the plugin nor the control plane can move your agent on its own, and no language model can approve either one by reading prose.
-
-**The model.** Your agent only leaves the champion arm when **all three** of these hold, and each fails closed back to the champion:
-
-1. **A person with the operator role moves it.** `POST /flywheel-agents/{agent_id}/policy-channel` requires the operator role and a signed-in human identity — the flywheel key your agent uses cannot make this call at all. Rollback is the same call with the other value. No promotion applies it, and there is no percentage rollout that can.
-2. **The candidate's certification verdict is not a refusal.** `regressed`, `inconclusive` and `escalated` are all refused — the very same list the promotion gate uses, so an agent can never be served a model the promote path would have rejected.
-3. **It is actually deployed somewhere servable.** A stored-artifact reference (`gs://`, `s3://`, `file://`) is refused rather than handed out as a model name.
-
-**The prompt.** A separate chain with its own approval: only a `PromptPairDelivery` whose status is `approved` or `delivered` is ever served, and this plugin re-checks that status itself before applying the text.
-
-**And neither can be approved by a language model reading free text.** `model_promotion`, `prompt_pair_delivery` and `research_promotion` are all classed as irreversible decisions in the control plane, which means only the explicit approve/reject control can resolve them. An interpreted "sure, go ahead" — in a chat thread, in a document, anywhere — never can.
-
-<br/>
-
-## 📄 What it writes
-
-One JSON object per executed tool call, appended to `tool_calls.jsonl`:
-
-```json
-{"name":"exec","arguments":{"command":"exit 3"},"outcome":"failed","status_code":null,"error":"(Command exited with code 3)","error_class":"ToolError","latency_ms":155,"agent_name":"main","tool_call_id":"call_percepteye_1"}
-```
-
-That line is real output from a live OpenClaw run, and it is the same format the Python SDK writes and reads.
-
-**And, in training mode, one file per rollout result the control plane has not acknowledged yet**, under `$PERCEPTEYE_HOME/outbox/<agentId>/`. The result is written there *before* the report is sent and removed the moment it lands, so a control plane that is briefly down, a key without the `rollout.report` scope, or a process killed mid-POST costs you nothing: held results are delivered before the next rollout is claimed, including by a later process over the same directory. Three things follow, worth knowing before you go looking in there:
-
-- **A file still present is work the control plane has not recorded yet.** It is retried in front of every claim, in both the attended and the unattended lane.
-- **A refusal that resending cannot fix stops the retries and never deletes the file.** It is renamed under a suffix that says *which* refusal it was: `.refused-lease-lost` when the lease is gone — the commonest one, and what a 410 becomes — `.refused-contract` when this SDK itself could not carry the payload, `.refused-400` / `.refused-404` / `.refused-409` / `.refused-422` for the remaining final statuses, and `.stale` for a file that aged out. A second refusal of the same rollout gets `.refused-lease-lost.1` rather than overwriting the first. A warning names the exact path every time. Retries stop after seven days, and that file is kept too.
-- **A status this SDK does not recognise keeps retrying.** Guessing that an unrecognised failure is permanent would stop delivering work on the strength of not understanding the error, so only the statuses named above are final. `401` and `403` stay in the retry set too: a reissued key delivers them.
-- **No credential is ever written there.** The rollout's lease token stays in this process's memory, because this directory is readable by the same agent the lease fences out.
-
-<br/>
-
-## ⚙️ Configuration
-
-Scalar settings are settable two ways: in your OpenClaw config under `plugins.entries.agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch. The nested execution snapshot is config-only so component names and completeness remain typed rather than being parsed from a shell string.
-
-| config key | environment variable | default | what it decides |
-|:--|:--|:--|:--|
-| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)* | the consent boundary. Without it nothing leaves the machine: no registration, no claim, no report, no control-plane read |
-| `mode` | `PERCEPTEYE_AGENT_MODE` | `training` | `training` claims rollouts and drives turns; `production` claims none and starts none, captures the turns you serve, and applies the approved pair. An unreadable value degrades to `production` and says so |
-| `agentId` | `PERCEPTEYE_AGENT_ID` | `openclaw` | the agent name this install reports as, **and** which OpenClaw agent's approved prompt and model it applies. Set it if your host runs more than one agent |
-| `controlPlaneUrl` | `PERCEPTEYE_CONTROL_PLANE_URL` | `https://launch.percepteye.ai/api/flywheel/v1` | the control plane this install talks to |
-| `capture` | `PERCEPTEYE_CAPTURE` | on | `0`/`false`/`no`/`off` registers no hooks and records nothing, in either mode |
-| `applyPrompt` | `PERCEPTEYE_APPLY_PROMPT` | on | `0` subscribes no prompt hook and does not fetch the prompt text |
-| `applyModel` | `PERCEPTEYE_APPLY_MODEL` | on | `0` subscribes no model hook and registers no provider |
-| `executionSnapshot` | *(config only)* | *(none)* | opaque SHA-256 components from the host adapter, its completeness assertion, and optionally an exact startup prompt/tool/provider/model observation. Exact startup evidence binds registration and claims to the same SDK-authored execution identity later reported; missing, invalid, lossy, or conflicting evidence abstains |
-| `introspect` | `PERCEPTEYE_INTROSPECT` | on | `0`/`false`/`no`/`off` registers this agent with no description at all, which the control plane records as your opt-out, and authors no execution identity. **The one switch where config does not win:** a refusal from either side stands, as it does in the Python SDK |
-| `describe` | *(config only)* | *(none)* | the agent's own `system_prompt`, `tools` and `model`, for what this plugin cannot observe — OpenClaw's `llm_input` carries no tools. See below |
-| `rules` | *(config only)* | *(none)* | the workflow rules this agent follows, a list of prose strings, declared as the rulebook of the Product that declares this agent. Unset sends nothing; `[]` retracts. See below |
-
-The snapshot contains `adapterName`, `executionIdentityComplete: true`, and a non-empty `executionComponents` object whose values are lowercase SHA-256 digests. An adapter that can resolve the full execution before work is claimed may also provide `startupObservation: {systemPrompt, tools, provider, model}`. Core runs startup and per-run evidence through the same canonical descriptor; it never accepts a caller-authored final digest. Component names belong to the adapter, and core does not assign them meaning. The resulting `execution_sha256` identifies the observed execution scaffold, not the serving policy, and this package does not generate training hints; those decisions belong downstream where evidence from multiple turns can be compared.
-
-**`describe`** says what this plugin cannot see. OpenClaw's `llm_input` carries no tool list, so on its own this plugin registers an agent whose tools are unknown, and no task can be generated for it. Declare them:
-
-```json
-"plugins": { "entries": { "agent-flywheel": { "config": { "describe": {
-  "system_prompt": "You triage support tickets.",
-  "tools": [{ "name": "lookup_ticket", "description": "Read one ticket.",
-              "input_schema": { "type": "object", "properties": { "id": { "type": "string" } } },
-              "read_only": true }]
-} } } } }
-```
-
-It is the Python SDK's `describe=`, read by the same rules, and a cross-language test holds the two equal: the same record, and the same refusals, for anything JSON carries — except an integer beyond 2⁵³ inside a schema, which JavaScript holds rounded.
-- **`tools`** is the list your agent sends its model: OpenAI function specs, Anthropic tools, or `{name, description, input_schema, read_only}`. A name and a description must be strings. `read_only: true` goes at the top level of an entry, whichever shape.
-- **`model`** is a name, or `{model_name, provider, temperature, max_tokens}`: `temperature` a finite number, and `max_tokens` a whole number from 1 to 2⁵³ − 1.
-- **What you declare wins** over what was observed, where you gave it. Anything you leave out still comes from observation. With nothing observed, the record names this plugin's host, `framework: "openclaw"`, where the Python SDK — which cannot know — says `custom`.
-- **It is your word, not an observation,** so it anchors no execution identity. If you also configured `executionSnapshot`, a startup warning says the identity is withheld.
-- **A bad declaration does not stop the plugin**, because a throw would take local capture down with it — and the config schema accepts any `describe` value, so OpenClaw never refuses the plugin over one either. It is dropped with a warning that names the cause, the same one the Python SDK refuses with, and the agent registers only what was observed.
-
-**`rules`** are the workflow rules your agent follows — the ones a person would tell a new colleague. They become the rulebook of the Product that declares this agent, and when training data is built for that Product, each decision's teacher is shown at most the few rules that apply to it. They are never added to your served agent's prompt.
-
-```json
-"plugins": { "entries": { "agent-flywheel": { "config": { "rules": [
-  "Before issuing a refund, confirm the order number with the customer.",
-  "Escalate to a human when the customer asks to close their account."
-] } } } }
-```
-
-- **Declared once per start**, on their own route (`POST /agents/{id}/rulebook`) — never inside the registration and never in `describe`. The route needs an API key and nothing else, so that is every keyed install with capture on: in production after the agent registers and reads its verdict (and never ahead of the approved serving policy: a rulebook route that is slow or down delays nothing else); in training after the agent registers when it drives rollouts, and at once when it does not (no conversation-access opt-in, no injection API). An install that cannot send them — no API key, a control plane that could not be set up, `capture` disabled — says so at startup. It is the Python SDK's `rules=`, and the two send the same bytes under the same idempotency key.
-- **The last writer wins.** Every start that sets `rules` declares them again: the same rules change nothing, different rules become a new version. Leaving `rules` unset sends nothing and leaves whatever is in force alone; `[]` retracts it. A Product admin can also set them through Mission Control's API (`PUT /api/v2/products/{product_id}/rulebook`), and both writes are kept in the Product's history.
-- **The control plane decides what a rule may be**, and says which rule it refused and why; this plugin refuses only a value that is not a list of strings, before sending anything. The agent must be declared by exactly one Product, or nothing is written.
-- **A refused declaration does not stop the plugin**: it costs the rules and nothing else, and the warning names the cause — also readable as `rulebookRefusal` on the handle `register()` returns (`capture` in production, where it also names why rules were never sent; `rollouts` in a training install that drives — one that does not returns no handle, so its startup line is the record). The config schema accepts any `rules` value for the same reason it accepts any `describe`.
-
-Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
-
-One host setting is not ours and has no environment form: `plugins.entries.agent-flywheel.hooks.allowConversationAccess`, which OpenClaw itself requires before it will deliver conversation hooks to a non-bundled plugin. See [Install](#-install-in-one-call).
-
-<br/>
-
-## ✨ Why it earns its place
-
-- 🪶 **Zero runtime dependencies.** Node builtins only — no version conflict imposed on a customer who did not ask for one, enforced by a CI job.
-- 🔌 **Kill switches that really are ones.** `PERCEPTEYE_CAPTURE=0` subscribes no hooks and records nothing; `PERCEPTEYE_APPLY_PROMPT=0` subscribes no prompt hook and does not even fetch the prompt text; `PERCEPTEYE_APPLY_MODEL=0` subscribes no model hook and registers no provider. In every case the guarantee is the absence of the subscription, not a branch inside a handler.
-- ⚖️ **It applies an approved pair, or says why it did not.** Every refusal names its own cause rather than one message covering all of them — and when only one half lands it warns and names *which*, because half of a certified combination is not the improvement that was measured.
-- 🎯 **One agent's approval changes one agent.** The approved prompt and model reach that agent's own served turns and nothing else — not its subagents, not its scheduled turns, not another agent in the same gateway. Where identity cannot be established, nothing is applied.
-- 🎯 **`unknown` is a real answer** — a tool call whose verdict nobody stated is never rounded up to `ok`, because a failure scored as a success is training data that teaches the model the failure was fine.
-- 🤝 **One on-disk format across both SDKs**, kept honest by a shared contract schema ([`schema/flywheel-1.json`](schema/flywheel-1.json)) and a test that asserts this package's wire types match it.
-- 🧯 **It degrades, it doesn't fail.** A missing key, an unreachable control plane, a closed host seam — each costs the feature that needed it and says so once. Local recording keeps running.
-- 🔒 **Every lane is opened from your side.** There is no listening socket anywhere in this package.
-
-<br/>
+<!-- lang -->
+In production mode the plugin applies the approved prompt and model to this agent's own turns and nothing else; `PERCEPTEYE_APPLY_PROMPT=0` and `PERCEPTEYE_APPLY_MODEL=0` switch each half off. → [Production](docs/production.md#run-the-approved-version)
+<!-- /lang -->
 
 ## 🐍 Python or Node?
 
-**Pick one.** Two implementations of the same flywheel for two different homes — install whichever matches the harness your agent already runs in, never both.
+Pick the one that matches where your agent runs. Never both for one agent.
 
-| | this package | [`agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) (Python) |
-|---|---|---|
-| **you have** | an OpenClaw or DeepSeek Harness agent | a Python agent, or a CLI agent you launch yourself |
-| **you install** | a harness plugin | a pip package — `pip install agent-flywheel` |
-| **you change** | nothing — the harness loads it | nothing — one import, one call |
-| **the approved prompt** | applied for you — the plugin *is* your host's prompt seam | handed back by `current_prompt()` for you to apply; a library in someone else's process has nowhere to put it |
-| **the approved model** | applied for you — the plugin registers a provider and points the turn at it | handed back as an endpoint for you to call |
+| | Python SDK | Node plugin |
+|:--|:--|:--|
+| **for** | a Python agent, or a command-line agent you launch yourself | an OpenClaw or DeepSeek Harness agent |
+| **install** | `pip install agent-flywheel` | `openclaw plugins install @percepteye/agent-flywheel` |
+| **the approved model and prompt** | handed back for your code to apply | applied for you, in production mode |
+| **repository** | [`agent-flywheel`](https://github.com/percepteye-ai/agent-flywheel) | [`agent-flywheel-node`](https://github.com/percepteye-ai/agent-flywheel-node) |
 
-<br/>
+## ⚙️ Configuration
 
-## 🛠 Develop
+<!-- lang -->
+| config key | environment variable | default | meaning |
+|:--|:--|:--|:--|
+| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)* | your agent's key. Without it nothing leaves the machine |
+| `controlPlaneUrl` | `PERCEPTEYE_CONTROL_PLANE_URL` | `https://launch.percepteye.ai/api/flywheel/v1` | the control-plane URL |
+| `agentId` | `PERCEPTEYE_AGENT_ID` | `openclaw` | the agent id this install reports as, and whose approved prompt and model it applies |
+| `mode` | `PERCEPTEYE_AGENT_MODE` | `training` | `training` claims practice tasks; `production` claims none, captures the turns you serve and applies the approved pair |
+| `capture` | `PERCEPTEYE_CAPTURE` | on | `0` registers no hook and records nothing |
+| `applyPrompt` · `applyModel` | `PERCEPTEYE_APPLY_PROMPT` · `PERCEPTEYE_APPLY_MODEL` | on | `0` leaves the system prompt, or the model, alone |
 
+Config is `plugins.entries.agent-flywheel.config` in your OpenClaw config, and wins over the environment. Every setting is in the [Reference](docs/reference.md#configuration).
+<!-- /lang -->
+
+## 📚 Docs
+
+- [Quickstart](docs/quickstart.md): from install to your first trace, then to improving.
+- [Production](docs/production.md): what is sent and when, retries, rate limits and personal data.
+- [OpenTelemetry push](docs/otlp.md): send the traces your agent already exports.
+- [In the dashboard](docs/dashboard.md): every click path, in one place.
+- [FAQ](docs/faq.md) and [Troubleshooting](docs/troubleshooting.md).
+<!-- lang -->
+- [Reference](docs/reference.md): every setting, the harnesses, what each hook does, and what the plugin writes.
+<!-- /lang -->
+
+## 🛠 Development
+
+<!-- lang -->
 ```bash
-npm test     # 683 tests, no install step — node:test, zero dependencies
+npm test     # 692 tests, no install step — node:test, zero dependencies
 ```
 
-The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
+The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data. One test compares the shared pages with the Python SDK's; it runs when a checkout of that repository sits beside this one, as `percepteye-agent-flywheel`.
+
+[`schema/flywheel-1.json`](schema/flywheel-1.json) is the wire contract, shared with the Python SDK, and a test asserts this package's wire types match it.
+<!-- /lang -->
 
 ---
 
-MIT — see [LICENSE](LICENSE) · security reports: **security@percepteye.ai** · issues and PRs welcome at [agent-flywheel-node](https://github.com/percepteye-ai/agent-flywheel-node/issues).
+**Contributing** — issues and PRs welcome; a new adapter must not import its framework at module scope, must report `unknown` rather than guess, and must fail loudly at bind time. ·
+**Security** — please report vulnerabilities privately to **security@percepteye.ai**. ·
+**License** — [MIT](LICENSE) © PerceptEye.
