@@ -12,6 +12,7 @@
  * everything else (or an operator's approval for one agent becomes a
  * process-wide swap). Refusing everything would pass half of this file.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 

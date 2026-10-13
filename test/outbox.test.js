@@ -14,6 +14,7 @@
  * than against an internal event or a log line. A log line was what the Python
  * SDK already had when the queue went dark.
  */
+import "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";

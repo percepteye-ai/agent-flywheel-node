@@ -9,12 +9,9 @@
  * `if` would give and which a later edit could invert without any test going
  * red.
  */
+import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveDeclaration } from "../src/declaration.js";
@@ -25,12 +22,6 @@ import {
   MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
   driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
 } from "../src/rollout.js";
-
-// Every driver in this file now holds an undelivered result durably, so it
-// needs somewhere to hold it. A temp home, never the developer's: `node --test`
-// runs each test FILE in its own process, so setting this here cannot leak
-// into another file's expectations.
-process.env.PERCEPTEYE_HOME = mkdtempSync(join(tmpdir(), "percepteye-rollout-"));
 
 // ROLLOUT-EXCLUSIVE hooks only. `agent_end` used to be in this list and had
 // to come out: production turn capture subscribes it too, to record the
@@ -81,7 +72,9 @@ function fakeApi({ conversationAccess = true, enqueue } = {}) {
 // configured, so a fixture carrying one would have every mode-split test
 // firing a live request at the real control plane. The verdict path is
 // exercised directly, with an injected transport, in its own suite below.
-const ENV = (mode, { key = null } = {}) => ({
+// A home of its own each time: training mode holds results under it and
+// production mode captures turns under it.
+const ENV = (mode, { key = null } = {}) => testEnv({
   PERCEPTEYE_AGENT_MODE: mode,
   ...(key ? { PERCEPTEYE_API_KEY: key } : {}),
   PERCEPTEYE_TRAJECTORY_DIR: "",
@@ -238,6 +231,7 @@ describe("training worker registration gates every claim", () => {
       async heartbeat() {},
     };
     const driver = registerRolloutDriver(api, {
+      env: testEnv(),
       config: { mode: "training", apiKey: "key", agentId: "support", ...config },
       transport,
       pluginId: PLUGIN_ID,
@@ -376,6 +370,7 @@ describe("the claim / deliver / report loop", () => {
     const enqueued = [];
     const tx = fakeTransport();
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx,
       enqueue: async (i) => { enqueued.push(i); return { enqueued: true, id: "i" }; },
     });
@@ -394,6 +389,7 @@ describe("the claim / deliver / report loop", () => {
     // queue look busy while nothing runs.
     const tx = fakeTransport();
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx,
       enqueue: async () => ({ enqueued: false, id: "", sessionKey: "s1" }),
     });
@@ -414,6 +410,7 @@ describe("the claim / deliver / report loop", () => {
     });
     let sent = 0;
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx,
       enqueue: async () => { sent += 1; return { enqueued: true }; },
     });
@@ -424,7 +421,9 @@ describe("the claim / deliver / report loop", () => {
 
   it("reports the answer when the agent finishes", async () => {
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onAgentEnd(
       { success: true, messages: [{ role: "assistant", content: "the answer" }] },
@@ -439,7 +438,9 @@ describe("the claim / deliver / report loop", () => {
     // The agent ran and failed. That is a real attempt and exactly what
     // training must see -- the opposite handling from a substrate fault.
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onAgentEnd(
       { success: false, messages: [{ role: "assistant", content: "I could not" }] },
@@ -453,7 +454,9 @@ describe("the claim / deliver / report loop", () => {
 
   it("gives back a rollout whose session ended with no answer", async () => {
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onSessionEnd({ sessionKey: "s1", reason: "shutdown" });
     assert.equal(tx.calls.report.length, 0, "an answerless rollout must not be reported");
@@ -470,7 +473,9 @@ describe("the claim / deliver / report loop", () => {
     // for the NEXT turn, and they close it without ever taking one. Nothing
     // ran, so the work is worth handing back.
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onSessionEnd({ sessionKey: "s1", reason: "shutdown" });
     assert.notEqual(
@@ -484,7 +489,9 @@ describe("the claim / deliver / report loop", () => {
 
   it("does not claim twice for one session", async () => {
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onSessionStart({ sessionKey: "s1" });
     assert.equal(tx.calls.claim.length, 1);
@@ -492,7 +499,9 @@ describe("the claim / deliver / report loop", () => {
 
   it("lets the agent run normally when the control plane is unreachable", async () => {
     const tx = fakeTransport({ claim: async () => { throw new Error("down"); } });
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     assert.equal(await d.onSessionStart({ sessionKey: "s1" }), null);
     assert.equal(d.inFlight.size, 0);
   });
@@ -501,6 +510,7 @@ describe("the claim / deliver / report loop", () => {
     const tx = fakeTransport({ claim: async () => ({ rollouts: [] }) });
     let sent = 0;
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx, enqueue: async () => { sent += 1; return { enqueued: true }; },
     });
     assert.equal(await d.onSessionStart({ sessionKey: "s1" }), null);
@@ -510,7 +520,9 @@ describe("the claim / deliver / report loop", () => {
 
   it("ignores an agent_end for a session it never claimed for", async () => {
     const tx = fakeTransport();
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onAgentEnd({ success: true, messages: [] }, { sessionKey: "other" });
     assert.equal(tx.calls.report.length, 0);
   });
@@ -533,6 +545,7 @@ describe("the claim / deliver / report loop", () => {
       async abandon() {},
     };
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx,
       enqueue: async () => ({ enqueued: true }),
       now: () => 100_000,
@@ -567,6 +580,7 @@ describe("the claim / deliver / report loop", () => {
     let finishReport;
     const reportGate = new Promise((resolve) => { finishReport = resolve; });
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: {
         leaseMs: 3_000,
         async claim() {
@@ -605,6 +619,7 @@ describe("the claim / deliver / report loop", () => {
   it("paces a long initial grant against the ten-minute renewal ceiling", async () => {
     const scheduled = [];
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: {
         leaseMs: 1_800_000,
         async claim() {
@@ -643,6 +658,7 @@ describe("the claim / deliver / report loop", () => {
       async abandon() {},
     };
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: tx,
       enqueue: async () => ({ enqueued: true }),
       cancel: async (request) => { cancelled.push(request); return true; },
@@ -671,6 +687,7 @@ describe("the claim / deliver / report loop", () => {
   it("fences later tool side effects when the host cannot abort an active run", async () => {
     const scheduled = [];
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: {
         leaseMs: 3_000,
         async claim() {
@@ -715,6 +732,7 @@ describe("the claim / deliver / report loop", () => {
   it("blocks and drains an injected turn whose lease was lost before it ran", async () => {
     const scheduled = [];
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: {
         leaseMs: 3_000,
         async claim() {
@@ -788,6 +806,7 @@ describe("two events for one session claim once", () => {
     let claims = 0;
     const counting = { ...tx, claim: async (n) => { claims += 1; return tx.claim(n); } };
     const d = createRolloutDriver({
+      env: testEnv(),
       transport: counting, enqueue: async () => ({ enqueued: true }),
     });
     const a = d.onSessionStart({ sessionKey: "s1" });
@@ -804,7 +823,9 @@ describe("two events for one session claim once", () => {
     const tx = fakeTransport({
       claim: async () => { claims += 1; return { rollouts: [] }; },
     });
-    const d = createRolloutDriver({ transport: tx, enqueue: async () => ({ enqueued: true }) });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
     await d.onSessionStart({ sessionKey: "s1" });
     await d.onSessionStart({ sessionKey: "s1" });
     assert.equal(claims, 2, "a session that got no work must be able to ask again");

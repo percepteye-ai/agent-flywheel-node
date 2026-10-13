@@ -1,6 +1,7 @@
 /**
  * The transport, with emphasis on the ONE call that must never be replayed.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import {

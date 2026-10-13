@@ -3,6 +3,7 @@
  * client's docstring records, because this port exists to be the SAME client
  * in a second language, not a second client.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { ControlPlaneClient, cut } from "../src/http.js";
