@@ -370,8 +370,11 @@ export class AttachTransport {
    * ⚠ `policy.prompt` IS NOT PROMPT TEXT. It is the control plane's own
    * prompt-PIN identity snapshot (`{pins, digest, captured_at}`), unrelated to
    * the customer's optimized prompt; the text comes from `promptCurrent`
-   * below. CONSUMER: `policy.js`, which reads `endpoint`, `arm` and
-   * `serving_generation` and reports what it cannot apply.
+   * below. CONSUMER: `policy.js`, which reads `endpoint` (`base_url`,
+   * `model`, and `api_key_env`, which with `base_url` decides whether this
+   * plugin's own key is supplied for it), `withdrawn` and `reason`, and for
+   * the startup line `arm`, `candidate_available` and `serving_generation`,
+   * and reports what it cannot apply.
    */
   async policyCurrent() {
     try {
