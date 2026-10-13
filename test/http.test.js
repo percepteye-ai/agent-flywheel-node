@@ -6,7 +6,7 @@
 import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { ControlPlaneClient, cut } from "../src/http.js";
+import { ControlPlaneClient, MAX_BACKOFF_MS, cut } from "../src/http.js";
 import { LeaseLost, TransportError } from "../src/errors.js";
 
 /** A fetch stub that replays a scripted sequence and records what it saw. */
@@ -105,6 +105,24 @@ describe("retrying reads the response, not just the exception", () => {
     ]);
     await c.request("GET", "/health");
     assert.equal(seen.length, 2);
+  });
+
+  it("caps a server-supplied Retry-After at the backoff ceiling", async (t) => {
+    // A proxy answering `Retry-After: 3600` must not park a request for an
+    // hour: the Python client caps it at the same 8s as its own backoff
+    // (tests/test_the_delivery_reserve_is_derived_not_declared.py there).
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { c, seen } = client([
+      { status: 503, headers: { "retry-after": "3600" } },
+      { status: 200, body: '{"ok":true}' },
+    ]);
+    const pending = c.request("GET", "/health");
+    for (let i = 0; i < 20 && seen.length < 2; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(MAX_BACKOFF_MS);
+    }
+    assert.equal(seen.length, 2, "an hour-long Retry-After was honoured");
+    assert.deepEqual(await pending, { ok: true });
   });
 });
 
