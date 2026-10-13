@@ -54,11 +54,10 @@ Your agent keeps running where it runs today, on your credentials, unchanged. We
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-start)
 [![tests](https://img.shields.io/badge/tests-708_·_0_skips-22c55e?style=for-the-badge)](#-development)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
-
-<img src="docs/assets/flywheel-overview.gif"
-     width="1040"
-     alt="Your agent — prompt, tools and model — sits inside your infrastructure. The plugin loads beside it in your harness with zero lines changed inside. Rollouts and observed outcomes go out; a trained policy comes back. Both the system prompt row and the model row flip to what the control plane approved for this agent, while the tools row stays untouched.">
 <!-- /lang -->
+
+<img src="docs/assets/flywheel-overview.gif" width="1040"
+     alt="Your agent sits inside your infrastructure, unchanged. Its real conversations are recorded where it runs, by our SDK, the OpenTelemetry traces it already exports, or your observability provider, and go out only once you allow it. PerceptEye learns a new version from them and tests it against your agent's current best on conversations it never saw. You approve the winner in Decisions, and the agent's prompt and model change to the version you approved, while its tools stay as they are.">
 
 **[Quickstart](docs/quickstart.md)** · [How it gets better](#-how-it-gets-better) · [Start](#-start) · [OpenTelemetry push](docs/otlp.md) · [What reaches us](#-what-reaches-us) · [Docs](#-docs)
 
@@ -67,6 +66,11 @@ Your agent keeps running where it runs today, on your credentials, unchanged. We
 ---
 
 ## 🔁 How it gets better
+
+<p align="center">
+  <img src="docs/assets/flywheel-loop.gif" width="980"
+       alt="One round of the loop, as a ring across a trust boundary: your agent's conversations, recorded where it runs, go out once you allow it; a new version is learned from them; it is tested against your agent's current best on conversations it has never seen; a version that did better waits for your approval in Decisions; and your agent runs the winner, and the next round starts from it. Practice tasks are an optional extra.">
+</p>
 
 1. **We learn from your agent's real conversations.** The SDK records what your users asked, what the model saw, what the tools did and what your agent answered, and sends it to us once you allow it.
 2. **Each new version is tested against your agent's current best,** on conversations it has never seen.
@@ -125,11 +129,6 @@ Send us the traces your agent already exports, as a second destination. With an 
 Your agent can also work through practice tasks we write from its own tools and system prompt, graded as it goes. You [start them](docs/dashboard.md#run-practice-tasks) from your agent's page.
 
 <!-- lang -->
-<p align="center">
-  <img src="docs/assets/flywheel-loop.gif" width="980"
-       alt="The SDK inside the customer's agent, talking to the control plane. On the left, inside your infrastructure: install the plugin, your harness loads it, your agent runs unchanged, and its trajectory is recorded. A dashed trust boundary splits the picture. On the right, the control plane: it generates tasks from your tool surface, scores every rollout, trains the policy, and hands a candidate back as an endpoint you can call. A return arrow closes the ring — the better agent runs the next lap. The figure predates delivery: both halves — the approved system prompt and the model it was certified with — now return all the way into the agent, once a person has approved each.">
-</p>
-
 In training mode, the default, the plugin claims practice tasks and runs each in its own `percepteye-rollout-*` session, never one you are using. Training mode needs `hooks.allowConversationAccess: true`; `PERCEPTEYE_AGENT_MODE=production` claims none. → [Reference](docs/reference.md#two-modes-one-switch)
 <!-- /lang -->
 
