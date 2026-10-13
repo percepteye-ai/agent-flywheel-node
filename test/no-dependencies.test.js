@@ -24,6 +24,7 @@
  * answers it, the CI matrix runs `npm test`, and there is no second answer
  * in CI to drift from it.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
