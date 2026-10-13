@@ -143,7 +143,7 @@ That last beat is what makes it a flywheel rather than a pipeline: **the better 
 > [!IMPORTANT]
 > **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` once at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
 >
-> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. Separately, if the served endpoint requires a credential it comes from your own `models.providers.percepteye-flywheel.apiKey`.
+> The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. The plugin's own key (`PERCEPTEYE_API_KEY`) opens an endpoint the control plane names `PERCEPTEYE_API_KEY` for only at the control plane's own address, never as a fallback; any other endpoint's credential comes from your own `models.providers.percepteye-flywheel.apiKey`.
 
 <br/>
 
@@ -270,6 +270,7 @@ Once, not per turn: a policy that moves under a running agent splits a process's
 | `PERCEPTEYE_APPLY_MODEL=0` | you switched it off |
 | the conversation opt-in missing | `before_model_resolve` is a conversation hook; without `hooks.allowConversationAccess: true` this host never delivers it |
 | no provider could be registered | the registered provider is the only thing that can supply the served `base_url`, so if your host has no provider surface or refuses the id, the model half is refused rather than pointing your agent at a provider the host does not know |
+| the model withdrawn | the control plane took the approved model away (`withdrawn: true`), so the model your host configures stands from the next start |
 | no endpoint served | this agent is on the champion arm, or its candidate is not deployed anywhere — nothing to point at |
 | an archive reference as the model | a `gs://` or `s3://` path is a stored artifact, not a name an endpoint can serve; sending it would 404 every completion |
 
