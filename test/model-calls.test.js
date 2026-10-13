@@ -1,3 +1,4 @@
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
@@ -128,6 +129,7 @@ describe("rollout reporting", () => {
     const reports = [];
     const warnings = [];
     const driver = createRolloutDriver({
+      env: testEnv(),
       transport: {
         claim: async () => ({ rollouts: [{ rolloutId: "r1", turnInput: "go" }] }),
         report: async (_rollout, output) => reports.push(output),
@@ -170,6 +172,7 @@ describe("rollout reporting", () => {
   it("lets a broken custom observer cost eligibility, never the report", async () => {
     const reports = [];
     const driver = createRolloutDriver({
+      env: testEnv(),
       transport: {
         claim: async () => ({ rollouts: [{ rolloutId: "r1", turnInput: "go" }] }),
         report: async (_rollout, output) => reports.push(output),
@@ -205,6 +208,7 @@ describe("rollout reporting", () => {
       } },
     };
     const driver = registerRolloutDriver(api, {
+      env: testEnv(),
       config: { mode: "training", apiKey: "key" },
       pluginId: "flywheel",
       transport: {

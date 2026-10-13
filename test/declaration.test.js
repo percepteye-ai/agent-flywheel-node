@@ -8,6 +8,7 @@
  * across one table), consent asked the same way, and a declaration that never
  * anchors an execution identity.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";

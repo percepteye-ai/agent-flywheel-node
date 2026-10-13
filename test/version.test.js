@@ -14,6 +14,7 @@
  * The DESCRIPTION is the same situation one field over, and it had already
  * drifted, so it is held here too.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";

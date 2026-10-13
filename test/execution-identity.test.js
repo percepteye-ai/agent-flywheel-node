@@ -1,3 +1,4 @@
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -328,6 +329,7 @@ describe("identity reaches reports without becoming policy identity", () => {
       abandon: async () => {},
     };
     const driver = createRolloutDriver({
+      env: testEnv(),
       transport,
       enqueue: async () => ({ enqueued: true }),
       executionIdentity: identity,
