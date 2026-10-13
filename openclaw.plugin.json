@@ -2,7 +2,7 @@
   "id": "agent-flywheel",
   "name": "Agent Flywheel",
   "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for a serving install, which claims no rollouts and starts no turn but does capture the turns you serve and apply the system prompt and the model your control plane has approved.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "providers": [
     "percepteye-flywheel"
   ],
@@ -143,6 +143,9 @@
       },
       "describe": {
         "description": "The agent's own description, for what this plugin cannot observe (OpenClaw's llm_input carries no tools): system_prompt, tools (the list the agent sends its model -- OpenAI function specs, Anthropic tools, or {name, description, input_schema, read_only}) and model (a name, or {model_name, provider, temperature, max_tokens}). What you declare wins where given; it anchors no execution identity."
+      },
+      "retentionTurns": {
+        "description": "Keep only this many most recently written captured turns on disk, pruning the rest every 256 turns, so the directory holds at most retentionTurns + 256. Unset keeps every turn: nothing deletes your capture unless you ask. A whole number, 0 or more."
       },
       "rules": {
         "description": "The workflow rules this agent follows, one prose rule per string (a list of strings), registered once per start, with an API key and capture on, as the rulebook of the one Product that declares it -- training guidance, never added to the served agent's prompt. Every start that sets it declares it again, so the last writer wins; [] retracts. Unset sends nothing and leaves the rulebook in force alone."

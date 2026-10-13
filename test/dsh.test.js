@@ -7,6 +7,7 @@
  * Those five fields are why this classifier can be honest about cases a
  * cruder reading collapses together.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";

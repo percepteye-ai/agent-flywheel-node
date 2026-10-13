@@ -13,10 +13,10 @@
  * `abandoned` over a rollout that is still running, and no report is ever
  * accepted.
  */
+import { testHome } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { LeaseLost, TransportError } from "../src/errors.js";
@@ -24,7 +24,6 @@ import { outboxDir, spoolName } from "../src/outbox.js";
 import { createRolloutDriver, registerRolloutDriver } from "../src/rollout.js";
 import { createUnattendedRunner } from "../src/unattended.js";
 
-const tmp = () => mkdtempSync(join(tmpdir(), "percepteye-delivery-"));
 const listing = (dir) => { try { return readdirSync(dir).sort(); } catch { return []; } };
 
 const ANSWERED = {
@@ -63,7 +62,7 @@ function driverOn(dir, { claim, report, heartbeat } = {}) {
 
 describe("the producer: every outcome is written down before it is sent", () => {
   it("keeps the agent's answer when the report is refused", async () => {
-    const home = tmp();
+    const home = testHome();
     const h = driverOn(home, {
       report: async () => { throw new TransportError("upstream is down"); },
     });
@@ -78,7 +77,7 @@ describe("the producer: every outcome is written down before it is sent", () => 
   });
 
   it("holds an outcome even when the process never gets to send it", async () => {
-    const home = tmp();
+    const home = testHome();
     let onDisk = null;
     const h = driverOn(home, {
       report: async () => {
@@ -93,7 +92,7 @@ describe("the producer: every outcome is written down before it is sent", () => 
   });
 
   it("leaves nothing behind when the report lands", async () => {
-    const home = tmp();
+    const home = testHome();
     const h = driverOn(home);
     await h.driver.onSessionStart({ sessionKey: "s1" });
     assert.ok(await h.driver.onAgentEnd(ANSWERED, { sessionKey: "s1" }));
@@ -103,7 +102,7 @@ describe("the producer: every outcome is written down before it is sent", () => 
 
 describe("the consumer: held results go out before more work is claimed", () => {
   it("drains before the ATTENDED lane claims", async () => {
-    const home = tmp();
+    const home = testHome();
     const order = [];
     let refuse = true;
     const h = driverOn(home, {
@@ -129,7 +128,7 @@ describe("the consumer: held results go out before more work is claimed", () => 
   it("drains before the UNATTENDED lane claims", async () => {
     // The lane that used to hold its own `transport.claim`. If it still did,
     // this would claim without ever draining.
-    const home = tmp();
+    const home = testHome();
     const order = [];
     let refuse = true;
     const h = driverOn(home, {
@@ -157,7 +156,7 @@ describe("the consumer: held results go out before more work is claimed", () => 
   it("claims anyway when the drain itself fails", async () => {
     // A local outbox fault must not stop the agent claiming work. It is named
     // as itself, rather than reported as an unreachable control plane.
-    const home = tmp();
+    const home = testHome();
     const warns = [];
     const transport = {
       agentId: "a1",
@@ -180,7 +179,7 @@ describe("the consumer: held results go out before more work is claimed", () => 
 
 describe("restart recovery, through the driver", () => {
   it("a second process delivers what the first could not", async () => {
-    const home = tmp();
+    const home = testHome();
     const first = driverOn(home, {
       report: async () => { throw new TransportError("upstream is down"); },
     });
@@ -210,7 +209,7 @@ describe("the heartbeat cannot become the outage", () => {
       },
       enqueue: async () => ({ enqueued: true }),
       logger,
-      env: { PERCEPTEYE_HOME: tmp() },
+      env: { PERCEPTEYE_HOME: testHome() },
       heartbeatScheduler: (callback, delayMs) => {
         const token = { callback, delayMs };
         scheduled.push(token);
@@ -288,7 +287,7 @@ describe("the heartbeat cannot become the outage", () => {
       },
       enqueue: async () => ({ enqueued: true }),
       logger: { info() {}, warn: (m) => warns.push(String(m)) },
-      env: { PERCEPTEYE_HOME: tmp() },
+      env: { PERCEPTEYE_HOME: testHome() },
       heartbeatScheduler: () => { throw new Error("no timers left"); },
       heartbeatCanceller: () => {},
     });
@@ -302,7 +301,7 @@ describe("the heartbeat cannot become the outage", () => {
 
 describe("the production wiring", () => {
   it("registerRolloutDriver gives the driver an outbox under PERCEPTEYE_HOME", () => {
-    const home = tmp();
+    const home = testHome();
     const api = {
       on: () => {},
       logger: { info() {}, warn() {} },

@@ -45,9 +45,10 @@ permissions:
 
 jobs:
   ci:
-    # EXACTLY the checks every pull request passes -- the test matrix, the
-    # no-dependencies rule, and what the tarball carries -- on the commit being
-    # published. Reused rather than copied, so the two gates cannot drift.
+    # EXACTLY the checks every pull request passes -- the test matrix (which
+    # holds the no-dependencies rule and the open-source boundary) and what
+    # the tarball carries -- on the commit being published. Reused rather than
+    # copied, so the two gates cannot drift.
     uses: ./.github/workflows/ci.yml
 
   publish:

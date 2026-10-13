@@ -8,6 +8,7 @@
  * against the Python authority here when that checkout sits beside this one,
  * and by the Python repo's cross-language ABI check, which runs both renderers.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";

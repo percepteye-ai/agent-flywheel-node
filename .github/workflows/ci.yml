@@ -41,32 +41,14 @@ jobs:
       # No `npm ci`: there is no lockfile because there are no dependencies,
       # and `npm install` on a dependency-free package would only prove npm
       # works. The suite is node:test, which needs nothing installed.
+      #
+      # It also holds "no dependencies" itself (test/no-dependencies.test.js),
+      # which used to be a separate job here. That job forbade even an
+      # OPTIONAL peer, so it was red from the commit that declared the
+      # optional OpenTelemetry peer while `npm test` was green -- and every
+      # publish `needs` this workflow. One rule, in the one place `npm test`
+      # answers it, as with test/oss-boundary.test.js.
       - run: npm test
-
-  no-dependencies:
-    # This plugin runs inside someone else's agent process. A dependency here
-    # is a version conflict imposed on a customer who did not ask for one --
-    # and peerDependencies count, because npm 7+ installs them unless they are
-    # explicitly optional, and an optional peer on ONE of the two harnesses
-    # this package supports is wrong for users of the other.
-    #
-    # This assertion was RED in the repo this was split from, which is how the
-    # package reached a publish window with its own suite not running.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: the plugin has no dependencies
-        run: |
-          node -e '
-            const pkg = require("./package.json");
-            for (const key of ["dependencies", "peerDependencies", "optionalDependencies"]) {
-              if (pkg[key] && Object.keys(pkg[key]).length) {
-                console.error(`${key} must stay empty: ${JSON.stringify(pkg[key])}`);
-                process.exit(1);
-              }
-            }
-            console.log("no dependencies, as required");
-          '
 
   publishable:
     # What `npm publish` would actually ship, checked BEFORE a release rather

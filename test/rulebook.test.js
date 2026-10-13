@@ -19,6 +19,7 @@
  * Python itself, so this suite pins the cross-SDK key without needing Python
  * to run; the Python package's parity test drives this build to prove it live.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

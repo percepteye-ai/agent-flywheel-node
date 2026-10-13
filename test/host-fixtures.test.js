@@ -7,6 +7,7 @@
  * someone re-reads the payload instead of discovering it from bad training
  * data months later.
  */
+import "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

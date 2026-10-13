@@ -5,6 +5,7 @@
  * production code imported -- the tests were the only consumer. Both are gone
  * (see `session.js`); what is left is what `capture.js` actually uses.
  */
+import { allowDefaultHome } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
@@ -16,7 +17,9 @@ describe("where this package writes", () => {
   });
 
   it("falls back to a dotdir in the user's home", () => {
-    assert.match(percepteyeHome({}), /\.percepteye$/);
+    // The fallback IS this test's subject, so it is the one call the home
+    // guard allows. It resolves under the guard's directory, not the real one.
+    assert.match(allowDefaultHome(() => percepteyeHome({})), /\.percepteye$/);
   });
 });
 

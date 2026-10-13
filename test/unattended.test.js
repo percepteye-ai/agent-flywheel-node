@@ -19,6 +19,7 @@
  *      each of those and retires the rollout unrun at the third, so "degrades
  *      instead of failing" is only true if the loop actually stops.
  */
+import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
@@ -27,17 +28,9 @@ import { createRolloutDriver } from "../src/rollout.js";
 import {
   JOB_PREFIX, createUnattendedRunner, cronTurnStarter, sessionKeyFor,
 } from "../src/unattended.js";
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 import { resolveConfig } from "../src/config.js";
-
-// Every driver in this file now holds an undelivered result durably, so it
-// needs somewhere to hold it. A temp home, never the developer's: `node --test`
-// runs each test FILE in its own process, so setting this here cannot leak
-// into another file's expectations.
-process.env.PERCEPTEYE_HOME = mkdtempSync(join(tmpdir(), "percepteye-unattended-"));
 
 const trainingApi = () => {
   const hooks = [];
@@ -49,12 +42,14 @@ const trainingApi = () => {
     session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
   };
 };
-const TRAINING_ENV = { PERCEPTEYE_AGENT_MODE: "training", PERCEPTEYE_API_KEY: "k" };
+const TRAINING_ENV = () => testEnv({
+  PERCEPTEYE_AGENT_MODE: "training", PERCEPTEYE_API_KEY: "k",
+});
 
 describe("the mode is the only switch", () => {
   it("training mode subscribes the gateway hooks; nothing else is needed", () => {
     const api = trainingApi();
-    register(api, {}, TRAINING_ENV);
+    register(api, {}, TRAINING_ENV());
     for (const h of ["gateway_start", "gateway_stop"]) {
       assert.ok(api.hooks.includes(h), `${h} must be subscribed`);
     }
@@ -71,7 +66,7 @@ describe("the mode is the only switch", () => {
     const api = trainingApi();
     // No key: production capture would otherwise subscribe `gateway_stop` for
     // its shutdown flush, which is a capture concern and not a rollout one.
-    register(api, {}, { PERCEPTEYE_AGENT_MODE: "production" });
+    register(api, {}, testEnv({ PERCEPTEYE_AGENT_MODE: "production" }));
     for (const h of ["gateway_start", "gateway_stop", "session_start"]) {
       assert.ok(!api.hooks.includes(h), `production mode subscribed '${h}'`);
     }
@@ -149,6 +144,7 @@ function harness({ started = true, degraded = false, rollouts, pollMs } = {}) {
     abandon: async (r, o) => { calls.abandon.push([r, o]); },
   };
   const driver = createRolloutDriver({
+    env: testEnv(),
     transport, enqueue: async () => ({ enqueued: true }),
   });
   const runner = createUnattendedRunner({
@@ -226,6 +222,7 @@ describe("the unattended loop", () => {
     // was simply unused, and the test asserted that a runner whose claim
     // SUCCEEDS does not reject -- which is not the property it is named for.
     const driver = createRolloutDriver({
+      env: testEnv(),
       transport: {
         claim: async () => { throw new Error("down"); },
         report: async () => {}, abandon: async () => {},

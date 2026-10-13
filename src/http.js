@@ -77,19 +77,30 @@ function neverSent(err) {
 }
 
 /**
- * Exponential with FULL JITTER, capped at 8s. The jitter is load-bearing: a
- * fleet of agents that all retry on the same schedule reconverges into exactly
- * the spike that caused the backoff.
+ * Ceiling on ONE backoff sleep, and therefore on a server-supplied
+ * `Retry-After`: the Python client's `_MAX_BACKOFF_S`. Honouring an uncapped
+ * header let a proxy answering `Retry-After: 3600` -- not necessarily the
+ * control plane at all -- park one request for an hour, once per attempt.
+ */
+export const MAX_BACKOFF_MS = 8000;
+
+/**
+ * Exponential with FULL JITTER, capped. The jitter is load-bearing: a fleet of
+ * agents that all retry on the same schedule reconverges into exactly the
+ * spike that caused the backoff.
  */
 function backoffMs(attempt) {
-  return Math.random() * Math.min(8000, 500 * 2 ** (attempt - 1));
+  return Math.random() * Math.min(MAX_BACKOFF_MS, 500 * 2 ** (attempt - 1));
 }
 
+/** The server's own backoff, capped at the same ceiling as our jitter. */
 function retryAfterMs(response) {
   const raw = response.headers.get("retry-after");
   if (!raw) return null;
   const seconds = Number(raw);
-  return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : null;
+  return Number.isFinite(seconds)
+    ? Math.max(0, Math.min(MAX_BACKOFF_MS, seconds * 1000))
+    : null;
 }
 
 /**

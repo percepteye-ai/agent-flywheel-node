@@ -12,6 +12,7 @@
  * module's own source, because "keep these in sync" in a comment is not a
  * mechanism and both sides have drifted before.
  */
+import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, existsSync, mkdtempSync } from "node:fs";
@@ -401,7 +402,7 @@ describe("the plugin wires the rollout driver to the recorder", () => {
         mode: "training", apiKey: "pefw_test",
         // Refused at once: nothing in this test may reach a real control plane.
         controlPlaneUrl: "http://127.0.0.1:9/api/flywheel/v1",
-      }, { PERCEPTEYE_TRAJECTORY_DIR: "" });
+      }, testEnv({ PERCEPTEYE_TRAJECTORY_DIR: "" }));
       assert.ok(out.rollouts, "the rollout driver was not constructed");
       out.rollouts.track("s1", { rolloutId: "rl_mc_9" });
       try {
