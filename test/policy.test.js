@@ -956,7 +956,7 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
       FLYWHEEL_KEY_CREDENTIAL);
 
     for (const base_url of [
-      "http://34.59.240.97:8001/v1",                      // a raw self-hosted box
+      "http://203.0.113.7:8001/v1",                      // a raw self-hosted box
       `http://launch.percepteye.ai${gatewayPath}`,        // the scheme downgraded
       `https://launch.percepteye.ai:8443${gatewayPath}`,  // another port
       `https://launch.percepteye.ai.evil.example${gatewayPath}`,
@@ -983,7 +983,7 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
 
   it("a raw self-hosted endpoint is applied WITHOUT the flywheel key, end to end", async () => {
     const RAW = { ...GATEWAY, endpoint: { ...GATEWAY.endpoint,
-      base_url: "http://34.59.240.97:8001/v1" } };
+      base_url: "http://203.0.113.7:8001/v1" } };
     const { provider, logger, src } = await delivered(RAW);
     assert.equal(src.appliedModel?.baseUrl, RAW.endpoint.base_url,
       "the address is still the control plane's answer to apply");
@@ -993,7 +993,7 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
     const line = logger.lines.find((l) => l.includes("applying the approved model"));
     assert.ok(line, logger.text());
     assert.match(line, /flywheel key is not supplied/);
-    assert.ok(line.includes("http://34.59.240.97:8001"), line);
+    assert.ok(line.includes("http://203.0.113.7:8001"), line);
     assert.ok(line.includes(controlPlaneOrigin(CONTROL_PLANE_URL)), line);
     assert.ok(line.includes(`models.providers.${PROVIDER_ID}`), line);
     assert.ok(!logger.text().includes(SECRET));
