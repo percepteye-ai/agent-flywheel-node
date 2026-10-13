@@ -8,7 +8,7 @@ read the plugin's lines in your OpenClaw log; each starts with `[agent-flywheel]
 
 ## The dashboard never sees your agent connect
 
-- **The key or the URL is not in your agent's environment.**
+- **The key is not in your agent's environment, or the URL points somewhere else.**
   <!-- lang -->
   Without a key the plugin never connects: it records on your disk and sends nothing. Set `PERCEPTEYE_API_KEY`, or `apiKey` in the plugin's config, where the gateway starts. A registration that fails is logged as `could not register '<agent>' with the control plane`, with why.
   <!-- /lang -->
