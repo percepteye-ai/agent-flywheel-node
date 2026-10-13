@@ -25,6 +25,7 @@
  * digest test for the same reason. `wire.test.js` and `genai-otlp.test.js`
  * compare against the sibling the same way, inside the test that always runs.
  */
+import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
