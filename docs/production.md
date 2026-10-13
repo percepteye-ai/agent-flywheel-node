@@ -42,7 +42,7 @@ The SDK sends what your agent saw and said as it was; it masks nothing on your s
 ## What stays on your machine
 
 <!-- lang -->
-Every turn is a directory under `~/.percepteye/captured` (`PERCEPTEYE_CAPTURE_DIR`, or `$PERCEPTEYE_HOME/captured`), and uploading does not delete it. The plugin never deletes it: remove old turn directories yourself when you no longer need them. `PERCEPTEYE_CAPTURE=0` records nothing at all.
+Every turn is a directory under `~/.percepteye/captured` (`PERCEPTEYE_CAPTURE_DIR`, or `$PERCEPTEYE_HOME/captured`), and uploading does not delete it. Nothing does unless you ask: `"retentionTurns": 50000` in the plugin's config keeps the most recent 50,000 turns, pruning every 256 turns, and turns already uploaded go before turns still waiting to be sent. `PERCEPTEYE_CAPTURE=0` records nothing at all.
 <!-- /lang -->
 
 ## Run the approved version

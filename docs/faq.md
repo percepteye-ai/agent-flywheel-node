@@ -26,7 +26,7 @@ What your agent sends us: its turns, its traces, and the results of practice tas
 - Each improvement round keeps the conversations it learned from and was tested on, with the round.
 
 <!-- lang -->
-Your own copy, under `~/.percepteye/captured`, is yours, and the plugin never deletes it. → [Production](production.md#what-stays-on-your-machine)
+Your own copy, under `~/.percepteye/captured`, is yours, and nothing deletes it unless you set `retentionTurns`. → [Production](production.md#what-stays-on-your-machine)
 <!-- /lang -->
 
 ### What do you do with personal data?

@@ -177,6 +177,17 @@ export const CONFIG_SCHEMA = {
         "(a name, or {model_name, provider, temperature, max_tokens}). What " +
         "you declare wins where given; it anchors no execution identity.",
     },
+    // NO `type`, for `describe`'s reason: a wrong one would fail the plugin
+    // load, and local capture with it. A value that is not a whole number of
+    // turns is dropped with a warning naming it (`capture.js:
+    // retentionTurnsFrom`), the Python SDK's refusal in this host's idiom.
+    retentionTurns: {
+      description:
+        "Keep only this many most recently written captured turns on disk, " +
+        "pruning the rest every 256 turns, so the directory holds at most " +
+        "retentionTurns + 256. Unset keeps every turn: nothing deletes your " +
+        "capture unless you ask. A whole number, 0 or more.",
+    },
     // NO `type` either, for `describe`'s reason: a wrong one would fail the
     // plugin load. The control plane is the one validator of the rules and
     // names what it refuses; the refusal is logged, never fatal.
@@ -300,6 +311,10 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     // `describe`. Null sends nothing -- which is not `[]`, a retraction. The
     // control plane validates them; see `AttachTransport.registerRulebook`.
     rules: pluginConfig.rules ?? null,
+    // Config-only, like the Python SDK's `attach(retention_turns=...)`, which
+    // has no environment form either. Transported raw and checked where a bad
+    // value can be named without failing the plugin load (`capture.js`).
+    retentionTurns: pluginConfig.retentionTurns ?? null,
     contributing: Boolean(apiKey),
   };
 }

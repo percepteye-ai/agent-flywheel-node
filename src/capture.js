@@ -60,7 +60,9 @@
  * the one field we cannot observe.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import { applyDeclaration } from "./declaration.js";
@@ -77,7 +79,8 @@ import {
 } from "./transport.js";
 import { CONTRACT_VERSION } from "./wire.js";
 import {
-  listTurnDirs, readConversationId, readTaskId, recordConversationId,
+  listTurnDirs, readConversationId, readModelBoundary, readTaskId,
+  recordConversationId,
   recordModelBoundary, recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
   turnDir, turnIndexOf, turnWire,
@@ -88,6 +91,122 @@ export const FLUSH_EVERY = 32;
 
 /** Turns per request. The intake's `TURN_BATCH_MAX`. */
 export const BATCH_SIZE = 64;
+
+/**
+ * Turns between automatic prunes when `retentionTurns` is set. The Python
+ * SDK's `_PRUNE_EVERY`: one directory scan over many turns, so the ceiling is
+ * `retentionTurns + PRUNE_EVERY`, not `retentionTurns` exactly.
+ */
+export const PRUNE_EVERY = 256;
+
+/**
+ * `retentionTurns` as configured: `{retentionTurns, refusal}`.
+ *
+ * A whole number of turns, 0 or more, or `null` when unset -- the Python
+ * SDK's `attach(retention_turns=...)`, which refuses anything else with the
+ * same sentence. Python raises; a throw from `register()` would fail the
+ * plugin load and take local capture with it, so here the value is dropped,
+ * nothing is pruned, and `refusal` says why.
+ */
+export function retentionTurnsFrom(value) {
+  if (value === undefined || value === null) {
+    return { retentionTurns: null, refusal: null };
+  }
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return { retentionTurns: value, refusal: null };
+  }
+  return {
+    retentionTurns: null,
+    refusal: "retentionTurns must be a whole number of turns, 0 or more, " +
+      `not ${JSON.stringify(value) ?? String(value)}`,
+  };
+}
+
+/** Whether a turn directory holds anything an upload could carry; Python's
+ *  `Attachment._holds_a_record`. Unreadable counts as held: the warning this
+ *  feeds is about data about to be destroyed, so fail towards telling. */
+function holdsARecord(path) {
+  try {
+    return turnWire(path) !== null || readModelBoundary(path) !== null;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Delete captured turns from `root`. Returns how many.
+ *
+ * THE PYTHON SDK'S `Attachment.prune`, rule for rule. Capture is append-only
+ * and nothing else removes it, so a long-running production gateway keeps one
+ * directory per recording turn forever. Deleting is never a default: the
+ * capture is the customer's data, so it happens only when they ask, with
+ * `retentionTurns` or a call to `prune`.
+ *
+ * - `keepLast` keeps that many most recently written turns and deletes the
+ *   rest; `olderThanS` deletes turns last written longer ago than that. Both
+ *   may be given, and a turn goes if EITHER says so. Neither deletes nothing
+ *   and returns 0: an unqualified prune is not a request to delete everything.
+ * - `uploaded`, the set of turn ids the control plane already holds, is given
+ *   only while uploading is on. Then already-uploaded turns are deleted FIRST:
+ *   the same number goes, but a turn still waiting to be sent (one whose
+ *   answer may still be coming) is kept over one that is safe at the control
+ *   plane. One that does go anyway is warned about, once per prune.
+ * - Never throws. A turn that cannot be removed is left and does not stop the
+ *   others; retention failing must not take down the agent it protects.
+ */
+export function pruneTurns({
+  root, keepLast = null, olderThanS = null, uploaded = null, logger = null,
+  now = Date.now(),
+} = {}) {
+  if (keepLast === null && olderThanS === null) return 0;
+  // Newest first, so "keepLast" is a slice. With uploading on, the ones not
+  // yet uploaded sort ahead of the ones that were, newest first within each.
+  const pendingFirst = (e) => (uploaded && !uploaded.has(e.name) ? 1 : 0);
+  const entries = listTurnDirs(root)
+    .sort((a, b) => pendingFirst(b) - pendingFirst(a) || b.mtime - a.mtime);
+  const doomed = [];
+  if (keepLast !== null) doomed.push(...entries.slice(Math.max(0, keepLast)));
+  if (olderThanS !== null) {
+    // The ones `keepLast` kept, or every turn when it was not given.
+    const head = keepLast === null ? entries : entries.slice(0, Math.max(0, keepLast));
+    const cutoff = now - olderThanS * 1000;
+    doomed.push(...head.filter((e) => e.mtime < cutoff));
+  }
+  const victims = [...new Set(doomed)];
+  let removed = 0;
+  let unsent = 0;
+  for (const e of victims) {
+    if (uploaded && !uploaded.has(e.name) && holdsARecord(e.path)) unsent += 1;
+    try {
+      rmSync(e.path, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Left in place; the next prune tries again.
+    }
+  }
+  if (unsent) {
+    logger?.warn?.(
+      `[agent-flywheel] retention deleted ${unsent} captured turn(s) that had ` +
+      `not been uploaded -- including any still waiting on an answer, which ` +
+      `the periodic upload holds back. They are gone. Raise retentionTurns, or ` +
+      `check why uploads are not succeeding (the startup line says if consent ` +
+      `is the reason).`);
+  }
+  if (removed) {
+    // The upload index describes this tree, so it is bounded by this tree.
+    const index = join(root, UPLOADED_INDEX);
+    try {
+      if (existsSync(index)) {
+        const gone = new Set(victims.map((e) => e.name));
+        const here = new Set(entries.map((e) => e.name).filter((n) => !gone.has(n)));
+        const kept = readFileSync(index, "utf8").split("\n")
+          .map((l) => l.trim()).filter((id) => id && here.has(id)).sort();
+        writeFileSync(index, kept.map((id) => `${id}\n`).join(""), "utf8");
+      }
+    } catch { /* the index is a cache of what was sent; a resend is deduped */ }
+  }
+  return removed;
+}
 
 /**
  * How long an unanswered turn must sit UNTOUCHED before the cadence will send
@@ -659,6 +778,8 @@ export function createTurnUploader({
 
   return {
     get mayUpload() { return mayUpload; },
+    /** The turn ids the control plane already holds. */
+    uploadedIds,
     get refusal() { return refusal; },
     /** The second tier: may a turn also carry what its model calls saw? */
     get mayCaptureModelContent() { return mayCaptureModelContent; },
@@ -725,6 +846,16 @@ export function registerTurnCapture(api, {
   if (!turns || typeof api?.on !== "function") return null;
   const root = captureRoot(env);
 
+  // RETENTION, only when the operator asked for it: the Python SDK's
+  // `attach(retention_turns=...)`. A value that is not a whole number of turns
+  // is dropped and named, never thrown -- a throw here fails the plugin load.
+  const { retentionTurns, refusal: retentionRefusal } =
+    retentionTurnsFrom(config.retentionTurns);
+  if (retentionRefusal) {
+    logger?.warn?.(`[${pluginId}] ${retentionRefusal}; nothing is pruned.`);
+  }
+  let sincePrune = 0;
+
   // ASKED ONCE, HERE, and handed to everything that needs it. Whether this
   // host will deliver `agent_end` decides two things at once -- whether the
   // operator is told answers are missing, and whether the cadence may ever
@@ -761,6 +892,12 @@ export function registerTurnCapture(api, {
     // NOT AWAITED. This hook sits on the path of a turn whose user is waiting;
     // an upload must never be between them and their answer.
     uploader?.note();
+    // Counted here, at the turn's opening, like the upload cadence and like
+    // Python's `turn()`; run after this hook returns, for the same reason.
+    if (retentionTurns !== null && ++sincePrune >= PRUNE_EVERY) {
+      sincePrune = 0;
+      setImmediate(() => prune({ keepLast: retentionTurns }));
+    }
   });
 
   if (config.apiKey) {
@@ -863,10 +1000,26 @@ export function registerTurnCapture(api, {
       `nothing that needs a completion can use them.`);
   }
 
+  /**
+   * Delete captured turns, the Python SDK's `Attachment.prune`: `keepLast`
+   * keeps the most recent N, `olderThanS` deletes older turns, and neither
+   * deletes nothing. Returns how many were deleted; never throws.
+   */
+  function prune({ keepLast = null, olderThanS = null } = {}) {
+    try {
+      return pruneTurns({
+        root, keepLast, olderThanS, logger,
+        uploaded: uploader?.mayUpload ? uploader.uploadedIds() : null,
+      });
+    } catch {
+      return 0;
+    }
+  }
+
   // `transport` is handed out so the serving-policy read reuses THIS client
   // rather than constructing a second one against the same base URL and key.
   return {
-    turns, uploader, root, transport, started, rulebook,
+    turns, uploader, root, transport, started, rulebook, prune, retentionTurns,
     get rulebookRefusal() { return rulebookRefusal; },
   };
 }
