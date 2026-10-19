@@ -33,7 +33,10 @@
  *     plugin cannot see;
  *   - a runtime-context carrier on the user turn, which the model saw and
  *     `llm_input` does not include;
- *   - images in the prompt, whose bytes `llm_input` does not carry;
+ *   - a prompt whose images the transcript does not hold as `llm_input`
+ *     counted them: `llm_input` carries only their count (`imagesCount`), so
+ *     their bytes are read from the transcript's copy of the prompt, where
+ *     the host puts them after its text, and a different count is refused;
  *   - a transcript whose last user message is not the prompt `llm_input`
  *     carried: a message steered into the running session
  *     (`activeSession.steer`, which fires no second `llm_input`) that the
@@ -47,6 +50,11 @@
  * Nothing is invented to fill a gap -- a span starts where the previous one
  * ended -- and a clock too coarse to separate two messages advances by one
  * nanosecond, so the transcript's order survives the decoder's time order.
+ *
+ * MEDIA is recorded as the Python SDK's adapters record it: an image as an
+ * OTel GenAI `blob` part (`{type, modality, mime_type, content}`, the base64
+ * bytes), in the history, the prompt and a tool's result alike
+ * (`mediaPart`). pi-ai's messages carry no audio or video.
  *
  * Zero dependencies.
  */
@@ -95,6 +103,33 @@ function providerName(value) {
 
 class Refused extends Error {}
 
+/** The GenAI modality a MIME type names, as the Python SDK's adapters read
+ * it: its major type when that is image, video or audio, else a document. */
+function modalityOf(mimeType) {
+  const major = typeof mimeType === "string" ? mimeType.split("/")[0].trim().toLowerCase() : "";
+  return ["image", "video", "audio"].includes(major) ? major : "document";
+}
+
+/**
+ * One medium as the OTel GenAI part BOTH SDKs emit
+ * (`agent_flywheel.adapters._media.media_part` in the Python SDK): inline
+ * base64 `data` is a `blob`, an address a `uri`, keys in this order and
+ * `mime_type` `null` when it is not known. `modality` defaults to the one the
+ * MIME type names.
+ */
+export function mediaPart({ mimeType = null, data = null, uri = null, modality = null }) {
+  const mime = typeof mimeType === "string" && mimeType ? mimeType : null;
+  const kind = modality ?? modalityOf(mime);
+  if (typeof data === "string") {
+    return { type: "blob", modality: kind, mime_type: mime, content: data };
+  }
+  return { type: "uri", modality: kind, mime_type: mime, uri };
+}
+
+/** A pi-ai image block (`ImageContent`: base64 `data` and its `mimeType`). */
+const isImage = (block) => isObject(block) && block.type === "image"
+  && typeof block.data === "string" && block.data.length > 0;
+
 function contentParts(content) {
   if (typeof content === "string") {
     return content ? [{ type: "text", content }] : [];
@@ -106,10 +141,9 @@ function contentParts(content) {
     if (block.type === "text") {
       parts.push({ type: "text", content: typeof block.text === "string" ? block.text : "" });
     } else if (block.type === "image") {
-      parts.push({
-        type: "blob", modality: "image", mime_type: block.mimeType ?? null,
-        content: block.data,
-      });
+      parts.push(mediaPart({
+        mimeType: block.mimeType ?? null, data: block.data, modality: "image",
+      }));
     } else if (block.type === "thinking") {
       // Redacted reasoning is an opaque token the model is sent back, not
       // text it said; it has no part in the conventions and is not rendered.
@@ -176,12 +210,15 @@ function toolDefinitions(tools) {
 
 /**
  * The run's first model input, from one `llm_input` event, or `null` when
- * it cannot be rendered faithfully (images, or a message the host converts
- * out of sight). `at` is the receipt time, decimal nanoseconds.
+ * it cannot be rendered faithfully (a message the host converts out of
+ * sight). `at` is the receipt time, decimal nanoseconds. The prompt's images
+ * are only COUNTED here (`images`): `llm_input` carries no bytes, so
+ * `operationsFromRun` reads them from the transcript's copy of the prompt.
  */
 export function inputFromLlmInput(event, at) {
   if (!isObject(event)) return null;
-  if (Number(event.imagesCount) > 0) return null;
+  const images = event.imagesCount === undefined ? 0 : Number(event.imagesCount);
+  if (!Number.isInteger(images) || images < 0) return null;
   try {
     const history = Array.isArray(event.historyMessages) ? event.historyMessages : [];
     const input = history.map(semconvMessage);
@@ -198,6 +235,7 @@ export function inputFromLlmInput(event, at) {
         ? [{ type: "text", content: event.systemPrompt }] : [],
       input,
       tools: toolDefinitions(event.tools),
+      images,
     };
   } catch (err) {
     if (err instanceof Refused) return null;
@@ -205,15 +243,20 @@ export function inputFromLlmInput(event, at) {
   }
 }
 
-/** A user message's text as the transcript stores it, or `null` when it is
- * not text alone. */
+const isText = (b) => isObject(b) && b.type === "text" && typeof b.text === "string";
+
+/** A user message's text as the transcript stores it -- its images aside --
+ * or `null` when it holds anything else. */
 function userText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content) || !content.length) return null;
-  if (!content.every((b) => isObject(b) && b.type === "text" && typeof b.text === "string")) {
-    return null;
-  }
-  return content.map((b) => b.text).join("");
+  if (!content.every((b) => isText(b) || isImage(b))) return null;
+  return content.filter(isText).map((b) => b.text).join("");
+}
+
+/** The images of the transcript's copy of the prompt, in order. */
+function userImages(content) {
+  return Array.isArray(content) ? content.filter(isImage) : [];
 }
 
 /**
@@ -247,6 +290,10 @@ export function operationsFromRun(first, messages, endAt) {
   const lastUser = lastUserIndex(messages);
   if (lastUser < 0) return null;
   if (!isRunPrompt(messages[lastUser], first.prompt)) return null;
+  // The prompt's images, from the transcript's copy of it: exactly as many
+  // as `llm_input` counted, after its text, as the host sends them.
+  const images = userImages(messages[lastUser].content);
+  if (images.length !== (first.images ?? 0)) return null;
   const run = messages.slice(lastUser + 1);
   let converted;
   try {
@@ -274,6 +321,13 @@ export function operationsFromRun(first, messages, endAt) {
     return t > cursor ? t : cursor + 1n;
   };
   let history = [...first.input];
+  if (images.length) {
+    const prompt = history[history.length - 1];
+    history[history.length - 1] = {
+      ...prompt,
+      parts: [...prompt.parts, ...contentParts(images)],
+    };
+  }
   run.forEach((message, i) => {
     const at = clock(message);
     if (message.role === "assistant") {

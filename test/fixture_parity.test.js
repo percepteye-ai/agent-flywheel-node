@@ -1,6 +1,6 @@
 /**
- * The control plane's `/policy/current` answers, held BYTE FOR BYTE across the
- * two SDKs.
+ * The control plane's `/policy/current` answers -- and the media parts both
+ * SDKs emit (`media_parts.json`) -- held BYTE FOR BYTE across the two SDKs.
  *
  * Both SDKs ship in one release and apply the same two answers -- the gateway
  * delivery and the withdrawal -- so they are tested against ONE pair of files,
@@ -37,6 +37,10 @@ const SHARED = {
     "46871a1b96401e321df5a19501f0bbcaa0413970ad1629be56cc276d25a0a3a6",
   "policy_current_withdrawn.json":
     "b370a3ae9b5742b78d6b97c5774fc51089822d8be7aac119eeb14e2c788ccbe9",
+  // One medium as the GenAI part both SDKs emit (`mediaPart`, the Python
+  // SDK's `adapters._media.media_part`).
+  "media_parts.json":
+    "a317549fe426f8351a4aabf8e97bda99f35ab7af0dd74b5587eac5e50f0eccac",
 };
 
 const ours = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
@@ -55,12 +59,12 @@ const pythonRoot = [
   .find((root) => existsSync(new URL("pyproject.toml", root))
     && existsSync(new URL("src/agent_flywheel/", root))) ?? null;
 
-describe("the shared /policy/current fixtures", () => {
+describe("the shared fixtures", () => {
   for (const [name, digest] of Object.entries(SHARED)) {
     it(`${name} is the shared copy, by digest and against the Python SDK's`, () => {
       assert.equal(createHash("sha256").update(ours(name)).digest("hex"), digest,
         `test/fixtures/${name} is not the shared fixture -- change every copy ` +
-        "together (both SDKs and the control plane), never one alone");
+        "together (both SDKs, and the control plane's for its answers), never one alone");
 
       if (!pythonRoot) return;
       const theirs = new URL(`tests/fixtures/${name}`, pythonRoot);

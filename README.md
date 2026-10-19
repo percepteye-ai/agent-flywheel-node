@@ -37,16 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 725 was true on 2026-10-13 (it had drifted to 683, 666, 633, 596, 490,
+     its 735 was true on 2026-10-19 (it had drifted to 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 725" / "skipped 0")
+     (prints "tests 735" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-725_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-735_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <img src="docs/assets/flywheel-overview.gif"
@@ -240,7 +240,7 @@ valid task-only turns still reach the control plane for downstream validation.
 
 Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
 
-**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt with images, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
+**What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. An image the model saw -- in the prompt, the history or a tool's result -- is recorded as the GenAI `blob` part both SDKs emit. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt whose images the transcript does not hold as `llm_input` counted them, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
 
 ### The approved pair, applied
 
@@ -405,7 +405,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 725 tests, no install step — node:test, zero dependencies
+npm test     # 735 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
