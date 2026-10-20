@@ -28,13 +28,14 @@ Built and Maintained by **[PerceptEye](https://percepteye.ai)**
 **It keeps running in your harness, behind your firewall, on your credentials — unchanged.**<br/>
 One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 
-<!-- BADGES — `npm` is the only live-data badge in this README: it reads the
-     registry, so it cannot claim a release that never happened. Never swap it
-     for a static badge with a hand-written version — that asserts a release
-     nothing checks. Every other badge here is a hardcoded shields `/badge/`.
-     There is no `ci` badge, and none should be added while this repo is
-     private: shields.io queries GitHub anonymously and a private repo 404s
-     regardless of what CI did.
+<!-- BADGES — `npm` and `ci` are the live-data badges in this README. `npm`
+     reads the registry, so it cannot claim a release that never happened;
+     `ci` asks GitHub for the latest ci.yml run on main. Never swap either for
+     a static badge with a hand-written value — that asserts a state nothing
+     checks. Every other badge here is a hardcoded shields `/badge/`. `ci`
+     was left out while this repo was private, because shields.io queries
+     GitHub anonymously and a private repo 404s regardless of what CI did; the
+     repo went public and the workflow was enabled again on 2026-10-20.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
      its 749 was true on 2026-10-20 (it had drifted to 745, 729, 725, 683, 666, 633, 596, 490,
@@ -42,6 +43,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      (prints "tests 749" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
+[![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
