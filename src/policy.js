@@ -144,6 +144,7 @@
  * or ignores what they return, the agent runs exactly as it does today. The
  * cost of a closed seam is the improvement and nothing else.
  */
+import { GET_A_KEY } from "./config.js";
 import { resolveServedAgent, scopeDecision } from "./scope.js";
 
 /** The host hook whose RESULT carries the system prompt. */
@@ -302,7 +303,7 @@ export const PENDING_ANSWER_REASON = "the control plane has not been asked yet";
 export const NO_KEY_REASON =
   "no API key is configured, so the control plane is never asked and no hook " +
   "is subscribed (set PERCEPTEYE_API_KEY, or plugins.entries.<id>.config." +
-  "apiKey)";
+  `apiKey; no key yet? ${GET_A_KEY})`;
 
 const str = (v) => (typeof v === "string" ? v.trim() : "");
 

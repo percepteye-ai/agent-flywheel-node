@@ -37,23 +37,29 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 725 was true on 2026-10-13 (it had drifted to 683, 666, 633, 596, 490,
+     its 729 was true on 2026-10-20 (it had drifted to 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 725" / "skipped 0")
+     (prints "tests 729" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-725_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-729_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
+
+<br/>
+
+[![Connect your agent at launch.percepteye.ai](https://img.shields.io/badge/connect_your_agent-launch.percepteye.ai_%E2%86%92-10b981?style=for-the-badge&labelColor=0f172a)](https://launch.percepteye.ai/onboard/agent-sdk)
+
+<sub>Hosted control plane · free plan · no credit card · your first key in about a minute</sub>
 
 <img src="docs/assets/flywheel-overview.gif"
      width="1040"
      alt="Your agent — prompt, tools and model — sits inside your infrastructure. The plugin loads beside it in your harness with zero lines changed inside. Rollouts and observed outcomes go out; a trained policy comes back. Both the system prompt row and the model row flip to what the control plane approved for this agent, while the tools row stays untouched.">
 
-**[Install](#-install-in-one-call)** · [How the loop closes](#-how-the-loop-closes) · [Harnesses](#-harnesses) · [Modes](#-two-modes-one-switch) · [Production observability](#-production-observability) · [Human approval](#-a-person-approves-every-change) · [Configuration](#-configuration) · [Python or Node?](#-python-or-node)
+**[Install](#-install-in-one-call)** · [Control plane](#-the-control-plane) · [How the loop closes](#-how-the-loop-closes) · [Harnesses](#-harnesses) · [Modes](#-two-modes-one-switch) · [Production observability](#-production-observability) · [Human approval](#-a-person-approves-every-change) · [Configuration](#-configuration) · [Python or Node?](#-python-or-node)
 
 </div>
 
@@ -80,6 +86,52 @@ No container to build. No cluster to run. No GPU to provision. No inbound port t
 
 <br/>
 
+## 🌐 The control plane
+
+<!-- SCREENSHOTS (docs/assets/control-plane-*.png): the dashboard's own
+     onboarding and agent-page components, from the dashboard's code as of
+     2026-10-20 (the release that follows the one live that day), rendered
+     over SAMPLE data. The agent
+     "support-agent", its pefw_demo_ key and its scores are illustrative, and
+     the caption says so. Re-take them when those screens change: a picture of
+     a screen that no longer exists sends a new user looking for it. -->
+
+Installing the plugin is half of the flywheel. **The other half writes the tasks, grades every rollout and trains the model. That half is the control plane at [launch.percepteye.ai](https://launch.percepteye.ai/onboard/agent-sdk).** PerceptEye runs it on PerceptEye's GPUs, so there is nothing for you to deploy, scale or keep on call. It is also where you watch every lap, and where you approve what ships.
+
+<p align="center">
+  <a href="https://launch.percepteye.ai/onboard/agent-sdk"><img src="docs/assets/control-plane-sdk.png" width="920"
+     alt="The control plane's 'Add our SDK to your agent's code' screen for an agent named support-agent, on its Node (OpenClaw) tab: install the plugin, let it read each conversation (allowConversationAccess), and set the environment with the agent's pefw_ key, beside a status panel reading Agent created and Connected."></a>
+  <br/><sub>Connecting an OpenClaw agent at launch.percepteye.ai. The screens on this page show a sample agent.</sub>
+</p>
+
+| | **the plugin** · this package | **the control plane** · launch.percepteye.ai |
+|:--|:--|:--|
+| **runs** | in your harness, beside your agent | hosted by PerceptEye |
+| **does** | records every tool outcome, claims rollouts in training mode, captures the turns you serve, applies the approved prompt and model | writes tasks from your agent's real tools, grades every rollout, trains the policy, measures each candidate against the model you run today |
+| **shows you** | one startup line | every agent, what it could read of each, every candidate against the champion, and the switch that moves an agent between them |
+| **you bring** | `openclaw plugins install @percepteye/agent-flywheel` | an email address |
+
+**A key joins the two halves.** Without one, the plugin records on your disk and sends nothing. That part is free forever and needs no account. With a key, the same install registers your agent, works rollouts and picks up what training produced. Its startup line says which state it is in, and names the page where you get a key.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <img src="docs/assets/control-plane-signup.png" alt="The Create your account card: email, password, confirm password, and a note that a six-digit code confirms the address."><br/>
+      <b>① Create a workspace.</b> An email, a password and a six-digit code. Free plan, no credit card.
+    </td>
+    <td width="33%" valign="top">
+      <img src="docs/assets/control-plane-choose.png" alt="Choose one way to connect your agent: add our SDK to your agent's code, send the traces it already exports, connect where your traces live, or upload a trace file, with what happens next listed beside the choice."><br/>
+      <b>② Connect your agent.</b> Choose the SDK, pick <i>Node (OpenClaw)</i>, name the agent and get its <code>pefw_</code> key, shown once and scoped to that one agent.
+    </td>
+    <td width="33%" valign="top">
+      <img src="docs/assets/control-plane-agent.png" alt="An agent's page: it runs the champion, with a Try the candidate button, and a candidate-versus-base table showing two improved verdicts with mean-reward and pass-rate gains."><br/>
+      <b>③ Watch, then approve.</b> Every candidate is measured against the model you run today. Nothing moves until a person clicks <i>Try the candidate</i>, and moving back is the same click.
+    </td>
+  </tr>
+</table>
+
+<br/>
+
 ## ⚡ Install in one call
 
 One package, two harnesses. Pick your line:
@@ -91,19 +143,21 @@ dsh plugin --profile <name> add @percepteye/agent-flywheel   # DeepSeek Harness
 
 **That's the integration.** No import, no wrapper process, no sidecar. Start your agent exactly the way you always did.
 
-Want it to start contributing? Add a key and one host setting:
+**Want it to start contributing?** Get its key at **[launch.percepteye.ai](https://launch.percepteye.ai/onboard/agent-sdk)**. Sign up, name the agent, and pick *Node (OpenClaw)*: the key is shown once and scoped to that one agent, beside the exact commands for this plugin. Then add the key and one host setting:
 
 ```bash
-export PERCEPTEYE_API_KEY=pefw_...        # optional, and free at https://launch.percepteye.ai
+export PERCEPTEYE_API_KEY=pefw_...        # from https://launch.percepteye.ai/onboard/agent-sdk
 ```
 
-**Where a `pefw_` key comes from:** PerceptEye runs the control plane, and signing in is free and self-serve at **[launch.percepteye.ai](https://launch.percepteye.ai)**. Connect your agent there and you get its key — shown once, and scoped to that one agent. Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever.
+Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever. The startup line says so, and names the page where a key comes from.
 
-<!-- THE KEY ROUTE, confirmed by the owner 2026-09-14: PerceptEye operates the
-     control plane, and sign-in is free and self-serve at
-     https://launch.percepteye.ai (HTTP 200, "Mission Control · PerceptEye").
-     Connecting an agent there issues its key -- shown once, bound to that
-     agent. The Python README says the same; keep the two in step. -->
+<!-- THE KEY ROUTE, confirmed by the owner 2026-09-14 and re-pointed
+     2026-10-20: PerceptEye operates the control plane, and sign-up is free and
+     self-serve. Every link on this page that asks for a key goes to
+     https://launch.percepteye.ai/onboard/agent-sdk, the dashboard's screen for
+     connecting an agent with the SDK, which is also the SIGN_UP_URL this
+     plugin's own missing-key lines print (src/config.js). The Python README
+     says the same; keep the two in step. -->
 
 ```jsonc
 // your OpenClaw config
@@ -323,7 +377,7 @@ Scalar settings are settable two ways: in your OpenClaw config under `plugins.en
 
 | config key | environment variable | default | what it decides |
 |:--|:--|:--|:--|
-| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)* | the consent boundary. Without it nothing leaves the machine: no registration, no claim, no report, no control-plane read |
+| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)* | the consent boundary, from [launch.percepteye.ai](https://launch.percepteye.ai/onboard/agent-sdk). Without it nothing leaves the machine: no registration, no claim, no report, no control-plane read |
 | `mode` | `PERCEPTEYE_AGENT_MODE` | `training` | `training` claims rollouts and drives turns; `production` claims none and starts none, captures the turns you serve, and applies the approved pair. An unreadable value degrades to `production` and says so |
 | `agentId` | `PERCEPTEYE_AGENT_ID` | `openclaw` | the agent name this install reports as, **and** which OpenClaw agent's approved prompt and model it applies. Set it if your host runs more than one agent |
 | `controlPlaneUrl` | `PERCEPTEYE_CONTROL_PLANE_URL` | `https://launch.percepteye.ai/api/flywheel/v1` | the control plane this install talks to |
@@ -405,10 +459,20 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 725 tests, no install step — node:test, zero dependencies
+npm test     # 729 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
+
+---
+
+<div align="center">
+
+**Your agent already does the work. Let it learn from it.**
+
+[![Connect your agent at launch.percepteye.ai](https://img.shields.io/badge/connect_your_agent-launch.percepteye.ai_%E2%86%92-10b981?style=for-the-badge&labelColor=0f172a)](https://launch.percepteye.ai/onboard/agent-sdk)
+
+</div>
 
 ---
 

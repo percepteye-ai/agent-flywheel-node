@@ -106,6 +106,7 @@
  *   CONSUMER  `claim` drains the outbox before every claim, in BOTH lanes --
  *             which is why `unattended.js` has no transport of its own.
  */
+import { GET_A_KEY } from "./config.js";
 import { applyDeclaration } from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
@@ -152,7 +153,8 @@ export function driveVerdict(config, api, pluginId) {
       reason:
         "training mode is set but no API key resolved, so there is no control " +
         "plane to claim from. Set PERCEPTEYE_API_KEY, or " +
-        `plugins.entries.${pluginId}.config.apiKey.`,
+        `plugins.entries.${pluginId}.config.apiKey. No key yet? ` +
+        `${GET_A_KEY[0].toUpperCase()}${GET_A_KEY.slice(1)}.`,
     };
   }
   if (!conversationAccessGranted(api, pluginId)) {

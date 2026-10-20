@@ -213,6 +213,22 @@ export const CONFIG_SCHEMA = {
  */
 const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
 
+/**
+ * Where a developer with no key gets one: the dashboard's screen for
+ * connecting an agent with this SDK, on the default's own origin. Signed out,
+ * it offers sign-in and "Create an account" and keeps its address through
+ * both, so a new developer lands where the key is issued rather than on Home.
+ * Every message a missing key causes names it, because that message is the
+ * moment the developer needs it. They used to name only the variable, which
+ * says what is missing and not where it comes from. The Python SDK's
+ * `SIGN_UP_URL`, byte for byte.
+ */
+export const SIGN_UP_URL = "https://launch.percepteye.ai/onboard/agent-sdk";
+
+/** The remedy for a missing key, one wording for every message that needs it. */
+export const GET_A_KEY =
+  `sign up free at ${SIGN_UP_URL} and connect this agent to get its key`;
+
 /** The spellings that mean OFF. One list, because one typo rule applies. */
 const OFF = ["0", "false", "no", "off"];
 

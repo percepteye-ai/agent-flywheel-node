@@ -65,6 +65,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { GET_A_KEY } from "./config.js";
 import { applyDeclaration } from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { nowUnixNano } from "./genai-otlp.js";
@@ -984,7 +985,7 @@ export function registerTurnCapture(api, {
     rulebookRefusal = rulesNeverSent(config.rules, "no API key is configured");
     logger?.info?.(
       `[${pluginId}] capturing production turns to ${root}. No API key is ` +
-      `configured, so nothing is uploaded.` +
+      `configured, so nothing is uploaded; to upload them, ${GET_A_KEY}.` +
       (rulebookRefusal ? ` ${sentence(rulebookRefusal)}` : ""));
   }
 
