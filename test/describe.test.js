@@ -1,4 +1,4 @@
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -262,7 +262,7 @@ describe("the plugin registers the describer", () => {
     const handlers = new Map();
     const api = { on: (name, fn) => handlers.set(name, fn), logger: { warn() {} } };
 
-    plugin.register(api);
+    plugin.register(api, {}, testEnv(process.env));
 
     assert.ok(handlers.has(DESCRIBE_HOOK_NAME), "llm_input was never subscribed");
     assert.ok(handlers.has("after_tool_call"), "the recorder hook was lost");
@@ -283,7 +283,7 @@ describe("the plugin registers the describer", () => {
 
   it("a malformed event costs the description, never the run", () => {
     const handlers = new Map();
-    plugin.register({ on: (n, f) => handlers.set(n, f), logger: { warn() {} } });
+    plugin.register({ on: (n, f) => handlers.set(n, f), logger: { warn() {} } }, {}, testEnv(process.env));
     assert.doesNotThrow(() => handlers.get(DESCRIBE_HOOK_NAME)(null, null));
   });
 });

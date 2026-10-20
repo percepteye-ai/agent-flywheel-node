@@ -6,6 +6,9 @@
   "author": "PerceptEye",
   "type": "module",
   "main": "./src/index.js",
+  "bin": {
+    "agent-flywheel": "src/cli.js"
+  },
   "exports": {
     ".": "./src/index.js",
     "./classify": "./src/classify.js",

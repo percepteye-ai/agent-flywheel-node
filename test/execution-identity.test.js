@@ -276,7 +276,7 @@ describe("identity reaches reports without becoming policy identity", () => {
         ...SNAPSHOT,
         executionComponents: { execution_sha256: "b".repeat(64) },
       },
-    }, { PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "pe-invalid-id-")) });
+    }, testEnv({ PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "pe-invalid-id-")) }));
     assert.ok(plugin);
     assert.equal(plugin.executionIdentity.enabled, false);
     assert.equal(warnings.filter((message) => (
@@ -294,7 +294,7 @@ describe("identity reaches reports without becoming policy identity", () => {
     register(api, {
       mode: "production",
       executionSnapshot: SNAPSHOT,
-    }, { PERCEPTEYE_CAPTURE_DIR: root });
+    }, testEnv({ PERCEPTEYE_CAPTURE_DIR: root }));
     handlers.get("message_received")({
       runId: "run-1", content: "help", sessionKey: "session-1",
     }, {});

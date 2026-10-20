@@ -1,4 +1,4 @@
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -146,7 +146,7 @@ describe("the plugin registers observer hooks and only those", () => {
     // `llm_input` was added to describe the agent, which is a READ; the
     // mutation seams (`before_prompt_build`, `before_tool_call`) stay unused.
     const seen = [];
-    plugin.register({ on: (name) => seen.push(name) });
+    plugin.register({ on: (name) => seen.push(name) }, {}, testEnv(process.env));
     assert.deepEqual(seen.sort(), [HOOK_NAME, DESCRIBE_HOOK_NAME].sort());
   });
 
@@ -157,7 +157,7 @@ describe("the plugin registers observer hooks and only those", () => {
     plugin.register({
       on: () => {},
       registerAgentToolResultMiddleware: () => { middleware += 1; },
-    });
+    }, {}, testEnv(process.env));
     assert.equal(middleware, 0);
   });
 
@@ -172,7 +172,7 @@ describe("the plugin registers observer hooks and only those", () => {
 
   it("does not throw out of the handler on a malformed event", () => {
     let handler = null;
-    plugin.register({ on: (_n, h) => { handler = h; } });
+    plugin.register({ on: (_n, h) => { handler = h; } }, {}, testEnv(process.env));
     assert.doesNotThrow(() => handler(undefined, undefined));
     assert.doesNotThrow(() => handler({ toolName: "x", get params() { throw new Error("boom"); } }, {}));
   });

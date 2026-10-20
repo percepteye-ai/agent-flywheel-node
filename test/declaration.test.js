@@ -8,7 +8,7 @@
  * across one table), consent asked the same way, and a declaration that never
  * anchors an execution identity.
  */
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -249,7 +249,7 @@ function plugin(config, env = {}) {
     logger: { info() {}, warn: (message) => warnings.push(message) },
   };
   const out = register(api, { mode: "production", ...config },
-    { PERCEPTEYE_CAPTURE_DIR: root, ...env });
+    testEnv({ PERCEPTEYE_CAPTURE_DIR: root, ...env }));
   const serveOneTurn = () => {
     handlers.get("message_received")({
       runId: "run-1", content: "help", sessionKey: "session-1" }, {});
