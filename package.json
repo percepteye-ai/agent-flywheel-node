@@ -1,6 +1,6 @@
 {
   "name": "@percepteye/agent-flywheel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for a serving install, which claims no rollouts and starts no turn but does capture the turns you serve and apply the system prompt and the model your control plane has approved.",
   "license": "MIT",
   "author": "PerceptEye",
