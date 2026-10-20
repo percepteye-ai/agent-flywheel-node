@@ -31,7 +31,7 @@
  *   changes the transport -- so answering unconditionally would redirect the
  *   customer's Anthropic or OpenAI traffic to our gateway.
  */
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import { strict as assert } from "node:assert";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1426,9 +1426,9 @@ describe("mode decides it, structurally", () => {
       // KEYLESS: no transport, no subscription, nothing applied. The line
       // used to promise the opposite unconditionally.
       const bare = hostApi({ logger: fakeLogger(), config: {} });
-      register(bare, {}, {
+      register(bare, {}, testEnv({
         PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-      });
+      }));
       const keyless = bare.logger.lines.find((l) => l.includes("claims no rollout"));
       assert.ok(keyless);
       assert.match(keyless, /applies NOTHING your control plane has approved/);

@@ -88,6 +88,9 @@ import {
   createExecutionIdentityTracker, withholdFingerprints,
 } from "./execution-identity.js";
 import { resolveDeclaration } from "./declaration.js";
+import {
+  CredentialsError, credentialsPath, loadStored, loginHint,
+} from "./credentials.js";
 
 export const PLUGIN_ID = "agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
@@ -110,6 +113,22 @@ export { DESCRIBE_HOOK_NAME };
  * Anything thrown is caught, not only a ConfigurationError: this runs inside
  * `register()`, and the promise is that a declaration never costs the load.
  */
+/**
+ * The stored keys for `resolveConfig`, or `[]`. Unless a key is already
+ * named (the plugin config's `apiKey` or PERCEPTEYE_API_KEY, which outrank
+ * any stored one), the file under `percepteyeHome(env)` is read; an unusable
+ * one is said once and read as none.
+ */
+function readStoredKeys(env, logger) {
+  try {
+    return loadStored(env);
+  } catch (err) {
+    if (!(err instanceof CredentialsError)) throw err;
+    logger?.warn?.(`[${PLUGIN_ID}] ignoring stored keys: ${err.message}`);
+    return [];
+  }
+}
+
 function declarationFor(config, logger) {
   if (config.describe === null) return null;
   const refusal = (err) => (err instanceof ConfigurationError
@@ -185,6 +204,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     ? pluginConfig
     : (api.pluginConfig ?? {});
   let config;
+  let degraded = null;
   try {
     config = resolveConfig(supplied, env);
   } catch (err) {
@@ -204,12 +224,37 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // failure the closed alias set exists to prevent. Production is the safe
     // side of a mode we could not read: the worst case is that this install
     // does less than intended, and says so.
-    config = resolveConfig({ ...supplied, mode: PRODUCTION }, env);
+    degraded = { ...supplied, mode: PRODUCTION };
+    config = resolveConfig(degraded, env);
     logger?.warn?.(
       `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode until ` +
       `this is corrected; no rollouts will be claimed. Note that production ` +
       `mode is not inert: it captures served turns and applies the approved ` +
       `system prompt (PERCEPTEYE_CAPTURE=0 / PERCEPTEYE_APPLY_PROMPT=0).`,
+    );
+  }
+  // THE KEY `npx @percepteye/agent-flywheel login` STORED, consulted only
+  // when it can matter: capture is on (with it off nothing below runs) and
+  // neither the config's `apiKey` nor PERCEPTEYE_API_KEY names a key, both of
+  // which outrank it. `resolveConfig` ranks it (credentials.js); the file is
+  // read here, once. An unreadable file is said and read as none: it must not
+  // take local capture down with it.
+  if (config.captureEnabled && config.apiKey === null) {
+    const stored = readStoredKeys(env, logger);
+    if (stored.length > 0) config = resolveConfig(degraded ?? supplied, env, stored);
+  }
+  if (config.apiKeySource === "stored") {
+    // NEVER SILENT (owner ruling 2026-10-20, R2): a stored key is consent,
+    // and the operator is told which one is in use and how to withdraw it.
+    logger?.info?.(
+      `[${PLUGIN_ID}] using the key stored for agent ` +
+      `${JSON.stringify(config.agentId)} in ${credentialsPath(env)} (control ` +
+      `plane ${config.controlPlaneUrl}). Run \`npx @percepteye/agent-flywheel ` +
+      `logout --agent-id ${config.agentId}\` to stop.`,
+    );
+  } else if (config.apiKey === null && config.storedKeyRefusal) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] ${config.storedKeyRefusal}; ${loginHint(config.agentId)}.`,
     );
   }
   if (!config.captureEnabled) {

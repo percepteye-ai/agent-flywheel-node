@@ -922,16 +922,16 @@ describe("the production lane is wired", () => {
     // Turn capture is the production lane. A training install's trajectory
     // belongs to a rollout, not to an end user's turn.
     const a = api();
-    register(a, {}, { PERCEPTEYE_AGENT_MODE: "training" });
+    register(a, {}, testEnv({ PERCEPTEYE_AGENT_MODE: "training" }));
     assert.ok(!a.hooks.map((h) => h.name).includes("message_received"));
   });
 
   it("routes each tool call into its own turn directory", () => {
     const root = mkdtempSync(join(tmpdir(), "percepteye-route-"));
     const a = api();
-    register(a, {}, {
+    register(a, {}, testEnv({
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-    });
+    }));
     const tool = a.hooks.find((h) => h.name === "after_tool_call").fn;
     tool({ toolName: "lookup", params: { id: 1 }, runId: "runA", result: "ok" }, {});
     tool({ toolName: "lookup", params: { id: 2 }, runId: "runB", result: "ok" }, {});
@@ -944,9 +944,9 @@ describe("the production lane is wired", () => {
     // misattribution this package refuses everywhere else.
     const root = mkdtempSync(join(tmpdir(), "percepteye-drop-"));
     const a = api();
-    register(a, {}, {
+    register(a, {}, testEnv({
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-    });
+    }));
     const tool = a.hooks.find((h) => h.name === "after_tool_call").fn;
     tool({ toolName: "lookup", params: {}, result: "ok" }, {});
     assert.deepEqual(readdirSync(root), []);
@@ -955,9 +955,9 @@ describe("the production lane is wired", () => {
   it("captures locally with no API key, and contacts nothing", () => {
     const root = mkdtempSync(join(tmpdir(), "percepteye-nokey-"));
     const a = api();
-    const out = register(a, {}, {
+    const out = register(a, {}, testEnv({
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-    });
+    }));
     assert.equal(out.capture.uploader, null);
     const msg = a.hooks.find((h) => h.name === "message_received").fn;
     msg({ runId: "r", content: "hello", sessionKey: "c" }, {});

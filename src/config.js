@@ -16,6 +16,7 @@
  */
 import { resolveModeSource } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
+import { storedKeyFor } from "./credentials.js";
 import {
   PRODUCTION_IDENTIFIER_MAX_CHARS, productionAgentIdentifier,
 } from "./wire.js";
@@ -261,19 +262,40 @@ const agentIdentifier = (...values) => {
  * @param {object} pluginConfig  `plugins.entries.<id>.config`, as OpenClaw hands it
  * @param {object} env           defaults to process.env
  */
-export function resolveConfig(pluginConfig = {}, env = process.env) {
-  const apiKey = firstString(pluginConfig.apiKey, env.PERCEPTEYE_API_KEY);
+export function resolveConfig(pluginConfig = {}, env = process.env, stored = []) {
+  const keyFromConfig = firstString(pluginConfig.apiKey);
+  const keyFromEnv = firstString(env.PERCEPTEYE_API_KEY);
   // THROWS on an unrecognised mode, and is meant to. A typo here decides
   // whether this process claims rollouts on the customer's credentials, and
   // there is no value to fall back to that is right in both directions.
   const { mode, source: modeSource } = resolveModeSource(pluginConfig.mode, env);
+  const agentId = agentIdentifier(
+    pluginConfig.agentId, env.PERCEPTEYE_AGENT_ID,
+  ) ?? "openclaw";
+  const controlPlaneUrl = firstString(
+    pluginConfig.controlPlaneUrl,
+    env.PERCEPTEYE_CONTROL_PLANE_URL,
+  ) ?? DEFAULT_CONTROL_PLANE;
+  // THE THIRD SOURCE, asked only when neither of the first two names a key:
+  // the key `npx @percepteye/agent-flywheel login` stored for THIS agent on
+  // THIS control plane (credentials.js). `stored` is what `register` read
+  // from the file; this function reads none, so every caller that hands it
+  // nothing gets exactly the answer it always got.
+  const fromStore = keyFromConfig || keyFromEnv
+    ? { cred: null, refusal: null }
+    : storedKeyFor(stored, controlPlaneUrl, agentId);
+  const apiKey = keyFromConfig ?? keyFromEnv ?? fromStore.cred?.api_key ?? null;
   return {
     apiKey,
+    /** Where `apiKey` came from: "config", "environment", "stored" or null. */
+    apiKeySource: keyFromConfig ? "config"
+      : keyFromEnv ? "environment"
+        : fromStore.cred ? "stored" : null,
+    /** Why a key stored for this agent was not used (it expired), or null. */
+    storedKeyRefusal: fromStore.refusal,
     mode,
     modeSource,
-    agentId: agentIdentifier(
-      pluginConfig.agentId, env.PERCEPTEYE_AGENT_ID,
-    ) ?? "openclaw",
+    agentId,
     // ONE NAME FOR ONE QUESTION. This also read an unprefixed
     // `CONTROL_PLANE_ENV_URL`, at the LOWEST precedence -- while the Python
     // SDK's harness recorder read the same variable at the HIGHEST. Nothing in
@@ -284,10 +306,7 @@ export function resolveConfig(pluginConfig = {}, env = process.env) {
     // Two components of one product resolving the control plane differently is
     // not something a precedence rule fixes -- it is a second answer, so it is
     // gone rather than aligned.
-    controlPlaneUrl: firstString(
-      pluginConfig.controlPlaneUrl,
-      env.PERCEPTEYE_CONTROL_PLANE_URL,
-    ) ?? DEFAULT_CONTROL_PLANE,
+    controlPlaneUrl,
     // Capture is on unless DELIBERATELY disabled. A typo must not silently
     // switch it off and leave the operator believing it is on.
     captureEnabled: enabledUnlessOff(

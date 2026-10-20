@@ -13,7 +13,7 @@
  * them: a customer following the manifest and setting `apiKey` would have had
  * it refused by the schema the module itself publishes.
  */
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,7 +58,7 @@ test("capture stays ON by default, and a typo does not silently disable it", () 
   // not quietly switch capture off and leave an operator believing it is on.
   assert.equal(resolveConfig({ capture: "flase" }).captureEnabled, true);
   const api = fakeApi();
-  assert.notEqual(register(api, {}), null);
+  assert.notEqual(register(api, {}, testEnv(process.env)), null);
   assert.ok(api.hooks.length >= 1, "the recorder must be subscribed");
 });
 
@@ -303,10 +303,10 @@ test("PERCEPTEYE_AGENT_MODE=production keeps the rollout driver unregistered und
   // The host calls `register(api)` with ONE argument
   // (loader-D8d2EvVh.js:761) and puts the validated config here.
   api.pluginConfig = hydrateAsHostWould(manifest.configSchema, {});
-  const out = register(api, {}, {
+  const out = register(api, {}, testEnv({
     PERCEPTEYE_AGENT_MODE: "production",
     PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "percepteye-config-gate-")),
-  });
+  }));
   assert.equal(out.mode, PRODUCTION);
   assert.equal(out.rollouts, null, "production must not construct the rollout driver");
   const subscribed = api.hooks.map(([name]) => name);
@@ -330,9 +330,9 @@ test("production is NOT inert without a trajectory dir, and the description no l
   try {
     const api = fakeApi();
     // No PERCEPTEYE_TRAJECTORY_DIR anywhere in this env, deliberately.
-    register(api, {}, {
+    register(api, {}, testEnv({
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-    });
+    }));
     const received = api.hooks.find(([name]) => name === "message_received");
     assert.ok(received, "production subscribes the end user's message");
     received[1]({ runId: "run1", content: "my account number is 12345", sessionKey: "s" }, {});

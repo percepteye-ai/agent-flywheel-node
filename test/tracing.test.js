@@ -363,9 +363,9 @@ describe("which id a tool call is stamped with", () => {
     const t = fakeTracer();
     __resetTracerForTests(t, { SpanStatusCode: { ERROR: 2 } });
     try {
-      plugin.register(api, { mode: "production" }, {
+      plugin.register(api, { mode: "production" }, testEnv({
         PERCEPTEYE_CAPTURE_DIR: mkdtempSync(join(tmpdir(), "pe-cap-")),
-      });
+      }));
       for (const fn of hooks[HOOK_NAME]) {
         fn({ toolName: "book", params: {}, runId: "run_5" },
            { runId: "run_5", sessionKey: "s1" });

@@ -37,16 +37,16 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      regardless of what CI did.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 729 was true on 2026-10-20 (it had drifted to 725, 683, 666, 633, 596, 490,
+     its 749 was true on 2026-10-20 (it had drifted to 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 729" / "skipped 0")
+     (prints "tests 749" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![npm](https://img.shields.io/npm/v/@percepteye/agent-flywheel?style=for-the-badge&logo=npm&logoColor=white&label=npm&color=3b82f6)](https://www.npmjs.com/package/@percepteye/agent-flywheel)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-729_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-749_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -148,6 +148,15 @@ dsh plugin --profile <name> add @percepteye/agent-flywheel   # DeepSeek Harness
 ```bash
 export PERCEPTEYE_API_KEY=pefw_...        # from https://launch.percepteye.ai/onboard/agent-sdk
 ```
+
+**Or get the key without leaving your terminal:**
+
+```bash
+npx @percepteye/agent-flywheel login                     # for agentId "openclaw"
+npx @percepteye/agent-flywheel login --agent-id my-agent # for another agent
+```
+
+It prints a short code and opens launch.percepteye.ai with the code filled in. Sign up or sign in, check that the code matches, and click **Approve**. The key comes back to the terminal and is stored in `~/.percepteye/credentials.json` (or `$PERCEPTEYE_HOME/credentials.json`), readable only by you, for that one agent on that one control plane. Restart OpenClaw: when neither the plugin's `apiKey` nor `PERCEPTEYE_API_KEY` is set, the plugin uses the stored key for its `agentId` and logs once that it is doing so. A stored key is consent to send, exactly as the variable is. `npx @percepteye/agent-flywheel logout` forgets it here; revoking it in Mission Control (Settings) stops it everywhere. The Python SDK's `agent-flywheel login` writes the same file, so either one serves both.
 
 Without a key nothing leaves the machine: local recording of your agent's real tool-failure rate works without one, forever. The startup line says so, and names the page where a key comes from.
 
@@ -367,7 +376,7 @@ That line is real output from a live OpenClaw run, and it is the same format the
 - **A file still present is work the control plane has not recorded yet.** It is retried in front of every claim, in both the attended and the unattended lane.
 - **A refusal that resending cannot fix stops the retries and never deletes the file.** It is renamed under a suffix that says *which* refusal it was: `.refused-lease-lost` when the lease is gone — the commonest one, and what a 410 becomes — `.refused-contract` when this SDK itself could not carry the payload, `.refused-400` / `.refused-404` / `.refused-409` / `.refused-422` for the remaining final statuses, and `.stale` for a file that aged out. A second refusal of the same rollout gets `.refused-lease-lost.1` rather than overwriting the first. A warning names the exact path every time. Retries stop after seven days, and that file is kept too.
 - **A status this SDK does not recognise keeps retrying.** Guessing that an unrecognised failure is permanent would stop delivering work on the strength of not understanding the error, so only the statuses named above are final. `401` and `403` stay in the retry set too: a reissued key delivers them.
-- **No credential is ever written there.** The rollout's lease token stays in this process's memory, because this directory is readable by the same agent the lease fences out.
+- **No rollout credential is ever written there.** The rollout's lease token stays in this process's memory, because this directory is readable by the same agent the lease fences out. The one secret this package does keep under `$PERCEPTEYE_HOME` is the agent key `login` stores, in `credentials.json` (0600), and no request body this package sends ever carries a Flywheel key: one a tool printed is replaced with `pefw_[REDACTED]` before it leaves.
 
 <br/>
 
@@ -377,7 +386,7 @@ Scalar settings are settable two ways: in your OpenClaw config under `plugins.en
 
 | config key | environment variable | default | what it decides |
 |:--|:--|:--|:--|
-| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)* | the consent boundary, from [launch.percepteye.ai](https://launch.percepteye.ai/onboard/agent-sdk). Without it nothing leaves the machine: no registration, no claim, no report, no control-plane read |
+| `apiKey` | `PERCEPTEYE_API_KEY` | *(none)*, then the key `login` stored for this `agentId` on this control plane | the consent boundary, from [launch.percepteye.ai](https://launch.percepteye.ai/onboard/agent-sdk) or `npx @percepteye/agent-flywheel login`. Without it nothing leaves the machine: no registration, no claim, no report, no control-plane read |
 | `mode` | `PERCEPTEYE_AGENT_MODE` | `training` | `training` claims rollouts and drives turns; `production` claims none and starts none, captures the turns you serve, and applies the approved pair. An unreadable value degrades to `production` and says so |
 | `agentId` | `PERCEPTEYE_AGENT_ID` | `openclaw` | the agent name this install reports as, **and** which OpenClaw agent's approved prompt and model it applies. Set it if your host runs more than one agent |
 | `controlPlaneUrl` | `PERCEPTEYE_CONTROL_PLANE_URL` | `https://launch.percepteye.ai/api/flywheel/v1` | the control plane this install talks to |
@@ -459,7 +468,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 729 tests, no install step — node:test, zero dependencies
+npm test     # 749 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

@@ -12,7 +12,7 @@
  * nothing recorded; a prefix this plugin cannot see, nothing rendered; a
  * revocation, nothing more sent.
  */
-import "./support/home.js";
+import { testEnv } from "./support/home.js";
 import { strict as assert } from "node:assert";
 import {
   existsSync, mkdtempSync, readFileSync, readdirSync, statSync,
@@ -195,9 +195,9 @@ describe("the happy path, through register()", () => {
   it("routes the host's llm_input to capture through register()", () => {
     const root = tmp();
     const a = hostApi();
-    const out = register(a, {}, {
+    const out = register(a, {}, testEnv({
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
-    });
+    }));
     out.capture.turns.gateModelContent(() => true);
     serveTurn(a, "run-9");
     assert.ok(existsSync(join(root, "run-9", OBSERVATION_FILENAME)),

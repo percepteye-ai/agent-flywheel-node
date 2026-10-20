@@ -158,6 +158,36 @@ async function detail(response) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** What a Flywheel key in an outgoing body is replaced with. */
+export const REDACTED_KEY = "pefw_[REDACTED]";
+/** A Flywheel key as the control plane mints one: the prefix and 43 URL-safe
+ *  base64 characters, matched whole. */
+const FLYWHEEL_KEY = /pefw_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
+/** A secret shorter than this is not a minted key (those are 48 characters)
+ *  and is not searched for by value: replacing every "k" in a report because
+ *  a test authenticated as "k" would corrupt the report. */
+const MIN_SECRET_LENGTH = 16;
+
+/**
+ * `body` (serialised JSON) with every Flywheel key in it -- and `secret` --
+ * replaced by {@link REDACTED_KEY}.
+ *
+ * NO BODY THIS PACKAGE SENDS CARRIES A FLYWHEEL KEY (owner ruling 2026-10-20,
+ * R2b). Tool output is captured into what this package reports, and a tool
+ * can read whatever its user can -- the key `login` stored under
+ * ~/.percepteye included. Every key the control plane mints is matched by its
+ * shape, and the key this client authenticates with by its exact value,
+ * whatever its shape. The Python SDK's `_http.redact_keys`, on the
+ * serialised form: a key is URL-safe, so JSON writes it unescaped.
+ */
+export function redactKeys(body, secret = null) {
+  let out = body.replace(FLYWHEEL_KEY, REDACTED_KEY);
+  if (secret && secret.length >= MIN_SECRET_LENGTH && out.includes(secret)) {
+    out = out.split(secret).join(REDACTED_KEY);
+  }
+  return out;
+}
+
 export class ControlPlaneClient {
   /**
    * @param {string} baseUrl
@@ -175,6 +205,8 @@ export class ControlPlaneClient {
       );
     }
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+    // Kept so `redactKeys` can find this exact value in a body.
+    this._secret = apiKey;
     this._timeoutMs = opts.timeoutMs ?? 30_000;
     this._maxAttempts = Math.max(1, opts.maxAttempts ?? 4);
     this._fetch = opts.fetchImpl ?? globalThis.fetch;
@@ -252,7 +284,9 @@ export class ControlPlaneClient {
         response = await this._fetch(url, {
           method,
           headers,
-          body: jsonBody === undefined ? undefined : JSON.stringify(jsonBody),
+          body: jsonBody === undefined
+            ? undefined
+            : redactKeys(JSON.stringify(jsonBody), this._secret),
           signal: controller.signal,
         });
       } catch (err) {
