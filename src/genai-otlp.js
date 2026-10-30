@@ -35,8 +35,10 @@
  *
  * THE REQUESTED OUTPUT FORMAT. The conventions carry only a call's output TYPE
  * (`gen_ai.output.type`), never the schema it asked the model to answer in.
- * When a call was sent a `response_format` (Chat Completions) or a
- * `text.format` (the Responses API) -- `requestedOutputFormat` is the one
+ * When a call was sent a `response_format` (Chat Completions), a
+ * `text.format` (the Responses API) or Gemini's structured-output config
+ * (`response_mime_type: "application/json"` with `response_json_schema` or
+ * `response_schema`, either spelling) -- `requestedOutputFormat` is the one
  * reading of a request for it -- its chat span carries that object WHOLE, in
  * the content encoding below, as `RESPONSE_FORMAT_ATTR`: what Mission
  * Control's decoder reads to grade the reply against the schema and to pose
@@ -125,10 +127,10 @@ const isFormat = (v) => isObject(v) && Object.keys(v).length > 0;
 
 /**
  * The output format a model request asked for, as it was sent: Chat
- * Completions' `response_format`, else the Responses API's `text.format`;
- * `null` when it asked for neither. Only an object is a format (both APIs
- * take one): anything else is not what went on the wire, and is not guessed
- * at.
+ * Completions' `response_format`, else the Responses API's `text.format`,
+ * else Gemini's structured-output config when it asks for JSON
+ * (`geminiOutputFormat`); `null` when it asked for none. Only an object is a
+ * format: anything else is not what went on the wire, and is not guessed at.
  */
 export function requestedOutputFormat(request) {
   if (!isObject(request)) return null;
@@ -136,7 +138,28 @@ export function requestedOutputFormat(request) {
   if (isObject(request.text) && isFormat(request.text.format)) {
     return { ...request.text.format };
   }
-  return null;
+  return geminiOutputFormat(request);
+}
+
+/** Gemini's structured-output keys (`GenerateContentConfig`), both
+ * spellings: the MIME type that asks for JSON, and the two schemas. */
+const GEMINI_MIME_KEYS = ["response_mime_type", "responseMimeType"];
+const GEMINI_SCHEMA_KEYS = ["response_json_schema", "responseJsonSchema",
+  "response_schema", "responseSchema"];
+
+/** Gemini's structured-output config, when the request asks for JSON: ONLY
+ * its MIME type and schema keys, in the request's own order, values as
+ * passed (a schema only when it is an object). `null` for any other MIME
+ * type, or none. */
+function geminiOutputFormat(request) {
+  const key = GEMINI_MIME_KEYS.find((k) => request[k] !== undefined && request[k] !== null);
+  const mime = key === undefined ? null : request[key];
+  if (typeof mime !== "string" || mime.trim().toLowerCase() !== "application/json") {
+    return null;
+  }
+  return Object.fromEntries(Object.entries(request).filter(([k, v]) => (
+    (GEMINI_MIME_KEYS.includes(k) && typeof v === "string")
+    || (GEMINI_SCHEMA_KEYS.includes(k) && isObject(v)))));
 }
 
 function finishSpan(op, attrs, { traceId, spanId, parent, name, kind, start, end }) {

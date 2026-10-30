@@ -209,6 +209,20 @@ describe("the requested output format", () => {
     assert.deepStrictEqual(requestedOutputFormat({ text: { format: flat } }), flat);
     assert.deepStrictEqual(
       requestedOutputFormat({ response_format: FORMAT, text: { format: flat } }), FORMAT);
+    // Gemini's config, when it asks for JSON: only its MIME type and schema
+    // keys, in the request's order, as passed (either spelling).
+    const gemini = { temperature: 0, responseMimeType: "application/json",
+      responseSchema: { type: "OBJECT" }, response_json_schema: "x" };
+    assert.equal(contentJson(requestedOutputFormat(gemini)),
+      '{"responseMimeType":"application/json","responseSchema":{"type":"OBJECT"}}');
+    assert.deepStrictEqual(
+      requestedOutputFormat({ response_mime_type: "application/json" }),
+      { response_mime_type: "application/json" });
+    for (const request of [
+      { response_mime_type: "text/plain", response_schema: { type: "STRING" } },
+      { response_schema: { type: "OBJECT" } }]) {
+      assert.equal(requestedOutputFormat(request), null);
+    }
     for (const request of [null, {}, { response_format: "json" },
       { response_format: {} }, { text: { format: "json" } },
       { response_format: ["x"] }]) {
