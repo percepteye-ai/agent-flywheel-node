@@ -14,8 +14,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
-  SCOPE_NAME, contentJson, newSpanId, newTraceId, observationFromLines,
-  renderTurnTrace,
+  RESPONSE_FORMAT_ATTR, SCOPE_NAME, contentJson, newSpanId, newTraceId,
+  observationFromLines, renderTurnTrace, requestedOutputFormat,
 } from "../src/genai-otlp.js";
 
 const GOLDEN_URL = new URL("./fixtures/genai-capture-golden.json", import.meta.url);
@@ -163,6 +163,56 @@ describe("what the intake enforces, as properties", () => {
     for (let i = 0; i < 64; i += 1) {
       assert.match(newTraceId(), /^[0-9a-f]{32}$/);
       assert.match(newSpanId(), /^[0-9a-f]{16}$/);
+    }
+  });
+});
+
+// The SAME input and the SAME expected bytes as the Python SDK's
+// tests/test_genai_otlp.py: the object as given (key order kept, never
+// sorted), compact content JSON, non-ASCII unescaped.
+const FORMAT = {
+  type: "json_schema",
+  json_schema: {
+    strict: true, name: "risk_batch",
+    schema: { type: "object", properties: { "größe": { type: "integer" } },
+      required: ["größe"] },
+  },
+};
+const FORMAT_BYTES = '{"type":"json_schema","json_schema":{"strict":true,"name":"risk_batch",'
+  + '"schema":{"type":"object","properties":{"größe":{"type":"integer"}},'
+  + '"required":["größe"]}}}';
+
+describe("the requested output format", () => {
+  it("rides whole on its chat span", () => {
+    // Mutation: drop the attribute in chatSpan -> red.
+    assert.equal(RESPONSE_FORMAT_ATTR, "percepteye.request.response_format");
+    const [, chat] = spans(renderTurnTrace(observation({ response_format: FORMAT }),
+      { agentName: "a" }));
+    assert.deepStrictEqual(attrs(chat)[RESPONSE_FORMAT_ATTR], { stringValue: FORMAT_BYTES });
+  });
+
+  it("is absent from a call that asked for none", () => {
+    // Its span is byte-identical to before. Mutation: render any value -> red.
+    const [, plain] = spans(renderTurnTrace(observation(), { agentName: "a" }));
+    for (const junk of [null, {}, "json_schema", ["x"]]) {
+      const [, chat] = spans(renderTurnTrace(observation({ response_format: junk }),
+        { agentName: "a" }));
+      assert.ok(!(RESPONSE_FORMAT_ATTR in attrs(chat)));
+      assert.deepStrictEqual(Object.keys(attrs(chat)), Object.keys(attrs(plain)));
+    }
+  });
+
+  it("is response_format, else the Responses API's text.format", () => {
+    // Mutation: read only response_format -> red.
+    const flat = { type: "json_schema", name: "risk_batch", schema: {} };
+    assert.deepStrictEqual(requestedOutputFormat({ response_format: FORMAT }), FORMAT);
+    assert.deepStrictEqual(requestedOutputFormat({ text: { format: flat } }), flat);
+    assert.deepStrictEqual(
+      requestedOutputFormat({ response_format: FORMAT, text: { format: flat } }), FORMAT);
+    for (const request of [null, {}, { response_format: "json" },
+      { response_format: {} }, { text: { format: "json" } },
+      { response_format: ["x"] }]) {
+      assert.equal(requestedOutputFormat(request), null);
     }
   });
 });

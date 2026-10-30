@@ -42,6 +42,14 @@
  * A refusal records no model boundary for that turn; the turn itself is
  * captured exactly as before.
  *
+ * NO REQUESTED OUTPUT FORMAT. `llm_input` carries no `response_format` or
+ * `text.format` (OpenClaw 2026.7.1's `PluginHookLlmInputEvent`: provider,
+ * model, systemPrompt, prompt, historyMessages, imagesCount, tools), so a
+ * chat operation built here has none and its span carries no
+ * `percepteye.request.response_format`. Nothing is inferred in its place;
+ * `genai-otlp.js` renders the format whenever an operation does carry one,
+ * byte-identically with the Python SDK.
+ *
  * CLOCKS are the host's own: the `llm_input` and `agent_end` receipt times
  * bound the run, and each message's own timestamp says when its span ended.
  * Nothing is invented to fill a gap -- a span starts where the previous one

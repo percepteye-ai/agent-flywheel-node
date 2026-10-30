@@ -33,6 +33,16 @@
  *     the customer's own traffic, and a span carrying that id is dropped
  *     downstream as our training traffic.
  *
+ * THE REQUESTED OUTPUT FORMAT. The conventions carry only a call's output TYPE
+ * (`gen_ai.output.type`), never the schema it asked the model to answer in.
+ * When a call was sent a `response_format` (Chat Completions) or a
+ * `text.format` (the Responses API) -- `requestedOutputFormat` is the one
+ * reading of a request for it -- its chat span carries that object WHOLE, in
+ * the content encoding below, as `RESPONSE_FORMAT_ATTR`: what Mission
+ * Control's decoder reads to grade the reply against the schema and to pose
+ * the decision with it. A call that asked for none carries no such attribute,
+ * so its span is byte-identical to before.
+ *
  * ONE ENCODING FOR CONTENT: compact JSON in the value's own key order, the
  * order this runtime would have serialized to the model. The one thing the two
  * runtimes cannot share is the order of integer-like object keys (JavaScript
@@ -47,6 +57,11 @@ import { randomBytes } from "node:crypto";
 
 /** Where a turn directory keeps its observed model boundary, one record per line. */
 export const OBSERVATION_FILENAME = "genai_observation.jsonl";
+
+/** The chat-span attribute carrying the call's requested output format, the
+ * WHOLE object as content JSON. The Python SDK's `genai_otlp.py` writes the
+ * same name with the same bytes; Mission Control's decoder reads it first. */
+export const RESPONSE_FORMAT_ATTR = "percepteye.request.response_format";
 
 /** The instrumentation scope every rendered trace names. */
 export const SCOPE_NAME = "percepteye.agent_flywheel";
@@ -106,6 +121,23 @@ const s = (value) => ({ stringValue: value });
 const attr = (key, value) => ({ key, value });
 const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isFormat = (v) => isObject(v) && Object.keys(v).length > 0;
+
+/**
+ * The output format a model request asked for, as it was sent: Chat
+ * Completions' `response_format`, else the Responses API's `text.format`;
+ * `null` when it asked for neither. Only an object is a format (both APIs
+ * take one): anything else is not what went on the wire, and is not guessed
+ * at.
+ */
+export function requestedOutputFormat(request) {
+  if (!isObject(request)) return null;
+  if (isFormat(request.response_format)) return { ...request.response_format };
+  if (isObject(request.text) && isFormat(request.text.format)) {
+    return { ...request.text.format };
+  }
+  return null;
+}
 
 function finishSpan(op, attrs, { traceId, spanId, parent, name, kind, start, end }) {
   const errorType = text(op.error_type);
@@ -164,6 +196,9 @@ function chatSpan(op, { traceId, parent, conversationId }) {
   const tools = op.tool_definitions;
   if (Array.isArray(tools) && tools.length) {
     attrs.push(attr("gen_ai.tool.definitions", s(contentJson(tools))));
+  }
+  if (isFormat(op.response_format)) {
+    attrs.push(attr(RESPONSE_FORMAT_ATTR, s(contentJson(op.response_format))));
   }
   return finishSpan(op, attrs, {
     traceId, spanId, parent, name: `chat ${requestModel}`, kind: CLIENT, start, end,
