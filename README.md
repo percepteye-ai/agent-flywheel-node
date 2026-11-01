@@ -384,7 +384,7 @@ That line is real output from a live OpenClaw run, and it is the same format the
 
 ## 📋 Runs, eligibility and evaluation sets
 
-`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.29.0) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
+`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.30.0) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
 
 ```js
 import { CustomerApiClient } from "@percepteye/agent-flywheel/customer-api";

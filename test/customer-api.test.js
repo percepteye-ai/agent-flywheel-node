@@ -1,6 +1,6 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.29.0), case for case with the Python
+ * The customer API reads (contract 1.30.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
@@ -23,8 +23,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.29.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.29.0");
+  it("pins contract 1.30.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.30.0");
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
@@ -62,10 +62,12 @@ describe("customer api", () => {
   });
 
   it("reads eligibility for an agent and eval sets by page", async () => {
-    const f = fake(200, { prompt_optimization: { enabled: true, mode: "offline", needs: "prepared_corpus", algorithms: [] } });
+    const f = fake(200, { prompt_optimization: { enabled: true, mode: "offline", needs: "prepared_corpus", algorithms: [],
+      model_under_test: { model: "m", label: "l", customer_model: false, reason: "r" } } });
     const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", fetchImpl: f.fetchImpl, env: {} });
     const e = await c.trainingEligibility({ agentId: "a1" });
     assert.equal(e.prompt_optimization.needs, "prepared_corpus");
+    assert.equal(e.prompt_optimization.model_under_test.customer_model, false);
     assert.equal(new URL(f.calls[0].url).search, "?agent_id=a1");
     await c.listEvalSets({ productId: "p1", limit: 5, offset: 10 });
     const u = new URL(f.calls[1].url);
