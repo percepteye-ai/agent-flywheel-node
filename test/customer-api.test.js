@@ -1,10 +1,12 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.30.0), case for case with the Python
+ * The customer API reads (contract 1.29.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ConfigurationError } from "../src/errors.js";
 import {
   CUSTOMER_CONTRACT_VERSION, CustomerApiClient, CustomerRefusal,
@@ -23,8 +25,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.30.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.30.0");
+  it("pins contract 1.29.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.29.0");
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
@@ -107,5 +109,29 @@ describe("customer api", () => {
     const no = fake(200, { customer_contract_versions_supported: ["2"] });
     const c2 = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", fetchImpl: no.fetchImpl, env: {} });
     assert.equal(await c2.supportsContract(), false);
+  });
+  it("answers false for a health body it cannot read, as the Python SDK does", async () => {
+    for (const body of ["<html>ok</html>", ["1"], { customer_contract_versions_supported: "1" }]) {
+      const { fetchImpl } = fake(200, body);
+      const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl });
+      assert.equal(await c.supportsContract(), false);
+    }
+  });
+
+  it("holds its refusal codes to the control plane's published contract", () => {
+    // Copies of the control plane's codes. When PERCEPTEYE_CONTROL_PLANE_CHECKOUT
+    // names its checkout (a release), each must be published with the status
+    // this SDK documents; a variable that is set is a promise.
+    const checkout = process.env.PERCEPTEYE_CONTROL_PLANE_CHECKOUT;
+    if (!checkout) return;
+    const doc = JSON.parse(readFileSync(join(checkout, "docs", "openapi.json"), "utf8"));
+    const published = Object.fromEntries(doc["x-refusal-codes"].map((e) => [e.code, e.http_status]));
+    const expected = {
+      launch_uri_outside_org: 403, run_page_too_deep: 422, prompt_run_balance_too_small: 402,
+      recorded_prompt_absent: 422, recorded_decisions_too_few: 422, recorded_prompt_mismatch: 422,
+    };
+    assert.deepEqual([...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES].sort(), Object.keys(expected).sort());
+    for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);
+    assert.equal(doc["x-customer-contract-version"], CUSTOMER_CONTRACT_VERSION);
   });
 });

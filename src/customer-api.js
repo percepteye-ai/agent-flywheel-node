@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.30.0).
+ * Reads of the customer-automation API (customer contract 1.29.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -17,7 +17,7 @@ import { DEFAULT_CONTROL_PLANE } from "./config.js";
 import { ConfigurationError } from "./errors.js";
 import { SDK_VERSION } from "./http.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.30.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.29.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -125,8 +125,8 @@ export class CustomerApiClient {
   /** Whether the server speaks this client's contract major (GET /health). */
   async supportsContract() {
     const body = await this._get("/health", {});
-    const served = body?.customer_contract_versions_supported ?? [];
-    return served.map(String).includes(MAJOR);
+    const served = body?.customer_contract_versions_supported;
+    return Array.isArray(served) && served.map(String).includes(MAJOR);
   }
 
   /**
@@ -149,7 +149,7 @@ export class CustomerApiClient {
 
   /**
    * GET /training/eligibility; `prompt_optimization` says the agent's prompt
-   * path, and (1.30.0) `model_under_test` the model a prompt run would test on.
+   * path, and (1.29.0) `model_under_test` the model a prompt run would test on.
    */
   trainingEligibility({ agentId, productId } = {}) {
     return this._get("/training/eligibility", { agent_id: agentId, product_id: productId });
