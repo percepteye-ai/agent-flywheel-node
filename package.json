@@ -14,7 +14,8 @@
     "./classify": "./src/classify.js",
     "./trajectory": "./src/trajectory.js",
     "./dsh": "./src/dsh.js",
-    "./tracing": "./src/tracing.js"
+    "./tracing": "./src/tracing.js",
+    "./customer-api": "./src/customer-api.js"
   },
   "files": [
     "src",

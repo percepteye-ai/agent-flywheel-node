@@ -212,7 +212,7 @@ export const CONFIG_SCHEMA = {
  * configuration table too, because a default a customer cannot see is a
  * default they cannot tell apart from a control plane that is down.
  */
-const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
+export const DEFAULT_CONTROL_PLANE = "https://launch.percepteye.ai/api/flywheel/v1";
 
 /**
  * Where a developer with no key gets one: the dashboard's screen for

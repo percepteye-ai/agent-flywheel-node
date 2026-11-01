@@ -40,7 +40,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      Separately: the `tests` badge below is hardcoded and nothing checks it;
      its 749 was true on 2026-10-20 (it had drifted to 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 749" / "skipped 0")
+     (prints "tests 760" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -48,7 +48,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-749_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-760_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -382,6 +382,21 @@ That line is real output from a live OpenClaw run, and it is the same format the
 
 <br/>
 
+## 📋 Runs, eligibility and evaluation sets
+
+`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.29.0) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
+
+```js
+import { CustomerApiClient } from "@percepteye/agent-flywheel/customer-api";
+
+const mc = new CustomerApiClient();
+const runs = await mc.listRuns({ productId: "prod_123", includePromptEvolutions: true });
+const path = (await mc.trainingEligibility({ agentId: "agent_123" })).prompt_optimization;
+const sets = await mc.listEvalSets({ productId: "prod_123", limit: 20 });
+```
+
+A refused request throws `CustomerRefusal` with the body's `code`, `refusalMessage`, `customerMessage`, `customerWords`, `remediation`, `faultOwner` and `retryable`. `plainWords` is what to show a person. The Python SDK has the same client in `agent_flywheel.customer_api`.
+
 ## ⚙️ Configuration
 
 Scalar settings are settable two ways: in your OpenClaw config under `plugins.entries.agent-flywheel.config`, or in the environment. **Config wins over the environment**, because config is hot-reloaded and puts a secret under the host's own secret handling, while a gateway reads its environment once at launch. The nested execution snapshot is config-only so component names and completeness remain typed rather than being parsed from a shell string.
@@ -470,7 +485,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 749 tests, no install step — node:test, zero dependencies
+npm test     # 760 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.
