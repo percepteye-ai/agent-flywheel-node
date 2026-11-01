@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.29.0).
+ * Reads of the customer-automation API (customer contract 1.30.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -17,7 +17,7 @@ import { DEFAULT_CONTROL_PLANE } from "./config.js";
 import { ConfigurationError } from "./errors.js";
 import { SDK_VERSION } from "./http.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.29.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.30.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -31,6 +31,8 @@ export const PROMPT_RUN_REFUSAL_CODES = Object.freeze([
   "recorded_decisions_too_few",
   "recorded_prompt_mismatch",
 ]);
+/** 1.30.0: the held-out attack set a promotion is measured on never changes. */
+export const ATTACK_REFUSAL_CODES = Object.freeze(["attack_set_is_sealed"]);
 
 const FLYWHEEL_SUFFIX = "/api/flywheel/v1";
 const CUSTOMER_PREFIX = "/api/v2";
@@ -149,7 +151,9 @@ export class CustomerApiClient {
 
   /**
    * GET /training/eligibility; `prompt_optimization` says the agent's prompt
-   * path, and (1.29.0) `model_under_test` the model a prompt run would test on.
+   * path, (1.29.0) `model_under_test` the model a prompt run would test on,
+   * and (1.30.0) `security`: its default, whether it is enabled, each
+   * objective's mode, and `measurement_funding` (always "platform").
    */
   trainingEligibility({ agentId, productId } = {}) {
     return this._get("/training/eligibility", { agent_id: agentId, product_id: productId });
@@ -158,5 +162,16 @@ export class CustomerApiClient {
   /** GET /eval-sets: a Product's evaluation sets, one page. */
   listEvalSets({ productId, limit, offset } = {}) {
     return this._get("/eval-sets", { product_id: productId, limit, offset });
+  }
+
+  /**
+   * GET /hillclimbs/{runId}/security (1.30.0): the run's security mode and
+   * why, and its attack-resistance measurement. `measurement.state` is never
+   * a pass by omission: not_measured, measuring, not_enough_attacks,
+   * attacks_unpaired, no_regression or regressed. A run that is not a hill
+   * climb of this organization is refused 404 `hillclimb_not_found`.
+   */
+  getHillclimbSecurity(runId) {
+    return this._get(`/hillclimbs/${encodeURIComponent(String(runId))}/security`, {});
   }
 }

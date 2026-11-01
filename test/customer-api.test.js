@@ -1,6 +1,6 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.29.0), case for case with the Python
+ * The customer API reads (contract 1.30.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigurationError } from "../src/errors.js";
 import {
-  CUSTOMER_CONTRACT_VERSION, CustomerApiClient, CustomerRefusal,
+  ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CustomerApiClient, CustomerRefusal,
   PROMPT_RUN_REFUSAL_CODES, RUN_LIST_REFUSAL_CODES, customerApiBase,
 } from "../src/customer-api.js";
 
@@ -25,13 +25,24 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.29.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.29.0");
+  it("pins contract 1.30.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.30.0");
+    assert.deepEqual([...ATTACK_REFUSAL_CODES], ["attack_set_is_sealed"]);
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
       "recorded_decisions_too_few", "recorded_prompt_mismatch",
     ]);
+  });
+
+  it("reads a run's attack resistance, and a refusal by its code", async () => {
+    const ok = fake(200, { measurement: { state: "not_measured" } });
+    const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: ok.fetchImpl });
+    assert.equal((await c.getHillclimbSecurity("r/1")).measurement.state, "not_measured");
+    assert.equal(ok.calls[0].url, "https://x.test/api/v2/hillclimbs/r%2F1/security");
+    const no = fake(404, { detail: { code: "hillclimb_not_found", message: "no" } });
+    const c2 = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: no.fetchImpl });
+    await assert.rejects(c2.getHillclimbSecurity("r2"), (e) => e instanceof CustomerRefusal && e.code === "hillclimb_not_found");
   });
 
   it("finds /api/v2 beside the Flywheel API", () => {
@@ -129,8 +140,9 @@ describe("customer api", () => {
     const expected = {
       launch_uri_outside_org: 403, run_page_too_deep: 422, prompt_run_balance_too_small: 402,
       recorded_prompt_absent: 422, recorded_decisions_too_few: 422, recorded_prompt_mismatch: 422,
+      attack_set_is_sealed: 409,
     };
-    assert.deepEqual([...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES].sort(), Object.keys(expected).sort());
+    assert.deepEqual([...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES].sort(), Object.keys(expected).sort());
     for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);
     assert.equal(doc["x-customer-contract-version"], CUSTOMER_CONTRACT_VERSION);
   });
