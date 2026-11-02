@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.30.0).
+ * Reads of the customer-automation API (customer contract 1.31.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -17,7 +17,7 @@ import { DEFAULT_CONTROL_PLANE } from "./config.js";
 import { ConfigurationError } from "./errors.js";
 import { SDK_VERSION } from "./http.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.30.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.31.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -32,7 +32,19 @@ export const PROMPT_RUN_REFUSAL_CODES = Object.freeze([
   "recorded_prompt_mismatch",
 ]);
 /** 1.30.0: the held-out attack set a promotion is measured on never changes. */
-export const ATTACK_REFUSAL_CODES = Object.freeze(["attack_set_is_sealed"]);
+/** 1.31.0: the attack gate and the attack measurement refuse by name. */
+export const ATTACK_REFUSAL_CODES = Object.freeze([
+  "attack_set_is_sealed",
+  "attack_resistance_measuring",
+  "attack_regression_not_accepted",
+  "attack_approval_stale",
+  "attack_regression_not_stated",
+  "measurement_deadline_passed",
+  "prompt_changed",
+  "hillclimb_not_found",
+  "round_not_found",
+  "event_kind_is_the_platforms",
+]);
 
 const FLYWHEEL_SUFFIX = "/api/flywheel/v1";
 const CUSTOMER_PREFIX = "/api/v2";

@@ -1,6 +1,6 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.30.0), case for case with the Python
+ * The customer API reads (contract 1.31.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
@@ -25,9 +25,20 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.30.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.30.0");
-    assert.deepEqual([...ATTACK_REFUSAL_CODES], ["attack_set_is_sealed"]);
+  it("pins contract 1.31.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.31.0");
+    assert.deepEqual([...ATTACK_REFUSAL_CODES], [
+      "attack_set_is_sealed",
+      "attack_resistance_measuring",
+      "attack_regression_not_accepted",
+      "attack_approval_stale",
+      "attack_regression_not_stated",
+      "measurement_deadline_passed",
+      "prompt_changed",
+      "hillclimb_not_found",
+      "round_not_found",
+      "event_kind_is_the_platforms",
+    ]);
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
@@ -141,6 +152,15 @@ describe("customer api", () => {
       launch_uri_outside_org: 403, run_page_too_deep: 422, prompt_run_balance_too_small: 402,
       recorded_prompt_absent: 422, recorded_decisions_too_few: 422, recorded_prompt_mismatch: 422,
       attack_set_is_sealed: 409,
+      attack_resistance_measuring: 409,
+      attack_regression_not_accepted: 409,
+      attack_approval_stale: 409,
+      attack_regression_not_stated: 409,
+      measurement_deadline_passed: 409,
+      prompt_changed: 409,
+      hillclimb_not_found: 404,
+      round_not_found: 404,
+      event_kind_is_the_platforms: 403,
     };
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES].sort(), Object.keys(expected).sort());
     for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);
