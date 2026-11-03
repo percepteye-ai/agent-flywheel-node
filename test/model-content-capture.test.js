@@ -419,8 +419,73 @@ describe("what the plugin cannot see, it does not render", () => {
     assert.equal(recorded([llmInput("r"), llmInput("r")], transcript()), false);
   });
 
-  it("refuses a prompt whose images llm_input does not carry", () => {
+  // The host puts a prompt's images after its text in the transcript's copy
+  // of the prompt, and tells llm_input only how many there are.
+  const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const withImages = (count) => {
+    const messages = transcript();
+    messages[0] = { ...messages[0], content: [
+      { type: "text", text: "Where is my order 4417?" },
+      ...Array.from({ length: count }, () => ({ type: "image", data: PNG, mimeType: "image/png" })),
+    ] };
+    return messages;
+  };
+
+  it("records a prompt's images as the GenAI blob parts both SDKs emit", () => {
+    // Mutation: refuse a run with images, or drop them from the input -> red.
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    turns.gateModelContent(() => true);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    turns.onLlmInput(llmInput("r", { imagesCount: 1 }), ctx);
+    turns.onAgentEnd({ runId: "r", messages: withImages(1) }, ctx);
+    const chats = spans(turnWire(join(root, "r"), { modelContentAgent: "a" })
+      .genai_trace).filter((s) => attrs(s)["gen_ai.operation.name"] === "chat");
+    assert.equal(chats.length, 2);
+    for (const chat of chats) {
+      assert.deepEqual(JSON.parse(attrs(chat)["gen_ai.input.messages"])[0], {
+        role: "user", parts: [
+          { type: "text", content: "Where is my order 4417?" },
+          { type: "blob", modality: "image", mime_type: "image/png", content: PNG },
+        ],
+      });
+    }
+  });
+
+  it("refuses a prompt whose images the transcript does not hold as counted", () => {
+    // llm_input carries only the count: a transcript holding another number
+    // of images is a prompt this plugin cannot see whole.
     assert.equal(recorded(llmInput("r", { imagesCount: 1 }), transcript()), false);
+    assert.equal(recorded(llmInput("r", { imagesCount: 2 }), withImages(1)), false);
+    assert.equal(recorded(llmInput("r"), withImages(1)), false);
+    assert.equal(recorded(llmInput("r", { imagesCount: 1 }), withImages(1)), true);
+  });
+
+  it("records an image in the history and a tool's result as blob parts", () => {
+    const image = { type: "image", data: PNG, mimeType: "image/jpeg" };
+    const history = [
+      { role: "user", content: [{ type: "text", text: "Is this my order?" }, image],
+        timestamp: 1758000000001 },
+      { role: "assistant", provider: "openai", model: "m", stopReason: "stop",
+        timestamp: 1758000000002, content: [{ type: "text", text: "Yes." }] },
+    ];
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    turns.gateModelContent(() => true);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    turns.onLlmInput(llmInput("r", { history }), ctx);
+    const messages = transcript(history);
+    const result = messages.findIndex((m) => m.role === "toolResult");
+    messages[result] = { ...messages[result], content: [
+      { type: "text", text: "the label:" }, image] };
+    turns.onAgentEnd({ runId: "r", messages }, ctx);
+    const chats = spans(turnWire(join(root, "r"), { modelContentAgent: "a" })
+      .genai_trace).filter((s) => attrs(s)["gen_ai.operation.name"] === "chat");
+    const blob = { type: "blob", modality: "image", mime_type: "image/jpeg", content: PNG };
+    const input = JSON.parse(attrs(chats[1])["gen_ai.input.messages"]);
+    assert.deepEqual(input[0].parts[1], blob);
+    assert.deepEqual(input.at(-1).parts[0].response,
+      [{ type: "text", content: "the label:" }, blob]);
   });
 
   it("refuses a history message the host converts out of sight", () => {
