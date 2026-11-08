@@ -38,9 +38,9 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      repo went public and the workflow was enabled again on 2026-10-20.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 773 was true on 2026-11-03 (it had drifted to 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
+     its 780 was true on 2026-11-08 (it had drifted to 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 773" / "skipped 0")
+     (prints "tests 780" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -48,7 +48,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-773_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-780_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -206,7 +206,9 @@ That setting does **three** jobs, and every one of them is dropped without it. I
 That last beat is what makes it a flywheel rather than a pipeline: **the better agent generates the better evidence.**
 
 > [!IMPORTANT]
-> **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` once at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
+> **Beat ⑥ closes the pair.** A production install reads `GET /policy/current` and `GET /prompt/current` at startup and applies **both** halves: the prompt, by replacing the one your host assembled, and the model, by naming a provider this plugin registers whose transport points at the served `base_url`. That matters because they were certified *together* — a prompt applied over some other checkpoint is not the combination anybody evaluated, and the startup log says so plainly whenever only one half lands.
+>
+> **The prompt keeps improving after you approve it.** Mission Control goes on evolving the system prompt from the traces your agent keeps producing, including while a person has not yet decided the last improvement. Each round has to beat the candidate already waiting, so whatever is approved next is the best prompt found so far, and the older waiting one is retired from your queue. So the prompt half does not stop at its startup answer. At most once per `ttl_s` (never faster than 30 s), the prompt hook re-reads `/policy/current` without making the turn wait. Only when its `prompt_generation` names a newer approval does it fetch the text. The turn that noticed keeps its prompt; the next turn runs the new one, and the log says so. An empty or failed read never takes an applied prompt away. The model half stays the startup answer, and `PERCEPTEYE_APPLY_PROMPT=0` still turns the prompt half off entirely.
 >
 > The model half needs two things from your host, and says at startup if it is missing either: `hooks.allowConversationAccess: true`, and a host that accepts the provider registration — the registered provider is the only thing that can supply the served `base_url`, so if the id is refused the model half is refused with it rather than pointing your agent at a provider your host does not know. The plugin's own key (`PERCEPTEYE_API_KEY`) opens an endpoint the control plane names `PERCEPTEYE_API_KEY` for only at the control plane's own address, never as a fallback; any other endpoint's credential comes from your own `models.providers.percepteye-flywheel.apiKey`.
 
@@ -548,7 +550,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 773 tests, no install step — node:test, zero dependencies
+npm test     # 780 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

@@ -39,19 +39,34 @@
  * Here we ARE the host's prompt and model seams, so the check that docstring
  * tells its caller to perform is ours to perform.
  *
- * ── RESOLVED ONCE, NOT POLLED ─────────────────────────────────────────────
+ * ── RESOLVED AT START; THE PROMPT FOLLOWS LATER APPROVALS ──────────────────
  *
- * Both reads happen once, after registration, and the answer is held for the
- * life of the process. `ttl_s` is a real cadence hint (300s, 60s while a
- * candidate is in flight) and it is deliberately not honoured: a policy that
- * changes under a running agent is the same confound the control plane
- * refuses on -- half a process's turns served under one prompt and half under
- * another, with nothing on either side recording where the seam was. The
- * control plane's own remedy for a moved answer is a restart, which is why
- * `serving_generation` supports equality and nothing else. Nothing here sits
- * on the path of a turn, and no timer re-reads it. That is a statement about
- * THIS PROCESS changing what it applies; the one thing that moves without a
- * restart moves on the control plane's side, which made the change:
+ * Both reads happen once, after registration. The MODEL half's answer is held
+ * for the life of the process (a moved address needs a restart, which is why
+ * `serving_generation` supports equality and nothing else).
+ *
+ * THE PROMPT HALF DOES NOT STOP AT THE FIRST APPROVAL, because prompt
+ * optimization does not. Mission Control keeps evolving the prompt from the
+ * traces this agent keeps producing -- also while an operator has not yet
+ * decided the last improvement -- and a round must beat the candidate already
+ * waiting, so each approval is the best prompt found so far. A process that
+ * applied its startup answer forever ran the first approval forever, and
+ * nothing else re-read it: `serving_generation` did not even move for an
+ * approved prompt until `prompt_generation` joined it.
+ *
+ * So at most once per `ttl_s` (floored at `PROMPT_REFRESH_MIN_MS`), on the
+ * prompt hook itself and never blocking it, `/policy/current` is read again;
+ * only when its `prompt_generation` names a different approved prompt is the
+ * text re-read, and the decision is redone by the rule Python's `PolicySource`
+ * uses (`promptNeedsRefresh`, `refreshedPrompt`). The swap lands at a TURN
+ * boundary -- the turn that noticed runs the prompt it started with, the next
+ * runs the new one -- and every captured turn records the system prompt it
+ * actually ran, so the seam the old comment here worried about is on the
+ * record. An empty or failed read never takes an applied prompt away.
+ * `PERCEPTEYE_APPLY_PROMPT=0` still turns the whole prompt half off.
+ *
+ * The one thing that moves the model without a restart moves on the control
+ * plane's side, which made the change:
  *
  * THE GATEWAY MOVES THE MODEL HALF, AND ONLY THAT HALF. A model the platform
  * serves is handed out as Mission Control's CONSTANT gateway URL for this
@@ -299,6 +314,16 @@ export const providerRefusedReason = (detail) =>
  */
 export const PENDING_ANSWER_REASON = "the control plane has not been asked yet";
 
+/**
+ * The floor under the prompt re-read cadence, whatever `ttl_s` says: the same
+ * floor Python's `PolicySource` puts under its poll (`MIN_TTL_S`), so a fleet
+ * cannot be talked into a polling storm by a bad hint.
+ */
+export const PROMPT_REFRESH_MIN_MS = 30_000;
+
+/** The cadence when `/policy/current` sends no usable `ttl_s`. */
+export const PROMPT_REFRESH_DEFAULT_MS = 300_000;
+
 /** Why nothing is read or applied when no key is configured. */
 export const NO_KEY_REASON =
   "no API key is configured, so the control plane is never asked and no hook " +
@@ -306,6 +331,14 @@ export const NO_KEY_REASON =
   `apiKey; no key yet? ${GET_A_KEY})`;
 
 const str = (v) => (typeof v === "string" ? v.trim() : "");
+
+/** `ttl_s` as the prompt re-read cadence, floored; the default without one. */
+const promptRefreshMs = (policy) => {
+  const ttl = policy && typeof policy === "object" ? policy.ttl_s : null;
+  return typeof ttl === "number" && Number.isFinite(ttl) && ttl > 0
+    ? Math.max(PROMPT_REFRESH_MIN_MS, ttl * 1000)
+    : PROMPT_REFRESH_DEFAULT_MS;
+};
 
 /** A checksum, shortened for a log line. Never a claim that it is complete. */
 const short = (v) => (v ? `${v.slice(0, 12)}…` : "none");
@@ -391,6 +424,67 @@ export function promptDecision(prompt) {
   }
 
   return { apply: true, text, checksum, reason: "" };
+}
+
+/**
+ * Which approved prompt `/policy/current` says is served, or `""`.
+ *
+ * The token `/prompt/current` returns beside the text as `generation`. `""`
+ * when none is served -- or the control plane predates the field, which then
+ * turns refreshing off rather than forcing a read every poll. Word for word
+ * Python's `served_prompt_generation`.
+ *
+ * @param {object} policy the `/policy/current` body
+ * @returns {string}
+ */
+export function servedPromptGeneration(policy) {
+  return str(policy && typeof policy === "object" ? policy.prompt_generation : "");
+}
+
+/**
+ * Should the prompt text be re-read? Only when a prompt is served and it is
+ * not the one held: absence is the answer "keep what you have", never a
+ * reason to read. Python's `prompt_needs_refresh`.
+ *
+ * @param {string} heldGeneration
+ * @param {object} policy the `/policy/current` body
+ * @returns {boolean}
+ */
+export function promptNeedsRefresh(heldGeneration, policy) {
+  const served = servedPromptGeneration(policy);
+  return Boolean(served) && served !== str(heldGeneration);
+}
+
+/**
+ * The decision and generation to hold after a poll, as `[decision,
+ * generation]`. Pure, and the same rule as Python's `refreshed_prompt`
+ * (`tests/test_prompt_decision_parity.py` drives both):
+ *
+ *   converge on what a fresh start would apply -- a newer approved prompt
+ *   applies, a stale or mispaired one is refused and the host's prompt
+ *   stands -- EXCEPT that no answer, an empty one, or nothing served after a
+ *   prompt was held keeps what is held. `/prompt/current` answers `{}` for
+ *   "could not answer" too, and an unreachable control plane must never blank
+ *   a running agent's instructions.
+ *
+ * @param {object} held the decision held now
+ * @param {string} heldGeneration the generation it was read at, `""` for none
+ * @param {object} policy the `/policy/current` body just read
+ * @param {object|null} answer the `/prompt/current` body, or null if not read
+ * @returns {[object, string]}
+ */
+export function refreshedPrompt(held, heldGeneration, policy, answer) {
+  const heldGen = str(heldGeneration);
+  const served = servedPromptGeneration(policy);
+  if (!served) {
+    if (heldGen || held?.apply) return [held, heldGen];
+    return [promptDecision({}), ""];
+  }
+  if (answer && typeof answer === "object" && typeof answer.text === "string"
+      && answer.text.trim()) {
+    return [promptDecision(answer), str(answer.generation) || served];
+  }
+  return [held, heldGen];
 }
 
 /**
@@ -624,11 +718,21 @@ export function createPolicySource({
   pluginId, logger = null, applyPrompt = true, applyModel = true,
   servedAgent = resolveServedAgent({}), modelBlocked = null,
   unwired = null, flywheelKey = null, controlPlaneUrl = null,
+  now = () => Date.now(),
 }) {
   let policy = {};
   let prompt = {};
   let applied = null;
   let appliedModel = null;
+  // THE PROMPT HALF'S RUNNING STATE: the decision in force, the generation it
+  // was read at, and what the re-read needs (see "RESOLVED AT START; THE
+  // PROMPT FOLLOWS LATER APPROVALS").
+  let heldDecision = null;
+  let heldGeneration = "";
+  let readThrough = null;
+  let lastPromptPollAt = 0;
+  let promptPollMs = PROMPT_REFRESH_DEFAULT_MS;
+  let refreshing = null;
 
   // NOTHING CAN BE APPLIED TO ANY RUN when the agent scope is unresolvable --
   // several agents on this host and none of them named -- because
@@ -726,6 +830,8 @@ export function createPolicySource({
       } catch {
         policy = {};
       }
+      promptPollMs = promptRefreshMs(policy);
+      lastPromptPollAt = now();
       logger?.info?.(`[${pluginId}] ${servedPolicySummary(policy)}`);
 
       // WHOSE RUN? -- and when the answer is "we cannot tell", NOTHING is
@@ -802,6 +908,14 @@ export function createPolicySource({
       }
       const decision = promptDecision(prompt);
       resolved = true;
+      heldDecision = decision;
+      // Held at a generation only when an answer WAS read: a startup read
+      // that failed or came back empty holds none, so the first poll that
+      // finds a prompt served reads it rather than believing it already has.
+      heldGeneration = typeof prompt?.text === "string" && prompt.text.trim()
+        ? str(prompt.generation) || servedPromptGeneration(policy)
+        : "";
+      readThrough = transport;
       if (!decision.apply) {
         applied = null;
         refusal = decision.reason;
@@ -820,6 +934,61 @@ export function createPolicySource({
       }
       source.announcePair();
       return source;
+    },
+
+    /**
+     * Re-read the PROMPT half if it is due. Returns the in-flight promise, or
+     * null when nothing was started. NEVER REJECTS and never blocks a turn:
+     * `handle` starts it and does not wait, so the swap lands on the NEXT
+     * turn. One read at a time; at most one per `ttl_s`.
+     *
+     * Only after a startup that read the prompt (`readThrough`), so it is off
+     * exactly where the startup read was off: no transport, the prompt half
+     * switched off, or no agent scope.
+     */
+    refreshPrompt() {
+      if (!readThrough || refreshing) return refreshing;
+      const t = now();
+      if (t - lastPromptPollAt < promptPollMs) return null;
+      lastPromptPollAt = t;
+      refreshing = (async () => {
+        let body;
+        try {
+          body = (await readThrough.policyCurrent()) || {};
+        } catch {
+          return;
+        }
+        promptPollMs = promptRefreshMs(body);
+        if (!promptNeedsRefresh(heldGeneration, body)) return;
+        let answer = null;
+        try {
+          answer = (await readThrough.promptCurrent()) || {};
+        } catch {
+          answer = null;
+        }
+        const [decision, generation] = refreshedPrompt(
+          heldDecision, heldGeneration, body, answer);
+        if (generation === heldGeneration) return;
+        heldDecision = decision;
+        heldGeneration = generation;
+        prompt = answer || {};
+        if (decision.apply) {
+          applied = decision.text;
+          refusal = null;
+          logger?.info?.(
+            `[${pluginId}] the control plane approved a newer system prompt ` +
+            `'${str(prompt.name) || "unnamed"}' v${prompt.version ?? "?"} ` +
+            `(${applied.length} chars); applying it from the next turn via ` +
+            `${PROMPT_HOOK_NAME}.`);
+        } else {
+          applied = null;
+          refusal = decision.reason;
+          logger?.info?.(
+            `[${pluginId}] the newest approved system prompt is NOT being ` +
+            `applied: ${refusal}.`);
+        }
+      })().catch(() => {}).finally(() => { refreshing = null; });
+      return refreshing;
     },
 
     /** The pair sentence, at the level `pairNote` chose. */
@@ -852,6 +1021,8 @@ export function createPolicySource({
      * See `scope.js`.
      */
     handle(event, ctx) {
+      // Started, never awaited: this turn runs the prompt it started with.
+      source.refreshPrompt();
       if (!applied) return undefined;
       const scope = inScope(ctx);
       if (!scope.apply) {
