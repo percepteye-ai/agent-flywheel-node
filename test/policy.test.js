@@ -45,7 +45,8 @@ import {
   FLYWHEEL_KEY_CREDENTIAL, FLYWHEEL_KEY_ENV, controlPlaneOrigin,
   MODEL_HOOK_NAME, MODEL_OFF_REASON, NO_KEY_REASON, PROMPT_HOOK_NAME,
   PROMPT_OFF_REASON, PROVIDER_ID, PROVIDER_TRANSPORT_API,
-  NO_PROVIDER_SURFACE_REASON, SERVABLE_PROMPT_STATUSES, createPolicySource,
+  NO_PROVIDER_SURFACE_REASON, PROMPT_REFRESH_MIN_MS, SERVABLE_PROMPT_STATUSES,
+  createPolicySource,
   modelDecision, modelHookBlockedReason, pairNote, promptDecision,
   providerRefusedReason, registerServingPolicy, servedPolicySummary,
 } from "../src/policy.js";
@@ -297,6 +298,147 @@ describe("pairNote — the whole point of the pair check is the CONDITIONAL", ()
       promptApplied: false, modelApplied: false, checksum: null,
       promptRefusal: "a", modelRefusal: "b",
     }), null);
+  });
+});
+
+
+/** A transport whose answers change over time: each list's last entry repeats. */
+function scriptedTransport({ policies, prompts }) {
+  const calls = [];
+  let pi = 0;
+  let qi = 0;
+  const at = (list, i) => list[Math.min(i, list.length - 1)];
+  return {
+    calls,
+    async policyCurrent() { calls.push("policy"); return at(policies, pi++); },
+    async promptCurrent() {
+      calls.push("prompt");
+      const next = at(prompts, qi++);
+      if (next instanceof Error) throw next;
+      return next;
+    },
+  };
+}
+
+const g = (gen, extra = {}) => ({ ...UNSERVED, ttl_s: 60, prompt_generation: gen, ...extra });
+const answer = (text, gen, extra = {}) => ({
+  ...APPROVED, text, generation: gen, sha256: gen.padEnd(64, "0"),
+  model_prompt_checksum: gen.padEnd(64, "0"), ...extra,
+});
+
+describe("createPolicySource — a newer approved prompt reaches a running agent", () => {
+  // Prompt optimization keeps going after the first approval: every approval
+  // is the best prompt found so far. Applying the startup answer forever ran
+  // the first one forever.
+  // The hook STARTS the re-read and does not wait for it; these let the
+  // in-flight reads finish without asking `refreshPrompt` (which would start
+  // one itself, and hide a hook that never did).
+  const settle = async () => {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
+  };
+  const setup = (script, opts = {}) => {
+    let t = 1_000_000;
+    const clock = { now: () => t, advance: (ms) => { t += ms; } };
+    const transport = scriptedTransport(script);
+    const src = createPolicySource({
+      pluginId: PLUGIN_ID, logger: fakeLogger(), now: clock.now, ...opts,
+    });
+    return { src, transport, clock };
+  };
+
+  it("swaps at a TURN boundary once /policy/current names a newer prompt", async () => {
+    const { src, transport, clock } = setup({
+      policies: [g("g1"), g("g2")],
+      prompts: [answer("FIRST", "g1"), answer("SECOND, BETTER", "g2")],
+    });
+    await src.resolve(transport);
+    assert.deepEqual(src.handle({}, TURN), { systemPrompt: "FIRST" });
+    clock.advance(61_000);
+    // The turn that notices still runs the prompt it started with ...
+    assert.deepEqual(src.handle({}, TURN), { systemPrompt: "FIRST" });
+    await settle();
+    // ... and the next one runs the newer approval.
+    assert.deepEqual(src.handle({}, TURN), { systemPrompt: "SECOND, BETTER" });
+    assert.equal(src.prompt.generation, "g2");
+  });
+
+  it("does NOT re-read the text while the served prompt is unchanged", async () => {
+    const { src, transport, clock } = setup({
+      policies: [g("g1")], prompts: [answer("FIRST", "g1")],
+    });
+    await src.resolve(transport);
+    for (let i = 0; i < 4; i++) {
+      clock.advance(61_000);
+      src.handle({}, TURN);
+      await settle();
+    }
+    assert.equal(transport.calls.filter((c) => c === "prompt").length, 1);
+    assert.ok(transport.calls.filter((c) => c === "policy").length >= 4);
+  });
+
+  it("an empty or failed read never takes the applied prompt away", async () => {
+    const { src, transport, clock } = setup({
+      policies: [g("g1"), g("g2"), g("g3"), { ...UNSERVED, ttl_s: 60 }],
+      prompts: [answer("FIRST", "g1"), {}, new Error("down")],
+    });
+    await src.resolve(transport);
+    for (let i = 0; i < 3; i++) {
+      clock.advance(61_000);
+      src.handle({}, TURN);
+      await settle();
+      assert.deepEqual(src.handle({}, TURN), { systemPrompt: "FIRST" });
+    }
+  });
+
+  it("a newer bundle that is stale is refused, as it would be at start", async () => {
+    const { src, transport, clock } = setup({
+      policies: [g("g1"), g("g1s")],
+      prompts: [answer("FIRST", "g1"), answer("FIRST", "g1s", { stale_baseline: true })],
+    });
+    await src.resolve(transport);
+    clock.advance(61_000);
+    src.handle({}, TURN);
+    await settle();
+    assert.equal(src.handle({}, TURN), undefined);
+    assert.match(src.refusal, /stale_baseline=true/);
+  });
+
+  it("a startup read that failed is retried, not believed already held", async () => {
+    // /policy/current named g1 at start but the text read failed: holding
+    // g1 anyway would make every later poll match it and never read again,
+    // leaving the host's own prompt in place for the life of the process.
+    const { src, transport, clock } = setup({
+      policies: [g("g1")],
+      prompts: [new Error("down"), answer("FIRST", "g1")],
+    });
+    await src.resolve(transport);
+    assert.equal(src.handle({}, TURN), undefined);
+    clock.advance(61_000);
+    src.handle({}, TURN);
+    await settle();
+    assert.deepEqual(src.handle({}, TURN), { systemPrompt: "FIRST" });
+  });
+
+  it("polls no faster than the floor, whatever ttl_s says", async () => {
+    const { src, transport, clock } = setup({
+      policies: [g("g1", { ttl_s: 1 })], prompts: [answer("FIRST", "g1")],
+    });
+    await src.resolve(transport);
+    clock.advance(5_000);
+    assert.equal(src.refreshPrompt(), null);
+    clock.advance(PROMPT_REFRESH_MIN_MS);
+    assert.ok(src.refreshPrompt());
+  });
+
+  it("never re-reads when the prompt half is switched off", async () => {
+    const { src, transport, clock } = setup(
+      { policies: [g("g1"), g("g2")], prompts: [answer("FIRST", "g1")] },
+      { applyPrompt: false },
+    );
+    await src.resolve(transport);
+    clock.advance(61_000);
+    assert.equal(src.refreshPrompt(), null);
+    assert.ok(!transport.calls.includes("prompt"));
   });
 });
 
@@ -1189,15 +1331,19 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
 });
 
 
-describe("resolved once — no timer re-polls the recorded decision", () => {
-  // THE RECORDED DECISION (policy.js, "RESOLVED ONCE, NOT POLLED"): a policy
-  // that moves under a running agent splits its traffic across two
-  // behaviours with nothing recording the seam, so `ttl_s` is not honoured
-  // and the remedy for a moved answer is a restart on `serving_generation`.
-  // The gateway's constant URL lets the control plane move the MODEL half
-  // behind it without one, on its own side; nothing in this process re-reads.
-  // This is what holds that decision against a re-poll being added back.
-  it("never re-reads /policy/current, however far past ttl_s the clock runs", async (t) => {
+describe("the model half is the startup answer; only the prompt half follows", () => {
+  // THE RECORDED DECISION (policy.js, "RESOLVED AT START; THE PROMPT FOLLOWS
+  // LATER APPROVALS"): the MODEL half's answer is held for the life of the
+  // process -- a moved address needs a restart on `serving_generation`, and
+  // the gateway's constant URL lets the control plane move the model behind
+  // it on its own side. The PROMPT half re-reads `/policy/current` from its
+  // own hook, at most once per `ttl_s`, and the prompt TEXT only when
+  // `prompt_generation` names a different approved prompt. No timer re-reads
+  // anything. This holds all three against a drift either way.
+  const policyReadsAtMost = (calls, ticks) =>
+    calls.filter((c) => c === "policy").length <= 1 + ticks;
+
+  it("re-reads /policy/current at most once per ttl_s, on the prompt hook, never on a timer", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     const api = hostApi();
     const transport = fakeTransport({ policy: GATEWAY });
@@ -1212,29 +1358,41 @@ describe("resolved once — no timer re-polls the recorded decision", () => {
     assert.equal(transport.calls.filter((c) => c === "policy").length, 1);
 
     const ttlMs = GATEWAY.ttl_s * 1000;
+    // NO TIMER: however far the clock runs with no turn, nothing is read.
+    t.mock.timers.tick(ttlMs * 10);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
+      "a timer re-read /policy/current with no turn to serve");
+    // The MODEL hook never re-reads: only the prompt hook does.
+    api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
+      "the model hook re-read /policy/current");
+
     for (let i = 0; i < 10; i += 1) {
       t.mock.timers.tick(ttlMs);
       await new Promise((r) => setImmediate(r));
-      // A turn is the other place a re-poll could hide: the hooks read the
-      // recorded answer and nothing else.
       api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN);
+      api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN);
+      // A second turn inside the same ttl window reads nothing.
       api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN);
       await new Promise((r) => setImmediate(r));
     }
-    assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
-      `/policy/current was re-read after ${GATEWAY.ttl_s}s: ${transport.calls}`);
+    assert.ok(policyReadsAtMost(transport.calls, 10),
+      `/policy/current was read more than once per ${GATEWAY.ttl_s}s: ${transport.calls}`);
+    // GATEWAY names no served prompt, so the text is never re-read.
     assert.equal(transport.calls.filter((c) => c === "prompt").length, 1);
     assert.deepEqual(api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN), {
       providerOverride: PROVIDER_ID, modelOverride: GATEWAY.endpoint.model,
-    }, "the startup answer is the answer for the life of the process");
+    }, "the startup answer is the MODEL answer for the life of the process");
   });
 
-  it("never re-reads it through the plugin's real entry point either", async (t) => {
+  it("holds the same cadence through the plugin's real entry point", async (t) => {
     // The test above holds `registerServingPolicy`. `register()` in index.js
     // is the other place a re-poll could be added -- it holds the source AND
     // the transport -- so this drives the real entry point, the real HTTP
     // client and the real capture lane, and counts the requests that reach
-    // the wire: a timer there, one riding a turn hook, or one riding the
+    // the wire: a timer there, one riding another hook, or one riding the
     // capture flush is caught here, where the test above cannot see it.
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     const root = mkdtempSync(join(tmpdir(), "percepteye-no-repoll-"));
@@ -1282,8 +1440,10 @@ describe("resolved once — no timer re-polls the recorded decision", () => {
         await out.capture?.uploader?.flush?.().catch(() => {});
         await settle();
       }
-      assert.equal(reads("/policy/current"), 1,
-        `/policy/current was re-read after ${GATEWAY.ttl_s}s: ${paths.join(", ")}`);
+      // Ten ttl windows, each with a turn: at most one re-read per window.
+      assert.ok(reads("/policy/current") <= 11,
+        `/policy/current was read more than once per ${GATEWAY.ttl_s}s: ${paths.join(", ")}`);
+      // GATEWAY names no served prompt, so the text is never re-read.
       assert.equal(reads("/prompt/current"), 1);
     } finally {
       globalThis.fetch = realFetch;
