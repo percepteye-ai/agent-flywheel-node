@@ -424,6 +424,41 @@ The model is not the only thing that improves. Mission Control also **evolves yo
 
 Is it ready for my agent? `trainingEligibility({ agentId })`'s `prompt_optimization` says which path a run takes (`mode`), whether it `can_run`, and if not, what it `needs`, in a sentence you can show a person. `listRuns({ includePromptEvolutions: true })` lists the prompt runs beside training runs ([Runs, eligibility and evaluation sets](#-runs-eligibility-and-evaluation-sets)).
 
+### How a new prompt reaches a running agent
+
+Nothing is pushed into your agent. The plugin pulls, and **the plugin makes the swap** in `production` mode:
+
+1. At startup it reads `GET /policy/current` and `GET /prompt/current`, checks the prompt (the refusal table in [The approved pair, applied](#the-approved-pair-applied)), and replaces the system prompt your host assembles on every attempt.
+2. While running, at most once per `ttl_s` (300 s when unset, never faster than 30 s), a turn starts a re-read of `/policy/current` without waiting for it.
+3. Only when its `prompt_generation` names a newer approval does the plugin fetch the new text and check it again.
+4. The turn that noticed keeps its prompt. The next turn runs the new one, and the log names the switch. A refusal, an empty answer or a failed read keeps the prompt already applied.
+
+The delay is roughly one `ttl_s` plus one turn after the approval is confirmed, with no redeploy and no restart. The model half is read once at startup; picking up a new model needs a restart.
+
+### Approving a new prompt
+
+Each winning prompt arrives as one **prompt-pair delivery**: the prompt, the checkpoint it was certified with, and its 2×2 evaluation (base or tuned model × your prompt or the new one). It waits for a person with write access to your organization, in two steps:
+
+1. **Decide.** Mission Control → **Decisions** shows the delivery's decision. Approve or reject it there. Only the explicit approve and reject controls can resolve it: a language model reading "sure, go ahead" is recorded as *answered*, which does not approve.
+2. **Confirm.** Mission Control → **Prompts** shows the delivery with a **Confirm** button. Confirm uses the approval up (it is single-use) and makes the bundle servable. From that moment `/prompt/current` serves it, and running agents pick it up as described above.
+
+The same two steps over the API, with a customer-automation key (`mck_`):
+
+```bash
+curl -X POST "$MC/api/v2/approvals/$APPROVAL_ID/approve" -H "Authorization: Bearer $MCK" -H "Content-Type: application/json" -d '{}'
+curl -X POST "$MC/api/v2/prompt-deliveries/$DELIVERY_ID/confirm" -H "Authorization: Bearer $MCK" -H "Content-Type: application/json" \
+     -d "{\"approval_id\": \"$APPROVAL_ID\"}"
+```
+
+`GET /api/v2/prompt-deliveries` lists deliveries with their `status`: `pending_approval`, `approved`, `delivered`, or `superseded` with `superseded_by` naming the newer one. Confirming a superseded delivery is refused with a 409 that names the newer delivery: approve that one instead.
+
+**What runs on its own, and what never does.** Starting optimization rounds, certifying the winner and assembling the delivery are automatic by default, and `GET /api/v2/autonomy/flags` shows each one's current setting. **Approval is never automatic.** No setting serves a prompt a person did not approve, so "auto" means the next candidate is always ready and waiting, not that it ships itself.
+
+**Reject, stop, or go back.**
+- **Reject** a waiting delivery in Decisions, and nothing changes for your agent.
+- **Stop applying** on your side at any time: `PERCEPTEYE_APPLY_PROMPT=0`, and the prompt your host assembles stands.
+- **There is no undo control for an approved prompt yet.** `/prompt/current` always serves the newest approved delivery. To go back, approve a newer delivery, or stop applying on your side.
+
 ## 🙋 A person approves every change
 
 **Both halves of an improvement require a human decision.** Neither the plugin nor the control plane can move your agent on its own, and no language model can approve either one by reading prose.
