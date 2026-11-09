@@ -212,4 +212,16 @@ describe("reading a claimed rollout", () => {
     assert.equal(request.leaseExpiresTs, 123.5);
     assert.deepEqual(request.metadata, { suite: "held-out" });
   });
+
+  it("names the task the rollout was claimed for (Python: current_task_id)", () => {
+    const named = rolloutRequestFromWire({
+      rollout_id: "r1", metadata: { task_id: "banking_knowledge:task_017" },
+    });
+    assert.equal(named.taskId, "banking_knowledge:task_017");
+    assert.equal(rolloutRequestFromWire({ rollout_id: "r1" }).taskId, null);
+    assert.equal(
+      rolloutRequestFromWire({ rollout_id: "r1", metadata: { task_id: "a\nb" } }).taskId,
+      null,
+    );
+  });
 });

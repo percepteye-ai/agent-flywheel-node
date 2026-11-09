@@ -346,6 +346,15 @@ describe("which id a tool call is stamped with", () => {
     assert.equal("percepteye.agent.execution_sha256" in a, false);
   });
 
+  it("a training rollout carries the task it was CLAIMED for, never the host's", async () => {
+    const a = await recordOne({
+      mode: "training", ctx: CTX,
+      rolloutFor: () => ({ rolloutId: "rl_mc_78", taskId: "task_017" }),
+    });
+    assert.equal(a["percepteye.rollout.id"], "rl_mc_78");
+    assert.equal(a["percepteye.task.id"], "task_017");
+  });
+
   it("a training install's ordinary session is the customer's own turn", async () => {
     const a = await recordOne({ mode: "training", ctx: CTX, rolloutFor: () => null });
     assert.equal("percepteye.rollout.id" in a, false);

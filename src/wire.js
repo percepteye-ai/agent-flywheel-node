@@ -102,6 +102,13 @@ export function rolloutRequestFromWire(raw) {
       && !Array.isArray(raw.metadata)
       ? raw.metadata
       : {},
+    // The task this rollout was handed, by the id it was claimed under -- for
+    // a task the customer registered, THEIR id (Python: `current_task_id()`).
+    // Only a safe opaque id; anything else is absent, never rewritten.
+    taskId: raw.metadata && typeof raw.metadata === "object"
+      && !Array.isArray(raw.metadata)
+      ? productionIdentifier(raw.metadata.task_id)
+      : null,
   };
 }
 
