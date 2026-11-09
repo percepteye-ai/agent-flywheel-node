@@ -82,6 +82,7 @@ No container to build. No cluster to run. No GPU to provision. No inbound port t
 | 🧪 **Honest discovery** | the plugin reads the assembled prompt and effective model; current OpenClaw does not expose tools on `llm_input`, so the catalogue stays explicitly incomplete instead of being invented — until you declare it with [`describe`](#-configuration) |
 | 📈 **Honest telemetry on day one** | your agent's true tool-failure rate, recorded locally, with **no account and no network** |
 | 📡 **Production observability** | capture the turns you actually serve — the user's message, the tool calls, the answer — and turn live traffic into evidence |
+| 🧬 **A prompt that keeps evolving** | [prompt optimization](#-prompt-optimization-an-evolving-system-prompt) evolves your system prompt from this agent's own traces and keeps improving it as new traces arrive, even while the last improvement awaits approval |
 | ✅ **The approved pair, applied** | training co-optimizes a system prompt alongside the model. Once *a person on your side approves each*, your production install runs **both** — the prompt, and the checkpoint it was certified with. No redeploy; one switch each to stop |
 | 🙋 **A person approves every change** | nothing reaches your agent that a human with the operator role did not approve through an explicit control. Not a percentage rollout, not an automated promotion, and never a language model reading "sure, go ahead". [How that is enforced](#-a-person-approves-every-change) |
 | 🛡️ **It never touches a tool result** | the recording hook returns `void`. It can never change, block, delay or replace what a tool returns. The two things this plugin *does* change are the system prompt and the model — production mode only, approved bundles only, this agent's own turns only, and off with [`PERCEPTEYE_APPLY_PROMPT=0` / `PERCEPTEYE_APPLY_MODEL=0`](#-two-modes-one-switch) |
@@ -314,9 +315,9 @@ Recording itself is unaffected by any of that: it never leaves the machine, and 
 With a key set, a `production` install also asks the control plane, **once at startup**, what this agent should be running:
 
 - `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
-- `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
+- `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt. Re-read when `/policy/current`'s `prompt_generation` names a newer approval (below).
 
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does.
+The model is read once, not per turn: a model that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does. The prompt is the exception: at most once per `ttl_s` (never faster than 30 s) the plugin re-reads `/policy/current` in the background of a turn, and only a changed `prompt_generation` fetches new text. The turn that noticed keeps its prompt, the next turn runs the new one, and the log names the switch, so the seam is recorded.
 
 **What stops the prompt being applied**, each logged with its own reason:
 
@@ -410,6 +411,18 @@ There is no size cap. Each request is spooled to disk and read in bounded memory
 **Seeing it arrive.** The agent's **Agent** tab in the dashboard counts the spans it has pushed, beside the turns the SDK uploaded, and how many of each are kept but not learned from, and why.
 
 <br/>
+
+## 🧬 Prompt optimization: an evolving system prompt
+
+The model is not the only thing that improves. Mission Control also **evolves your agent's system prompt** from the traces it records, and you can use it without training a model at all.
+
+- **Evolutionary, not one-shot.** Each generation proposes candidate edits to your prompt as diffs against your own baseline (never a rewrite from nothing), grounded in where your agent actually failed. It scores every candidate on several separate axes, keeps the Pareto frontier rather than blending them into one number, and feeds what the frontier got wrong into the next generation's edits. A candidate whose diff does not apply cleanly is rejected, never run.
+- **Learned from your agent's own decisions.** For an agent connected through this plugin, a prompt run replays its recorded decisions, so it needs the model-content tier (see [Production observability](#-production-observability)): the traces must hold what the model saw. Nothing is re-run against your users.
+- **It keeps improving while you decide.** Your agent keeps producing traces after a round finishes, so optimization keeps running, including while a person has not yet decided the last improvement. Each new round starts with the candidate already waiting as the bar to beat. It is replaced only by a prompt that measures better, and the older waiting prompt is retired from your queue, so the one in front of the approver is always the best found so far. An approval already granted is never taken back.
+- **Certified, then approved.** The winning prompt is certified in a full-scale run, paired with the checkpoint it was measured on, and goes to your Decisions queue as one bundle. Nothing reaches your agent until a person approves it ([below](#-a-person-approves-every-change)).
+- **Applied for you, without a restart.** A `production` install applies each new approval on the next turn ([The approved pair, applied](#the-approved-pair-applied)), and `PERCEPTEYE_APPLY_PROMPT=0` turns that off. The bytes served are pinned at approval: a later round can never change what an approval already covers.
+
+Is it ready for my agent? `trainingEligibility({ agentId })`'s `prompt_optimization` says which path a run takes (`mode`), whether it `can_run`, and if not, what it `needs`, in a sentence you can show a person. `listRuns({ includePromptEvolutions: true })` lists the prompt runs beside training runs ([Runs, eligibility and evaluation sets](#-runs-eligibility-and-evaluation-sets)).
 
 ## 🙋 A person approves every change
 

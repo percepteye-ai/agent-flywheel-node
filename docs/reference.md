@@ -144,7 +144,7 @@ With a key set, a `production` install also asks the control plane, **once at st
 - `GET /policy/current` — which model. **Applied**: the plugin registers a provider (`percepteye-flywheel`), returns it from `before_model_resolve` as the provider and model for the turn, and supplies the served `base_url` through that provider's transport. The startup line still names the `base_url`, model and `serving_generation`, because that is what a fleet cycles a replica on.
 - `GET /prompt/current` — the approved system prompt. **Applied**, by replacing the prompt your host assembled, for every attempt.
 
-Once, not per turn: a policy that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does.
+The model is read once, not per turn: a model that moves under a running agent splits a process's traffic across two behaviours with nothing recording where the seam was. Restart to pick up a new one — `serving_generation` changes when and only when the answer does. The prompt is the exception: at most once per `ttl_s` (never faster than 30 s) the plugin re-reads `/policy/current` in the background of a turn, and only a changed `prompt_generation` fetches new text. The turn that noticed keeps its prompt, the next turn runs the new one, and the log names the switch, so the seam is recorded.
 
 **What stops the prompt being applied**, each logged with its own reason:
 
