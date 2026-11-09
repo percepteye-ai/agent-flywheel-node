@@ -19,8 +19,8 @@ import {
 import { ConfigurationError } from "../src/errors.js";
 
 describe("resolveMode", () => {
-  it("defaults to training when nothing says otherwise", () => {
-    assert.equal(resolveMode(null, {}), TRAINING);
+  it("defaults to production when nothing says otherwise: training is explicit", () => {
+    assert.equal(resolveMode(null, {}), PRODUCTION);
     assert.equal(resolveModeSource(null, {}).source, "default");
   });
 
