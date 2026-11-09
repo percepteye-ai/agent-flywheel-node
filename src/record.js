@@ -125,7 +125,8 @@ export function createRecorder({
         : null;
       // A production turn's correlation, read by the same helpers turn capture
       // uses, so the tool span and the turn it belongs to name the same
-      // conversation. A rollout carries none of it, as in Python's `serve()`.
+      // conversation. A rollout carries no conversation; its task is the one
+      // it was claimed for, as in Python's `serve()` (`current_task_id()`).
       const production = !training;
       recordToolCallSpan(name, event.params, {
         outcome: verdict.outcome,
@@ -136,7 +137,9 @@ export function createRecorder({
         rolloutId,
         turnId: rolloutId ? null : runId,
         conversationId: production ? conversationIdOf(event, ctx) : null,
-        taskId: production ? taskIdOf(event, ctx) : null,
+        taskId: production
+          ? taskIdOf(event, ctx)
+          : (rolloutFor?.(ctx)?.taskId ?? null),
         executionSha256: production
           ? (executionIdentity?.fingerprintFor?.(event, ctx)?.execution_sha256
             ?? null)
