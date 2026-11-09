@@ -145,8 +145,13 @@ describe("the plugin registers observer hooks and only those", () => {
     // run. That structural property -- not the hook COUNT -- is the rule.
     // `llm_input` was added to describe the agent, which is a READ; the
     // mutation seams (`before_prompt_build`, `before_tool_call`) stay unused.
+    // In TRAINING mode, chosen explicitly: unset is production, which
+    // also applies the approved prompt (`registerServingPolicy`).
     const seen = [];
-    plugin.register({ on: (name) => seen.push(name) }, {}, testEnv(process.env));
+    plugin.register(
+      { on: (name) => seen.push(name) }, {},
+      testEnv({ ...process.env, PERCEPTEYE_AGENT_MODE: "training" }),
+    );
     assert.deepEqual(seen.sort(), [HOOK_NAME, DESCRIBE_HOOK_NAME].sort());
   });
 

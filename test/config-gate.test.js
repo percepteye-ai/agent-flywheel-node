@@ -160,7 +160,8 @@ test("config from the HOST turns capture off", () => {
 test("host config carrying an api key does not disable capture", () => {
   const api = fakeApi();
   api.pluginConfig = { apiKey: "pefw_x", agentId: "coder" };
-  assert.notEqual(register(api), null);
+  // Unset mode is production, whose capture resolves a home: give it one.
+  assert.notEqual(register(api, {}, testEnv(process.env)), null);
   assert.ok(api.hooks.length >= 1);
 });
 

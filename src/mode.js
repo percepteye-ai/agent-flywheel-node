@@ -123,14 +123,16 @@ export function resolveModeSource(explicit = null, env = process.env) {
   if (raw !== null && raw !== undefined && String(raw).trim() !== "") {
     return { mode: modeFrom(raw, `${ENV_MODE}=`), source: "environment" };
   }
-  return { mode: TRAINING, source: "default" };
+  return { mode: PRODUCTION, source: "default" };
 }
 
 /**
  * `"training"` or `"production"`. Throws `ConfigurationError` on a typo.
  *
  * Precedence is the plugin config, then `PERCEPTEYE_AGENT_MODE`, then
- * `training` -- the same order and the same default as Python's
+ * `production` -- training is always an explicit choice, because a training
+ * install runs our tasks through the agent's real tools. The same order and
+ * the same default as Python's
  * `resolve_mode`, so one env var configures either package identically.
  */
 export function resolveMode(explicit = null, env = process.env) {

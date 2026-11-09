@@ -816,6 +816,27 @@ export function createRolloutDriver({
 }
 
 /**
+ * The one line a training-mode install logs when Mission Control's half of
+ * practice is off, or `null`: read from the registration answer's
+ * `practice.missing` (the control plane's `practice_switches`), never
+ * inferred here. The Python SDK's `_practice_line`, word for word.
+ */
+export function practiceLine(answer) {
+  const missing = answer?.practice?.missing;
+  for (const item of Array.isArray(missing) ? missing : []) {
+    if (item?.switch === "practice_consent") {
+      const detail = String(item.detail ?? "").trim();
+      return (
+        "training mode is on, but Mission Control's \"Allow practice runs\" " +
+        "is off for this agent, so improvement rounds (Start improving) will " +
+        "not send it tasks" + (detail ? `: ${detail}` : ".")
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Subscribe the driver. CALLED ONLY IN TRAINING MODE.
  *
  * Returns `null` when this install must not drive, having said why once. The
@@ -936,7 +957,14 @@ export function registerRolloutDriver(api, {
       }
       return transport.register(registrationSpec);
     })()
-      .then(() => true)
+      .then((answer) => {
+        // Practice takes two switches: this install's mode (training, or
+        // this lane would not exist) and Mission Control's "Allow practice
+        // runs". The control plane names whichever is off; say it once.
+        const line = practiceLine(answer);
+        if (line) logger?.warn?.(`[${pluginId}] ${line}`);
+        return true;
+      })
       .catch((err) => {
         logger?.warn?.(
           `[${pluginId}] rollouts are disabled for this run because worker ` +

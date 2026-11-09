@@ -77,11 +77,14 @@ lane, because that lane does not exist in production mode.
 Everything the plugin does beyond local recording is decided by `PERCEPTEYE_AGENT_MODE`.
 
 ```bash
-export PERCEPTEYE_AGENT_MODE=training     # the default — claim rollouts and run them
-export PERCEPTEYE_AGENT_MODE=production   # for the process serving your users
+export PERCEPTEYE_AGENT_MODE=training     # claim rollouts and run them
+export PERCEPTEYE_AGENT_MODE=production   # the default — for the process serving your users
 ```
 
-| | `training` (default) | `production` |
+
+**Training is always an explicit choice, and it takes two switches.** `PERCEPTEYE_AGENT_MODE=training` here says this install may run practice tasks; **Allow practice runs** on the agent in Mission Control (an org admin) says the platform may send them. With either off, no practice task runs. A training install runs our tasks through your agent's real tools, so point it at a test or sandbox backend.
+
+| | `training` | `production` (default) |
 |---|---|---|
 | Records tool outcomes locally | yes | yes |
 | Alters a tool result | **never** | **never** |
