@@ -153,6 +153,7 @@ The model is read once, not per turn: a model that moves under a running agent s
 | no API key | the ordinary first install: the control plane is never asked and no hook is subscribed |
 | `PERCEPTEYE_APPLY_PROMPT=0` | you switched it off — the hook is not subscribed and the prompt text is not even fetched |
 | an empty answer | nothing has passed the approval gate — your prompt stands. It never means "run with no prompt" |
+| `withdrawn` | a person withdrew the approved prompt and none is approved in its place — your prompt stands, and one already applied is taken away from the next turn |
 | `stale_baseline` | your own baseline prompt changed after the pair was certified, so the approved text was shaped against a prompt you no longer ship |
 | a status that is not `approved`/`delivered` | a draft or pending bundle never serves |
 | the bundle disagreeing with itself | its prompt checksum and the checkpoint it was certified against differ — that is not the pair anybody approved |

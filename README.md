@@ -38,9 +38,9 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      repo went public and the workflow was enabled again on 2026-10-20.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 780 was true on 2026-11-08 (it had drifted to 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
+     its 781 was true on 2026-11-09 (it had drifted to 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 780" / "skipped 0")
+     (prints "tests 781" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -48,7 +48,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-780_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-781_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -326,6 +326,7 @@ The model is read once, not per turn: a model that moves under a running agent s
 | no API key | the ordinary first install: the control plane is never asked and no hook is subscribed |
 | `PERCEPTEYE_APPLY_PROMPT=0` | you switched it off — the hook is not subscribed and the prompt text is not even fetched |
 | an empty answer | nothing has passed the approval gate — your prompt stands. It never means "run with no prompt" |
+| `withdrawn` | a person withdrew the approved prompt and none is approved in its place — your prompt stands, and one already applied is taken away from the next turn |
 | `stale_baseline` | your own baseline prompt changed after the pair was certified, so the approved text was shaped against a prompt you no longer ship |
 | a status that is not `approved`/`delivered` | a draft or pending bundle never serves |
 | the bundle disagreeing with itself | its prompt checksum and the checkpoint it was certified against differ — that is not the pair anybody approved |
@@ -431,33 +432,38 @@ Nothing is pushed into your agent. The plugin pulls, and **the plugin makes the 
 1. At startup it reads `GET /policy/current` and `GET /prompt/current`, checks the prompt (the refusal table in [The approved pair, applied](#the-approved-pair-applied)), and replaces the system prompt your host assembles on every attempt.
 2. While running, at most once per `ttl_s` (300 s when unset, never faster than 30 s), a turn starts a re-read of `/policy/current` without waiting for it.
 3. Only when its `prompt_generation` names a newer approval does the plugin fetch the new text and check it again.
-4. The turn that noticed keeps its prompt. The next turn runs the new one, and the log names the switch. A refusal, an empty answer or a failed read keeps the prompt already applied.
+4. The turn that noticed keeps its prompt. The next turn runs the new one, and the log names the switch. An empty answer or a failed read keeps the prompt already applied; a withdrawal is the one answer that takes it away, and the host's own prompt runs from the next turn.
 
-The delay is roughly one `ttl_s` plus one turn after the approval is confirmed, with no redeploy and no restart. The model half is read once at startup; picking up a new model needs a restart.
+The delay is roughly one `ttl_s` plus one turn after the approval, with no redeploy and no restart. The model half is read once at startup; picking up a new model needs a restart.
 
 ### Approving a new prompt
 
-Each winning prompt arrives as one **prompt-pair delivery**: the prompt, the checkpoint it was certified with, and its 2×2 evaluation (base or tuned model × your prompt or the new one). It waits for a person with write access to your organization, in two steps:
+Each winning prompt arrives as one **prompt-pair delivery**: the prompt, the checkpoint it was certified with, and its 2×2 evaluation (base or tuned model × your prompt or the new one). It waits for a person with write access to your organization.
 
-1. **Decide.** Mission Control → **Decisions** shows the delivery's decision. Approve or reject it there. Only the explicit approve and reject controls can resolve it: a language model reading "sure, go ahead" is recorded as *answered*, which does not approve.
-2. **Confirm.** Mission Control → **Prompts** shows the delivery with a **Confirm** button. Confirm uses the approval up (it is single-use) and makes the bundle servable. From that moment `/prompt/current` serves it, and running agents pick it up as described above.
+**Approve it in Mission Control → Decisions.** That is the whole step: approving the decision makes the prompt servable, and from that moment `/prompt/current` serves it and running agents pick it up as described above. Only the explicit approve and reject controls can resolve it: a language model reading "sure, go ahead" is recorded as *answered*, which does not approve. If the prompt can no longer be served exactly as it was approved, the decision records why, and nothing is served.
 
-The same two steps over the API, with a customer-automation key (`mck_`):
+The same step over the API, with a customer-automation key (`mck_`):
 
 ```bash
 curl -X POST "$MC/api/v2/approvals/$APPROVAL_ID/approve" -H "Authorization: Bearer $MCK" -H "Content-Type: application/json" -d '{}'
-curl -X POST "$MC/api/v2/prompt-deliveries/$DELIVERY_ID/confirm" -H "Authorization: Bearer $MCK" -H "Content-Type: application/json" \
-     -d "{\"approval_id\": \"$APPROVAL_ID\"}"
 ```
 
-`GET /api/v2/prompt-deliveries` lists deliveries with their `status`: `pending_approval`, `approved`, `delivered`, or `superseded` with `superseded_by` naming the newer one. Confirming a superseded delivery is refused with a 409 that names the newer delivery: approve that one instead.
+The answer's `context.completion` says what happened: `confirmed`, or `refused` with the reason. `GET /api/v2/prompt-deliveries` lists deliveries with their `status`: `pending_approval`, `approved`, `delivered`, `superseded` (with `superseded_by` naming the newer one that replaced it before it was decided), or `withdrawn`.
 
 **What runs on its own, and what never does.** Starting optimization rounds, certifying the winner and assembling the delivery are automatic by default, and `GET /api/v2/autonomy/flags` shows each one's current setting. **Approval is never automatic.** No setting serves a prompt a person did not approve, so "auto" means the next candidate is always ready and waiting, not that it ships itself.
 
-**Reject, stop, or go back.**
+### Withdrawing a prompt, and other ways to stop
+
+- **Withdraw** an approved prompt in Mission Control → **Prompts** → the prompt → *Versions of this prompt* → **Withdraw**. It stops being served at once. The prompt approved before it serves again, or, if none is left, running agents are told it was withdrawn and go back to their own prompt within one refresh, with no restart. Over the API:
+
+  ```bash
+  curl -X POST "$MC/api/v2/prompt-deliveries/$DELIVERY_ID/withdraw" -H "Authorization: Bearer $MCK" \
+       -H "Content-Type: application/json" -d '{"reason": "answers got too long"}'
+  ```
+
+  A withdrawn prompt cannot be approved back into service; approve a newer delivery instead.
 - **Reject** a waiting delivery in Decisions, and nothing changes for your agent.
 - **Stop applying** on your side at any time: `PERCEPTEYE_APPLY_PROMPT=0`, and the prompt your host assembles stands.
-- **There is no undo control for an approved prompt yet.** `/prompt/current` always serves the newest approved delivery. To go back, approve a newer delivery, or stop applying on your side.
 
 ## 🙋 A person approves every change
 
@@ -598,7 +604,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 780 tests, no install step — node:test, zero dependencies
+npm test     # 781 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

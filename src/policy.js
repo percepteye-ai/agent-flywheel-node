@@ -315,6 +315,14 @@ export const providerRefusedReason = (detail) =>
 export const PENDING_ANSWER_REASON = "the control plane has not been asked yet";
 
 /**
+ * Why nothing is applied once a person withdrew the approved prompt. Word for
+ * word the Python SDK's `WITHDRAWN_REASON`.
+ */
+export const WITHDRAWN_REASON =
+  "a person withdrew the approved prompt for this agent and none is " +
+  "approved in its place; the prompt this host assembles stands";
+
+/**
  * The floor under the prompt re-read cadence, whatever `ttl_s` says: the same
  * floor Python's `PolicySource` puts under its poll (`MIN_TTL_S`), so a fleet
  * cannot be talked into a polling storm by a bad hint.
@@ -362,6 +370,13 @@ export function promptDecision(prompt) {
   const p = prompt && typeof prompt === "object" ? prompt : {};
   const text = typeof p.text === "string" ? p.text : "";
   const checksum = str(p.model_prompt_checksum) || null;
+
+  // WITHDRAWN: a person took the approved prompt back out of service and
+  // nothing approved is left. Unlike `{}` below, this is an instruction to
+  // stop applying: the prompt the host assembles is what runs now.
+  if (p.withdrawn === true) {
+    return { apply: false, text: null, checksum, reason: WITHDRAWN_REASON };
+  }
 
   // `{}` IS AN ANSWER, and it is "keep what you have". No product declares
   // this agent, no twin optimizes that product, nothing has passed the gate,
@@ -462,7 +477,8 @@ export function promptNeedsRefresh(heldGeneration, policy) {
  *
  *   converge on what a fresh start would apply -- a newer approved prompt
  *   applies, a stale or mispaired one is refused and the host's prompt
- *   stands -- EXCEPT that no answer, an empty one, or nothing served after a
+ *   stands, and a withdrawal (`{"withdrawn": true}`) applies nothing even
+ *   after a prompt was held, because a person decided it -- EXCEPT that no answer, an empty one, or nothing served after a
  *   prompt was held keeps what is held. `/prompt/current` answers `{}` for
  *   "could not answer" too, and an unreachable control plane must never blank
  *   a running agent's instructions.
@@ -479,6 +495,9 @@ export function refreshedPrompt(held, heldGeneration, policy, answer) {
   if (!served) {
     if (heldGen || held?.apply) return [held, heldGen];
     return [promptDecision({}), ""];
+  }
+  if (answer && typeof answer === "object" && answer.withdrawn === true) {
+    return [promptDecision(answer), str(answer.generation) || served];
   }
   if (answer && typeof answer === "object" && typeof answer.text === "string"
       && answer.text.trim()) {
@@ -980,6 +999,12 @@ export function createPolicySource({
             `'${str(prompt.name) || "unnamed"}' v${prompt.version ?? "?"} ` +
             `(${applied.length} chars); applying it from the next turn via ` +
             `${PROMPT_HOOK_NAME}.`);
+        } else if (prompt.withdrawn === true) {
+          applied = null;
+          refusal = decision.reason;
+          logger?.info?.(
+            `[${pluginId}] a person withdrew the approved system prompt; ` +
+            "the prompt this host assembles runs from the next turn.");
         } else {
           applied = null;
           refusal = decision.reason;

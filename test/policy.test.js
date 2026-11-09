@@ -49,6 +49,7 @@ import {
   createPolicySource,
   modelDecision, modelHookBlockedReason, pairNote, promptDecision,
   providerRefusedReason, registerServingPolicy, servedPolicySummary,
+  WITHDRAWN_REASON,
 } from "../src/policy.js";
 
 /**
@@ -401,6 +402,28 @@ describe("createPolicySource — a newer approved prompt reaches a running agent
     await settle();
     assert.equal(src.handle({}, TURN), undefined);
     assert.match(src.refusal, /stale_baseline=true/);
+  });
+
+  it("a withdrawal takes the applied prompt away from the next turn", async () => {
+    // A person withdrew the approved prompt and none is approved in its
+    // place. Unlike an empty or failed read, that is an answer: the host's
+    // own prompt runs, without a restart, and the refusal names the cause.
+    const { src, transport, clock } = setup({
+      policies: [g("g1"), g("w1")],
+      prompts: [answer("FIRST", "g1"), { withdrawn: true, generation: "w1" }],
+    });
+    await src.resolve(transport);
+    assert.deepEqual(src.handle({}, TURN), { systemPrompt: "FIRST" });
+    clock.advance(61_000);
+    src.handle({}, TURN);
+    await settle();
+    assert.equal(src.handle({}, TURN), undefined);
+    assert.equal(src.refusal, WITHDRAWN_REASON);
+    // Held at the withdrawal's generation: not re-read every poll.
+    clock.advance(61_000);
+    src.handle({}, TURN);
+    await settle();
+    assert.equal(transport.calls.filter((c) => c === "prompt").length, 2);
   });
 
   it("a startup read that failed is retried, not believed already held", async () => {
