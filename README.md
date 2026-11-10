@@ -38,9 +38,9 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      repo went public and the workflow was enabled again on 2026-10-20.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 781 was true on 2026-11-09 (it had drifted to 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
+     its 826 was true on 2026-11-10 (it had drifted to 781, 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 781" / "skipped 0")
+     (prints "tests 826" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -48,7 +48,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-781_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-826_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -310,6 +310,18 @@ valid task-only turns still reach the control plane for downstream validation.
 **Uploading is off until an operator turns it on, per agent.** A production turn carries *your end users'* messages, so the default cannot be to send them. With a key set, the plugin registers this agent with the control plane at startup — that is what makes it appear so an operator can enable capture — then asks a plain read whether it may upload. It never learns its permission by uploading and finding out. Once enabled, turns go up every 32 turns and again at gateway shutdown; while the answer is still no, each of those flushes re-reads it, so a grant made after startup is picked up without a restart. If the control plane refuses a batch of turns (an operator withdrew consent, or the key lost its scope), the plugin stops uploading and stops recording model content, says why in the control plane's words, and keeps the turns on disk until consent is granted again.
 
 Recording itself is unaffected by any of that: it never leaves the machine, and works with no account at all.
+
+**Then say how the turn turned out.** The capture handle `register()` returns carries `reportOutcome`, the Python SDK's `report_outcome` under this package's casing:
+
+```js
+const { capture } = register(api, pluginConfig);
+
+capture.reportOutcome("resolved", { turnId: runId });             // this turn settled it
+capture.reportOutcome("reopened", { conversationId,               // ...or the whole conversation,
+  value: 129.5, note: "refund re-requested" });                    // with a number and a short note
+```
+
+The outcome is one of `resolved`, `escalated`, `reopened`, `abandoned`, `thumbs_up`, `thumbs_down` (`PRODUCTION_OUTCOMES`); anything else throws `InvalidOutcome` where you wrote it. `turnId` is the run id the turn was captured under. Name it, the `conversationId`, or both, and report as many as happen — resolved today and reopened next week are two outcomes, and neither replaces the other. `value` is an optional number, `note` an optional remark of at most 1,000 characters (the control plane masks personal data in it before storing it), `occurredAt` (a `Date` or RFC 3339 string) defaults to now, and `outcomeId` is the idempotency key if you want your own. It follows the turn in every way that matters: **it is a no-op until capture is enabled for the agent** (it returns `null` and keeps nothing), and once enabled it is queued as one `.outcome.<digest>.json` file in the capture directory, uploaded without being awaited, retried until the control plane acknowledges it (for up to a week, across restarts), and stopped by the same refusal that stops turns. An outcome is your report of what happened next — a weak label the platform keeps beside the turn, not a grade, and nothing is trained on it directly.
 
 **What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. An image the model saw -- in the prompt, the history or a tool's result -- is recorded as the GenAI `blob` part both SDKs emit. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt whose images the transcript does not hold as `llm_input` counted them, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
 
@@ -607,7 +619,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 781 tests, no install step — node:test, zero dependencies
+npm test     # 826 tests, no install step — node:test, zero dependencies
 ```
 
 The suite includes payloads captured verbatim from a live OpenClaw run (`test/host-fixtures.test.js`). If a future OpenClaw changes the shape, those fail — rather than someone discovering it months later from bad training data.

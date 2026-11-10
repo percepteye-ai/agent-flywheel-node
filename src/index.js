@@ -95,6 +95,9 @@ import {
 export const PLUGIN_ID = "agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
+// The outcome vocabulary and its named error, for a caller of
+// `capture.reportOutcome` -- the Python package exports the same two names.
+export { InvalidOutcome, PRODUCTION_OUTCOMES } from "./wire.js";
 
 /**
  * The operator's `describe`, validated -- or null, having said why.

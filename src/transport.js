@@ -19,8 +19,10 @@ import { createHash } from "node:crypto";
 import { TransportError } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
-  ContractError, PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
-  productionIdentifier, productionTurnIdentifier, rolloutOutputToWire,
+  ContractError, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
+  PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
+  productionIdentifier, productionOutcome, productionTurnIdentifier,
+  rolloutOutputToWire,
   rolloutRequestFromWire, rulebookReceiptFromWire, rulebookRequestToWire,
 } from "./wire.js";
 
@@ -524,6 +526,39 @@ export class AttachTransport {
     return this._c.request("POST", "/turns", {
       jsonBody: { agent_id: agentId, turns },
       idempotencyKey: `turns-${quoteIdentifier(agentId)}-${bodyDigest(turns)}`,
+    });
+  }
+
+  /**
+   * Upload a batch of reported outcomes: `POST /outcomes`.
+   *
+   * How production turns or conversations actually turned out, each in the
+   * shape `productionOutcome` validates -- which every outcome is passed
+   * through again here, so a batch that leaves is one the published schema
+   * accepts. REPLAYABLE, like `reportTurns`: the control plane keys each
+   * outcome on its `outcome_id` and answers a replay as a duplicate. The
+   * idempotency key is the turn batch's derivation over the outcomes,
+   * matching `agent_flywheel.transport.report_outcomes`.
+   */
+  reportOutcomes(agentId, outcomes) {
+    if (productionAgentIdentifier(agentId) === null) {
+      throw new ContractError(
+        "production outcome agent_id does not match the published production agent identifier grammar",
+      );
+    }
+    if (
+      !Array.isArray(outcomes)
+      || outcomes.length < 1
+      || outcomes.length > PRODUCTION_OUTCOME_BATCH_MAX_ITEMS
+    ) {
+      throw new ContractError(
+        `production outcome batches must contain between 1 and ${PRODUCTION_OUTCOME_BATCH_MAX_ITEMS} outcomes`,
+      );
+    }
+    const body = outcomes.map(productionOutcome);
+    return this._c.request("POST", "/outcomes", {
+      jsonBody: { agent_id: agentId, outcomes: body },
+      idempotencyKey: `outcomes-${quoteIdentifier(agentId)}-${bodyDigest(body)}`,
     });
   }
 

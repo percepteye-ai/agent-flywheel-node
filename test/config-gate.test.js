@@ -192,6 +192,9 @@ test("the transport calls no route the control plane does not serve", async () =
     "POST /rollouts/{id}/result",
     "POST /rollouts/{id}/abandon",
     "POST /turns",
+    // How a production turn turned out (reward robustness M6, 2026-11-10):
+    // Mission Control's `report_outcomes`, beside `POST /turns`.
+    "POST /outcomes",
     "GET /rollouts/{id}",
     "GET /rollouts",
     "GET /policy/current",

@@ -59,9 +59,10 @@
  * inventing the user's message from the model's prompt would be manufacturing
  * the one field we cannot observe.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
-  existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
+  statSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -78,7 +79,10 @@ import { percepteyeHome } from "./session.js";
 import {
   AttachTransport, declareRulebook, rulesNeverSent, sentence,
 } from "./transport.js";
-import { CONTRACT_VERSION } from "./wire.js";
+import {
+  CONTRACT_VERSION, InvalidOutcome, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
+  productionOutcome,
+} from "./wire.js";
 import {
   listTurnDirs, readConversationId, readModelBoundary, readTaskId,
   recordConversationId,
@@ -564,6 +568,77 @@ export function createTurnCapture({ root, logger = null }) {
 }
 
 /**
+ * A reported outcome waiting to be uploaded is ONE FILE in the capture root,
+ * `.outcome.<digest of its id>.json` -- the names and the bytes the Python
+ * SDK's `Attachment.report_outcome` writes. A file and not a directory for the
+ * reason `UPLOADED_INDEX` is: every directory under the root is read as a
+ * turn. One file per outcome, written whole and renamed into place, so two
+ * processes sharing a root never rewrite each other's pending outcomes.
+ */
+export const OUTCOME_FILE_PREFIX = ".outcome.";
+export const OUTCOME_FILE_SUFFIX = ".json";
+/**
+ * How long an outcome that could not be delivered is kept: a week, the
+ * rollout outbox's bound. An outbox nothing can drain (a control plane with no
+ * `/outcomes` route yet) must not grow for the life of a deployment.
+ */
+export const OUTCOME_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+
+/** Where the outcome with this id waits: a digest of the id, never the id. */
+export function outcomeFile(root, outcomeId) {
+  const digest = createHash("sha256").update(outcomeId, "utf8")
+    .digest("hex").slice(0, 32);
+  return join(root, `${OUTCOME_FILE_PREFIX}${digest}${OUTCOME_FILE_SUFFIX}`);
+}
+
+/**
+ * `occurredAt` as the wire spells it. Absent is now; a `Date` becomes UTC
+ * with milliseconds and `Z` (what the Python SDK writes for a `datetime`); a
+ * string goes through untouched for the validator to judge. A `Date` that is
+ * not a time is refused: it names no instant.
+ */
+function rfc3339(value) {
+  const at = value === undefined || value === null ? new Date() : value;
+  if (at instanceof Date) {
+    if (Number.isNaN(at.getTime())) {
+      throw new InvalidOutcome("occurredAt is not a valid Date");
+    }
+    return at.toISOString();
+  }
+  return at;
+}
+
+/**
+ * One `reportOutcome` call as the outcome wire carries it, validated
+ * (`productionOutcome`); throws `InvalidOutcome`. The Python SDK's
+ * `Attachment.report_outcome` builds the same record from the same arguments.
+ */
+export function outcomeWire(outcome, {
+  turnId, conversationId, value, note, occurredAt, outcomeId,
+} = {}) {
+  const wire = {
+    outcome_id: outcomeId === undefined || outcomeId === null
+      ? `o_${randomUUID().replaceAll("-", "")}` : outcomeId,
+    outcome,
+    occurred_at: rfc3339(occurredAt),
+  };
+  for (const [name, given] of [
+    ["turn_id", turnId], ["conversation_id", conversationId],
+    ["value", value], ["note", note],
+  ]) {
+    if (given !== undefined && given !== null) wire[name] = given;
+  }
+  return productionOutcome(wire);
+}
+
+/** `JSON.stringify` with sorted keys: the bytes Python's `sort_keys` writes
+ * are not promised, only that either SDK reads the other's file. */
+function sortedJson(wire) {
+  return JSON.stringify(Object.fromEntries(
+    Object.keys(wire).sort().map((k) => [k, wire[k]])));
+}
+
+/**
  * Uploads captured turns. Periodic while traffic arrives, and once at shutdown.
  *
  * TWO TRIGGERS, because neither covers the other's case -- the same pair the
@@ -730,51 +805,175 @@ export function createTurnUploader({
   }
 
   /**
-   * Send. Never rejects: a control plane that cannot be reached must not break
-   * an agent that is serving users, and the turns stay on disk for next time.
+   * Queue one outcome for upload: how a turn or a conversation actually
+   * turned out. THE PYTHON SDK'S `Attachment.report_outcome`, rule for rule.
+   *
+   * Validated first, capture enabled or not (`InvalidOutcome`). Then A NO-OP
+   * UNTIL PRODUCTION CAPTURE IS ENABLED for this agent: an outcome is a fact
+   * about the end users' traffic, so it is sent on exactly the terms a turn
+   * is, and nothing is kept locally for an agent that may not send it.
+   * Returns the outcome's id once queued, else `null`; the upload itself
+   * happens off the caller's path (`flush`, kicked here and not awaited).
    */
-  async function flush({ includeUnanswered = false, settleMs = 0 } = {}) {
+  function reportOutcome(outcome, options = {}) {
+    const wire = outcomeWire(outcome, options);
+    if (!mayUpload) return null;
+    const path = outcomeFile(root, wire.outcome_id);
+    try {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(`${path}.tmp`, sortedJson(wire), "utf8");
+      renameSync(`${path}.tmp`, path);
+    } catch {
+      // Capture costs the observation, never the caller.
+      return null;
+    }
+    flush({
+      includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
+    }).catch(() => {});
+    return wire.outcome_id;
+  }
+
+  /** The outcomes waiting on disk, in file-name order; week-old ones dropped. */
+  function pendingOutcomes() {
+    let names;
+    try {
+      names = readdirSync(root).filter((n) =>
+        n.startsWith(OUTCOME_FILE_PREFIX) && n.endsWith(OUTCOME_FILE_SUFFIX))
+        .sort();
+    } catch {
+      return [];
+    }
+    const out = [];
+    let expired = 0;
+    for (const name of names) {
+      const path = join(root, name);
+      try {
+        const st = statSync(path);
+        if (!st.isFile()) continue;
+        if (Date.now() - st.mtimeMs > OUTCOME_MAX_AGE_MS) {
+          rmSync(path, { force: true });
+          expired += 1;
+          continue;
+        }
+        out.push({ path, wire: productionOutcome(
+          JSON.parse(readFileSync(path, "utf8"))) });
+      } catch {
+        // Unreadable or not ours to send; one file costs that file.
+      }
+    }
+    if (expired) {
+      logger?.warn?.(
+        `[agent-flywheel] ${expired} reported outcome(s) could not be ` +
+        `delivered for a week and were dropped.`);
+    }
+    return out;
+  }
+
+  /**
+   * Upload the outcomes waiting on disk. Called inside `flush`, after its
+   * consent gate. THE TURNS' RULES: an acknowledged batch is deleted; a 403
+   * is the control plane's decision, so sending stops and the outcomes stay;
+   * any other failure leaves the batch for the next flush. An outcome refused
+   * BY NAME inside an acknowledged batch would be refused again, so it is
+   * dropped and said out loud.
+   */
+  async function flushOutcomes() {
+    const waiting = pendingOutcomes();
+    if (!waiting.length) return {};
+    let sent = 0;
+    let failed = 0;
+    for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
+      const chunk = waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS);
+      let reply;
+      try {
+        reply = await transport.reportOutcomes(agentId, chunk.map((o) => o.wire));
+      } catch (err) {
+        const refused = captureRefusal(err);
+        if (refused !== null) {
+          refuseUpload(refused);
+          failed += waiting.length - sent;
+          break;
+        }
+        failed += chunk.length;
+        continue;
+      }
+      for (const { path } of chunk) {
+        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
+      }
+      sent += chunk.length;
+      const refusedByName = [...new Set(
+        (Array.isArray(reply?.outcomes) ? reply.outcomes : [])
+          .filter((r) => r?.accepted === false)
+          .map((r) => String(r.error || "refused")),
+      )].sort();
+      if (refusedByName.length) {
+        logger?.warn?.(
+          `[agent-flywheel] the control plane did not record some reported ` +
+          `outcomes (${refusedByName.join(", ")}); they will not be sent again.`);
+      }
+    }
+    return { outcomesSent: sent, outcomesFailed: failed };
+  }
+
+  /**
+   * Everything a flush sends: the captured turns, then the reported outcomes.
+   * ONE SEAM FOR BOTH, because the consent question is one question. The
+   * counts are the turns'; `outcomesSent` and `outcomesFailed` are added only
+   * when outcomes were waiting.
+   */
+  async function flush(options = {}) {
     if (inFlight) return { sent: 0, skipped: true };
     inFlight = true;
     try {
-      // Asked while either tier is still NO, and not at all once both are
-      // yes: one read per flush, the Python SDK's cadence.
-      if (!mayUpload || !mayCaptureModelContent) await recheck();
-      if (!mayUpload) return { sent: 0, notPermitted: true };
-      const turns = pending({
-        includeUnanswered,
-        quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
-      });
-      if (!turns.length) return { sent: 0 };
-      let sent = 0;
-      for (let i = 0; i < turns.length; i += BATCH_SIZE) {
-        const chunk = turns.slice(i, i + BATCH_SIZE);
-        let reply;
-        try {
-          reply = await transport.reportTurns(agentId, chunk);
-        } catch (err) {
-          const refused = captureRefusal(err);
-          if (refused !== null) {
-            // NOT A TRANSPORT FAILURE. Stop, in the intake's own words, and
-            // leave the turns on disk; `recheck` picks consent back up.
-            refuseUpload(refused);
-            return { sent, notPermitted: true };
-          }
-          // Whole chunk unacknowledged: leave every marker unwritten so the
-          // next flush retries it.
-          logger?.warn?.(
-            `[agent-flywheel] could not upload ${chunk.length} captured turn(s); ` +
-            `they stay on disk and are retried: ${err?.message ?? err}`);
-          continue;
-        }
-        markUploaded(chunk.map((t) => t.turn_id));
-        sent += chunk.length;
-        noteModelContentRefusal(reply);
-      }
-      return { sent };
+      const counts = await flushTurns(options);
+      if (mayUpload) Object.assign(counts, await flushOutcomes());
+      return counts;
     } finally {
       inFlight = false;
     }
+  }
+
+  /**
+   * Send the turns. A control plane that cannot be reached must not break an
+   * agent that is serving users, and the turns stay on disk for next time.
+   * Caller (`flush`) holds `inFlight`.
+   */
+  async function flushTurns({ includeUnanswered = false, settleMs = 0 } = {}) {
+    // Asked while either tier is still NO, and not at all once both are
+    // yes: one read per flush, the Python SDK's cadence.
+    if (!mayUpload || !mayCaptureModelContent) await recheck();
+    if (!mayUpload) return { sent: 0, notPermitted: true };
+    const turns = pending({
+      includeUnanswered,
+      quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
+    });
+    if (!turns.length) return { sent: 0 };
+    let sent = 0;
+    for (let i = 0; i < turns.length; i += BATCH_SIZE) {
+      const chunk = turns.slice(i, i + BATCH_SIZE);
+      let reply;
+      try {
+        reply = await transport.reportTurns(agentId, chunk);
+      } catch (err) {
+        const refused = captureRefusal(err);
+        if (refused !== null) {
+          // NOT A TRANSPORT FAILURE. Stop, in the intake's own words, and
+          // leave the turns on disk; `recheck` picks consent back up.
+          refuseUpload(refused);
+          return { sent, notPermitted: true };
+        }
+        // Whole chunk unacknowledged: leave every marker unwritten so the
+        // next flush retries it.
+        logger?.warn?.(
+          `[agent-flywheel] could not upload ${chunk.length} captured turn(s); ` +
+          `they stay on disk and are retried: ${err?.message ?? err}`);
+        continue;
+      }
+      markUploaded(chunk.map((t) => t.turn_id));
+      sent += chunk.length;
+      noteModelContentRefusal(reply);
+    }
+    return { sent };
   }
 
   return {
@@ -817,6 +1016,7 @@ export function createTurnUploader({
       }).catch(() => ({ sent: 0 }));
     },
     flush,
+    reportOutcome,
   };
 }
 
@@ -1017,10 +1217,32 @@ export function registerTurnCapture(api, {
     }
   }
 
+  /**
+   * Tell the control plane how a turn or a conversation turned out: the
+   * Python SDK's `Attachment.report_outcome`. `outcome` is one of
+   * `PRODUCTION_OUTCOMES`; `turnId` is the run id the turn was captured under
+   * and `conversationId` its conversation -- give either or both. Optional
+   * `value` (a number of your own), `note` (at most 1,000 characters, masked
+   * by the control plane), `occurredAt` (a `Date` or RFC 3339 string; now when
+   * omitted) and `outcomeId` (this report's idempotency key; minted when
+   * omitted). Throws `InvalidOutcome` for what the wire cannot carry, whether
+   * or not capture is on; otherwise returns the outcome's id once queued, or
+   * `null` -- a no-op -- when this agent may not upload (no key, or
+   * production capture not enabled).
+   */
+  function reportOutcome(outcome, options = {}) {
+    if (!uploader) {
+      outcomeWire(outcome, options);
+      return null;
+    }
+    return uploader.reportOutcome(outcome, options);
+  }
+
   // `transport` is handed out so the serving-policy read reuses THIS client
   // rather than constructing a second one against the same base URL and key.
   return {
     turns, uploader, root, transport, started, rulebook, prune, retentionTurns,
+    reportOutcome,
     get rulebookRefusal() { return rulebookRefusal; },
   };
 }

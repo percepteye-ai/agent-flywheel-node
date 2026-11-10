@@ -74,6 +74,114 @@ export class ContractError extends Error {
 }
 
 /**
+ * `reportOutcome` was handed something the outcome wire cannot carry: a word
+ * outside the closed vocabulary, no turn or conversation to attach it to, an
+ * id, number, note or time the published schema refuses. The Python SDK's
+ * `InvalidOutcome`. Thrown BEFORE anything is stored or sent, whether or not
+ * production capture is enabled.
+ */
+export class InvalidOutcome extends ContractError {
+  constructor(message) {
+    super(message);
+    this.name = "InvalidOutcome";
+  }
+}
+
+/**
+ * THE closed vocabulary of `reportOutcome`: how a production turn or
+ * conversation actually turned out. Asserted verbatim against
+ * `schema/flywheel-1.json` (`ProductionOutcome.outcome`); the Python SDK's
+ * `PRODUCTION_OUTCOMES`.
+ */
+export const PRODUCTION_OUTCOMES = Object.freeze([
+  "resolved", "escalated", "reopened", "abandoned",
+  "thumbs_up", "thumbs_down",
+]);
+/** A note is a short remark, not a transcript (code points, as the schema counts). */
+export const PRODUCTION_OUTCOME_NOTE_MAX_CHARS = 1000;
+export const PRODUCTION_OUTCOME_BATCH_MAX_ITEMS = 64;
+/** An RFC 3339 instant WITH its offset; the schema's `occurred_at.pattern`. */
+export const RFC3339_PATTERN =
+  "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$";
+const RFC3339_RE = new RegExp(RFC3339_PATTERN, "u");
+const OUTCOME_WIRE_KEYS = new Set([
+  "outcome_id", "outcome", "turn_id", "conversation_id", "value", "note",
+  "occurred_at",
+]);
+
+/**
+ * One reported outcome exactly as the wire carries it, or `InvalidOutcome`
+ * naming what is wrong.
+ *
+ * THE one validator: `reportOutcome` builds its record through it, and
+ * `AttachTransport.reportOutcomes` passes every outcome through it again
+ * before a batch leaves. The Python SDK's `production_outcome`, rule for rule
+ * and message for message (`test_report_outcome.py` runs both).
+ *
+ * Absent optional fields are OMITTED, never null. Nothing is rewritten.
+ */
+export function productionOutcome(wire) {
+  if (!wire || typeof wire !== "object" || Array.isArray(wire)) {
+    throw new InvalidOutcome(`an outcome must be an object, got ${jsonType(wire)}`);
+  }
+  const unknown = Object.keys(wire).filter((k) => !OUTCOME_WIRE_KEYS.has(k)).sort();
+  if (unknown.length) {
+    throw new InvalidOutcome(`an outcome has no field ${JSON.stringify(unknown[0])}`);
+  }
+  const present = (v) => v !== undefined && v !== null;
+  const { outcome } = wire;
+  if (typeof outcome !== "string" || !PRODUCTION_OUTCOMES.includes(outcome)) {
+    const got = typeof outcome === "string" ? JSON.stringify(outcome) : jsonType(outcome ?? null);
+    throw new InvalidOutcome(
+      `outcome must be one of ${PRODUCTION_OUTCOMES.join(", ")}; got ${got}`);
+  }
+  if (productionTurnIdentifier(wire.outcome_id) === null) {
+    throw new InvalidOutcome("outcome_id is not a valid identifier");
+  }
+  const out = { outcome_id: wire.outcome_id, outcome };
+  if (present(wire.turn_id)) {
+    if (productionTurnIdentifier(wire.turn_id) === null) {
+      throw new InvalidOutcome("turn_id is not a valid turn identifier");
+    }
+    out.turn_id = wire.turn_id;
+  }
+  if (present(wire.conversation_id)) {
+    if (productionIdentifier(wire.conversation_id) === null) {
+      throw new InvalidOutcome("conversation_id is not a valid identifier");
+    }
+    out.conversation_id = wire.conversation_id;
+  }
+  if (!("turn_id" in out) && !("conversation_id" in out)) {
+    throw new InvalidOutcome(
+      "an outcome names the turn_id or the conversation_id it is the outcome of");
+  }
+  if (present(wire.value)) {
+    if (typeof wire.value !== "number" || !Number.isFinite(wire.value)) {
+      throw new InvalidOutcome("value must be a finite number");
+    }
+    out.value = wire.value;
+  }
+  if (present(wire.note)) {
+    if (
+      typeof wire.note !== "string" || wire.note.length === 0
+      || [...wire.note].length > PRODUCTION_OUTCOME_NOTE_MAX_CHARS
+    ) {
+      throw new InvalidOutcome(
+        "note must be a non-empty string of at most " +
+        `${PRODUCTION_OUTCOME_NOTE_MAX_CHARS} characters`);
+    }
+    out.note = wire.note;
+  }
+  if (typeof wire.occurred_at !== "string" || !RFC3339_RE.test(wire.occurred_at)) {
+    throw new InvalidOutcome(
+      "occurred_at must be an RFC 3339 time with its offset, such as " +
+      "2026-11-10T09:00:00Z");
+  }
+  out.occurred_at = wire.occurred_at;
+  return out;
+}
+
+/**
  * One rollout, as the control plane handed it to us.
  *
  * Field names are the SERVER's, not ours -- renaming them here would put a
