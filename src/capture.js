@@ -369,10 +369,31 @@ export function outcomeRouteRefused(status) {
 }
 
 /**
+ * Whether an `/outcomes` refusal was about how LARGE the body was (413: a
+ * proxy's limit, or the control plane's). Both halves of a batch too large
+ * for a proxy answer it in the same words, so it is never read as a refusal
+ * of the batch: the split goes on, and a record that draws it alone is too
+ * large on its own. The Python SDK's `_outcome_refused_for_size`.
+ */
+export function outcomeRefusedForSize(status) {
+  return status === 413;
+}
+
+/**
+ * A record's size as the wire spells it: compact JSON, UTF-8 -- the Python
+ * SDK's `_outcome_wire_bytes`.
+ */
+function outcomeWireBytes(wire) {
+  return Buffer.byteLength(JSON.stringify(wire), "utf8");
+}
+
+/**
  * Whether an `/outcomes` answer refused THIS BATCH: any other 4xx (400, 409,
  * 413, 422 ...) -- not 403 (consent), 408 or 429 (blips the client already
  * retried). Final for the batch, which is split to find the records it
- * refused. The Python SDK's `_outcome_batch_refused`.
+ * refused, or -- both halves refused alike for what they say, never for their
+ * size (`outcomeRefusedForSize`) -- kept as a refusal of the batch itself.
+ * The Python SDK's `_outcome_batch_refused`.
  */
 export function outcomeBatchRefused(status) {
   return Number.isInteger(status) && status >= 400 && status < 500
@@ -976,11 +997,19 @@ export function createTurnUploader({
    *
    * Unless both halves are refused with the same status and the same words:
    * then the refusal was about THE BATCH, not a record in it -- a 422 from a
-   * control plane on another contract minor, a proxy's 400 or 413 -- and
-   * splitting further would drop every outcome at two requests each. Sending
-   * stops for this flush, they stay on disk (the week's expiry still
-   * applies), and the cause is said once. Splitting is also bounded per flush
-   * (`OUTCOME_SPLIT_MAX_REQUESTS`); what the bound leaves stays for the next.
+   * control plane on another contract minor, a proxy's 400 -- and splitting
+   * further would drop every outcome at two requests each. Sending stops for
+   * this flush, they stay on disk (the week's expiry still applies), and the
+   * cause is said once.
+   *
+   * Except a 413 (`outcomeRefusedForSize`): it is about the body's SIZE, so
+   * both halves of a batch too large for a proxy answer it alike, and smaller
+   * parts may still pass. The split goes on; a record that draws a 413
+   * standing alone is too large on its own, and is dropped with a warning
+   * naming the 413 and its size.
+   *
+   * Splitting is bounded per flush (`OUTCOME_SPLIT_MAX_REQUESTS`); what the
+   * bound leaves stays for the next.
    *
    * A 4xx about the ROUTE or the KEY (`outcomeRouteRefused`: 401, 404, 405,
    * 410) is not the records' fault either: sending stops for this flush and
@@ -1085,17 +1114,21 @@ export function createTurnUploader({
       }
       if (halves && refused.length === 2
           && refused[0].status === refused[1].status
-          && refused[0].cause === refused[1].cause) {
+          && refused[0].cause === refused[1].cause
+          && !outcomeRefusedForSize(refused[0].status)) {
         failed += refused[0].batch.length + refused[1].batch.length + left();
         queue.length = 0;
         warnWholeBatchRefusal(refused[0].cause);
         break;
       }
       const split = [];
-      for (const { batch, cause } of refused) {
+      for (const { batch, status, cause } of refused) {
         if (batch.length === 1) {
           forget(batch);
-          dropped.push(cause);
+          dropped.push(outcomeRefusedForSize(status)
+            ? `${cause} (an outcome of ${outcomeWireBytes(batch[0].wire)} ` +
+              `bytes, too large to send even alone)`
+            : cause);
         } else {
           const half = Math.floor(batch.length / 2);
           split.push([batch.slice(0, half), batch.slice(half)]);

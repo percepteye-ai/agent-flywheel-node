@@ -652,7 +652,7 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
   it("keeps every outcome of a batch refused whole, at three requests", async () => {
     // Every part of the batch refused alike -- the same status, the same
     // words -- is a refusal of THE BATCH: a 422 from a control plane on
-    // another contract minor, a proxy's 400 or 413. It used to be bisected to
+    // another contract minor, a proxy's 400. It used to be bisected to
     // singles and every outcome dropped, 64 outcomes costing 127 requests.
     const root = tmp();
     const warnings = [];
@@ -678,6 +678,54 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
     assert.ok(said[0].includes("HTTP 422"));
     assert.ok(!warnings.some((w) => w.includes("were dropped")));
     assert.deepEqual(tr.outcomes, []);
+  });
+
+  it("splits on through a 413, which is about size, until the parts fit", async () => {
+    // Both halves of a batch too large for a proxy answer the same words, and
+    // halves too large still is not a refusal of the batch: quarters may fit.
+    // It used to stop the flush there; the outcomes waited a week and expired.
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: PRODUCTION_OUTCOME_BATCH_MAX_ITEMS },
+                           (_, n) => `o${String(n).padStart(2, "0")}`);
+    const quarter = ids.length / 4;
+    const tr = refusing((batch) => (batch.length > quarter
+      ? [413, "Request Entity Too Large"] : null));
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr, { warnings }));
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [ids.length, 0, 0]);
+    assert.deepEqual(pending(root), []);
+    assert.equal(tr.tried.length, 1 + 2 + 4, "halves, then quarters");
+    assert.ok(!warnings.some((w) => w.includes("whole batches")));
+    assert.deepEqual(tr.outcomes.map((o) => o.outcome_id).sort(), ids);
+  });
+
+  it("drops an outcome too large alone, naming the 413 and its size", async () => {
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: 8 }, (_, n) => `o${n}`);
+    const tr = refusing((batch) => (batch.includes("o5")
+      ? [413, "Request Entity Too Large"] : null));
+    const sentWires = new Map();
+    const inner = tr.reportOutcomes;
+    tr.reportOutcomes = async (agentId, outcomes) => {
+      for (const o of outcomes) sentWires.set(o.outcome_id, o);
+      return inner(agentId, outcomes);
+    };
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr, { warnings }));
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [7, 0, 1]);
+    // The size as the wire spells the record: compact JSON, UTF-8 -- the
+    // figure the Python SDK gives for the same record.
+    const size = Buffer.byteLength(JSON.stringify(sentWires.get("o5")), "utf8");
+    const said = warnings.filter((w) => w.includes("were dropped"));
+    assert.equal(said.length, 1, said);
+    assert.ok(said[0].includes("HTTP 413") && said[0].includes(`${size} bytes`),
+              said[0]);
   });
 
   it("still isolates two records refused for different causes", async () => {
