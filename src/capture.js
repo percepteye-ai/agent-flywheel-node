@@ -358,6 +358,28 @@ export const MODEL_CONTENT_NOT_ENABLED =
 const REFUSED_MARKER = "-> HTTP 403";
 
 /**
+ * A 4xx about the ROUTE or the KEY, never the records in an `/outcomes`
+ * batch: an absent route (404, 405 -- a control plane older than
+ * `POST /outcomes`), a key it does not accept (401), a gone resource (410).
+ * Sending stops for the flush and the outcomes stay. The Python SDK's
+ * `_outcome_route_refused`.
+ */
+export function outcomeRouteRefused(status) {
+  return [401, 404, 405, 410].includes(status);
+}
+
+/**
+ * Whether an `/outcomes` answer refused THIS BATCH: any other 4xx (400, 409,
+ * 413, 422 ...) -- not 403 (consent), 408 or 429 (blips the client already
+ * retried). Final for the batch, which is split to find the records it
+ * refused. The Python SDK's `_outcome_batch_refused`.
+ */
+export function outcomeBatchRefused(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500
+    && ![401, 403, 404, 405, 408, 410, 429].includes(status);
+}
+
+/**
  * The intake's sentence when it REFUSED a batch of turns, else `null`.
  *
  * THE PYTHON SDK'S `_capture_refusal`. A 403 is a DECISION -- an operator
@@ -871,36 +893,78 @@ export function createTurnUploader({
 
   /**
    * Upload the outcomes waiting on disk. Called inside `flush`, after its
-   * consent gate. THE TURNS' RULES: an acknowledged batch is deleted; a 403
-   * is the control plane's decision, so sending stops and the outcomes stay;
-   * any other failure leaves the batch for the next flush. An outcome refused
-   * BY NAME inside an acknowledged batch would be refused again, so it is
-   * dropped and said out loud.
+   * consent gate. THE PYTHON SDK'S `Attachment._flush_outcomes`, rule for
+   * rule. THE TURNS' RULES: an acknowledged batch is deleted; a 403 is the
+   * control plane's decision, so sending stops and the outcomes stay; a blip
+   * leaves the batch for the next flush. An outcome refused BY NAME inside an
+   * acknowledged batch would be refused again, so it is dropped and said out
+   * loud.
+   *
+   * A 4xx ABOUT THE BATCH IS FINAL FOR THAT BATCH (`outcomeBatchRefused`):
+   * it is split in halves until the refused records stand alone, the good
+   * ones are sent and each bad one is dropped with a warning naming the
+   * control plane's own cause. It used to be retried for a week and then
+   * deleted with up to 63 good outcomes beside it. A 4xx about the ROUTE or
+   * the KEY (`outcomeRouteRefused`: 401, 404, 405, 410) is not the records'
+   * fault: sending stops for this flush and they stay, said out loud.
+   *
+   * `outcomesFailed` counts each outcome still on disk once;
+   * `outcomesDropped` the records the control plane refused.
    */
   async function flushOutcomes() {
     const waiting = pendingOutcomes();
     if (!waiting.length) return {};
+    const queue = [];
+    for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
+      queue.push(waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS));
+    }
+    const left = () => queue.reduce((n, b) => n + b.length, 0);
+    const forget = (batch) => {
+      for (const { path } of batch) {
+        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
+      }
+    };
     let sent = 0;
     let failed = 0;
-    for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
-      const chunk = waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS);
+    const dropped = [];
+    while (queue.length) {
+      const batch = queue.shift();
       let reply;
       try {
-        reply = await transport.reportOutcomes(agentId, chunk.map((o) => o.wire));
+        reply = await transport.reportOutcomes(agentId, batch.map((o) => o.wire));
       } catch (err) {
         const refused = captureRefusal(err);
         if (refused !== null) {
           refuseUpload(refused);
-          failed += waiting.length - sent;
+          failed += batch.length + left();
+          queue.length = 0;
           break;
         }
-        failed += chunk.length;
+        const status = err?.statusCode ?? null;
+        if (outcomeBatchRefused(status)) {
+          if (batch.length === 1) {
+            forget(batch);
+            dropped.push(String(err?.message ?? err));
+          } else {
+            const half = Math.floor(batch.length / 2);
+            queue.unshift(batch.slice(0, half), batch.slice(half));
+          }
+          continue;
+        }
+        if (outcomeRouteRefused(status)) {
+          failed += batch.length + left();
+          queue.length = 0;
+          logger?.warn?.(
+            `[agent-flywheel] the control plane did not take reported ` +
+            `outcomes (${err?.message ?? err}); they stay on disk and are ` +
+            `sent again on a later flush.`);
+          break;
+        }
+        failed += batch.length;
         continue;
       }
-      for (const { path } of chunk) {
-        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
-      }
-      sent += chunk.length;
+      forget(batch);
+      sent += batch.length;
       const refusedByName = [...new Set(
         (Array.isArray(reply?.outcomes) ? reply.outcomes : [])
           .filter((r) => r?.accepted === false)
@@ -912,7 +976,16 @@ export function createTurnUploader({
           `outcomes (${refusedByName.join(", ")}); they will not be sent again.`);
       }
     }
-    return { outcomesSent: sent, outcomesFailed: failed };
+    if (dropped.length) {
+      logger?.warn?.(
+        `[agent-flywheel] the control plane refused ${dropped.length} ` +
+        `reported outcome(s), so they were dropped and the rest of their ` +
+        `batch was sent: ${[...new Set(dropped)].sort().join("; ")}`);
+    }
+    return {
+      outcomesSent: sent, outcomesFailed: failed,
+      outcomesDropped: dropped.length,
+    };
   }
 
   /**

@@ -100,10 +100,40 @@ export const PRODUCTION_OUTCOMES = Object.freeze([
 /** A note is a short remark, not a transcript (code points, as the schema counts). */
 export const PRODUCTION_OUTCOME_NOTE_MAX_CHARS = 1000;
 export const PRODUCTION_OUTCOME_BATCH_MAX_ITEMS = 64;
-/** An RFC 3339 instant WITH its offset; the schema's `occurred_at.pattern`. */
+/**
+ * An RFC 3339 instant WITH its offset; the schema's `occurred_at.pattern`.
+ * ASCII digits, spelled `[0-9]`: the Python SDK's `\\d` matched other
+ * scripts' digits, and the pattern is one string both SDKs and the schema share.
+ */
 export const RFC3339_PATTERN =
-  "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$";
+  "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?" +
+  "(Z|[+-][0-9]{2}:[0-9]{2})$";
 const RFC3339_RE = new RegExp(RFC3339_PATTERN, "u");
+
+/**
+ * Whether `text` is an RFC 3339 instant that EXISTS: the pattern, and then
+ * every field in its range -- a real calendar day (`2026-02-30` is not one),
+ * an hour of 0-23 (`T24:00` is not one), no leap second, an offset under a
+ * day. A shape alone let an impossible time reach the control plane, which
+ * refused the whole batch around it. The Python SDK's `_is_rfc3339_instant`,
+ * the same arithmetic.
+ */
+export function isRfc3339Instant(text) {
+  if (typeof text !== "string" || !RFC3339_RE.test(text)) return false;
+  const num = (a, b) => Number(text.slice(a, b));
+  const [year, month, day] = [num(0, 4), num(5, 7), num(8, 10)];
+  const [hour, minute, second] = [num(11, 13), num(14, 16), num(17, 19)];
+  if (!(year >= 1 && month >= 1 && month <= 12)) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (!(day >= 1 && day <= days[month - 1] && hour <= 23 && minute <= 59
+        && second <= 59)) return false;
+  if (!text.endsWith("Z")) {
+    if (num(text.length - 5, text.length - 3) > 23
+        || num(text.length - 2, text.length) > 59) return false;
+  }
+  return true;
+}
 const OUTCOME_WIRE_KEYS = new Set([
   "outcome_id", "outcome", "turn_id", "conversation_id", "value", "note",
   "occurred_at",
@@ -172,7 +202,7 @@ export function productionOutcome(wire) {
     }
     out.note = wire.note;
   }
-  if (typeof wire.occurred_at !== "string" || !RFC3339_RE.test(wire.occurred_at)) {
+  if (!isRfc3339Instant(wire.occurred_at)) {
     throw new InvalidOutcome(
       "occurred_at must be an RFC 3339 time with its offset, such as " +
       "2026-11-10T09:00:00Z");

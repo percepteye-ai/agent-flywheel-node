@@ -193,6 +193,17 @@ describe("reportOutcome: validated where it is called", () => {
     [{ turnId: "t1", occurredAt: new Date("not a date") }, "valid Date"],
     [{ turnId: "t1", occurredAt: "yesterday" }, "RFC 3339"],
     [{ turnId: "t1", occurredAt: "2026-11-10T09:00:00" }, "RFC 3339"],
+    // The shape of a time is not a time: each of these used to pass.
+    [{ turnId: "t1", occurredAt: "2026-02-30T09:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2025-02-29T09:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2026-11-10T24:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2026-11-10T09:60:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2026-11-10T23:59:60Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2026-13-10T09:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "0000-11-10T09:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "2026-11-10T09:00:00+24:00" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "\u0662026-11-10T09:00:00Z" }, "RFC 3339"],
+    [{ turnId: "t1", occurredAt: "\uFF12\uFF10\uFF12\uFF16-11-10T09:00:00Z" }, "RFC 3339"],
     [{ turnId: "t1", outcomeId: "a/b" }, "outcome_id"],
     [{ turnId: "t1", outcomeId: "" }, "outcome_id"],
   ];
@@ -427,6 +438,121 @@ describe("reportOutcome: the turns' retry and offline behaviour", () => {
     recordTurnText(turnDir(root, "t1"), "answer", "there", { turn_id: "t1" });
     assert.deepEqual(await u.flush(), { sent: 1 });
     assert.deepEqual(tr.batches, []);
+  });
+});
+
+describe("reportOutcome: one refused outcome never holds back the good ones", () => {
+  /** The outcome route answering by status: `answer(ids)` is null
+   * (acknowledged) or the `[status, detail]` it answers that batch with. */
+  function refusing(answer) {
+    const tr = fakeTransport();
+    const ok = tr.reportOutcomes.bind(tr);
+    tr.tried = [];
+    tr.reportOutcomes = async (agentId, outcomes) => {
+      const ids = outcomes.map((o) => o.outcome_id);
+      tr.tried.push(ids);
+      const refused = answer(ids);
+      if (refused) {
+        const [status, detail] = refused;
+        throw new TransportError(`POST /outcomes -> HTTP ${status}: ${detail}`,
+                                 { statusCode: status });
+      }
+      return ok(agentId, outcomes);
+    };
+    return tr;
+  }
+  const report = (u, ids) => {
+    for (const outcomeId of ids) u.reportOutcome("resolved", { turnId: "t1", outcomeId });
+  };
+  /** Outcomes already waiting on disk, as a previous process left them. */
+  const seed = (root, ids) => {
+    for (const outcomeId of ids) {
+      writeFileSync(join(root, `.outcome.${outcomeId}.json`), JSON.stringify({
+        outcome_id: outcomeId, outcome: "resolved", turn_id: "t1",
+        occurred_at: "2026-11-10T09:00:00Z" }));
+    }
+  };
+
+  it("isolates the refused record, sends the rest, and drops it by name", async () => {
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: 9 }, (_, n) => `o${n}`);
+    const tr = refusing((batch) => (batch.includes("o5")
+      ? [422, "value: Input should be a finite number"] : null));
+    const u = uploaderFor(root, tr, { warnings });
+    report(u, ids);
+    await settle(u);
+    assert.deepEqual(pending(root), [], "nothing is left to retry forever");
+    assert.deepEqual(
+      tr.outcomes.map((o) => o.outcome_id).sort(),
+      ids.filter((id) => id !== "o5").sort());
+    assert.ok(tr.tried.some((b) => b.length === 1 && b[0] === "o5"),
+              "the refused record was isolated, not guessed");
+    assert.ok(warnings.some((w) => w.includes("HTTP 422")
+                                && w.includes("finite number")));
+    const tried = tr.tried.length;
+    await settle(u);
+    assert.equal(tr.tried.length, tried, "a refused record is not sent again");
+  });
+
+  it("counts a bisected flush: sent, none failed, one dropped", async () => {
+    const root = tmp();
+    const ids = Array.from({ length: 9 }, (_, n) => `o${n}`);
+    const tr = refusing((batch) => (batch.includes("o5") ? [422, "bad"] : null));
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr));
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [8, 0, 1]);
+  });
+
+  it("drops each record of a batch refused whole and sends nothing", async () => {
+    const root = tmp();
+    const tr = refusing(() => [400, "bad body"]);
+    seed(root, ["a", "b", "c"]);
+    const counts = await settle(uploaderFor(root, tr));
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [0, 0, 3]);
+    assert.deepEqual(pending(root), []);
+    assert.deepEqual(tr.outcomes, []);
+  });
+
+  for (const status of [401, 404, 405, 410]) {
+    it(`drops nothing on a ${status}: the route, not the records`, async () => {
+      const root = tmp();
+      const warnings = [];
+      const tr = refusing(() => [status, "Not Found"]);
+      seed(root, ["a", "b", "c"]);
+      const u = uploaderFor(root, tr, { warnings });
+      const counts = await settle(u);
+      assert.equal(pending(root).length, 3);
+      assert.deepEqual(
+        [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+        [0, 3, 0]);
+      assert.deepEqual(tr.tried, [["a", "b", "c"]], "one try, not a bisection");
+      assert.ok(warnings.some((w) => w.includes(`HTTP ${status}`)));
+      assert.equal(u.mayUpload, true, "not a consent refusal");
+    });
+  }
+
+  it("counts each unsent outcome once after a blip and then a 403", async () => {
+    const root = tmp();
+    const total = PRODUCTION_OUTCOME_BATCH_MAX_ITEMS + 3;
+    seed(root, Array.from({ length: total }, (_, n) => `o${n}`));
+    const calls = [];
+    const tr = fakeTransport();
+    tr.reportOutcomes = async (_agent, outcomes) => {
+      calls.push(outcomes.length);
+      if (calls.length === 1) throw new TransportError("connection reset");
+      throw new TransportError("POST /outcomes -> HTTP 403: capture is off",
+                               { statusCode: 403 });
+    };
+    const u = uploaderFor(root, tr);
+    const counts = await settle(u);
+    assert.deepEqual(calls, [PRODUCTION_OUTCOME_BATCH_MAX_ITEMS, 3]);
+    assert.deepEqual([counts.outcomesSent, counts.outcomesFailed], [0, total]);
+    assert.equal(pending(root).length, total);
   });
 });
 
