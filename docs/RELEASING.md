@@ -6,6 +6,14 @@ this README's figures.
 
 **[percepteye-ai/agent-flywheel → docs/RELEASING.md](https://github.com/percepteye-ai/agent-flywheel/blob/main/docs/RELEASING.md)**
 
+- **§1a is the Mission Control gate, and no tag goes out without it.** It
+  checks that the Mission Control the release targets publishes at least the
+  customer contract `src/customer-api.js` declares (`CUSTOMER_CONTRACT_VERSION`,
+  read off `GET /api/v2/contract`'s `info.version`) and answers every Flywheel
+  route this release calls, `POST /api/flywheel/v1/outcomes` among them, as a
+  route. Run its Node command from this repository's root; it exits non-zero
+  naming what is missing. Tagged before that route was deployed, every
+  reported outcome would have been refused for a week and then dropped.
 - **§1** covers the checks before any release. That includes re-syncing
   `schema/flywheel-1.json` and the four figures from the Python repository,
   and merging this repository's PR first whenever either changed.
