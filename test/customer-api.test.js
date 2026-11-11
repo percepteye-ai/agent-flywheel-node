@@ -52,6 +52,8 @@ describe("customer api", () => {
       "opsd_teacher_preflight_no_evidence_decisions", "training_diverged_at_lr",
       "training_unhealthy", "training_pool_cannot_train_objective",
       "opsd_chosen_model_not_trainable", "hillclimb_base_model_invalid",
+      "base_model_unresolvable", "destination_algorithm_unsupported",
+      "provider_checkpoint_not_owned",
     ]);
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
@@ -63,6 +65,7 @@ describe("customer api", () => {
     assert.deepEqual([...AGENT_REFUSAL_CODES], [
       "practice_rollouts_not_enabled", "practice_needs_a_training_process",
       "model_content_capture_not_enabled", "flywheel_no_task_source",
+      "flywheel_product_undeclared", "invalid_flywheel_spec",
     ]);
   });
 
@@ -247,6 +250,11 @@ describe("customer api", () => {
       practice_needs_a_training_process: 422,
       model_content_capture_not_enabled: 422,
       flywheel_no_task_source: 422,
+      flywheel_product_undeclared: 422,
+      invalid_flywheel_spec: 422,
+      base_model_unresolvable: 422,
+      destination_algorithm_unsupported: 422,
+      provider_checkpoint_not_owned: 403,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
       ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];
