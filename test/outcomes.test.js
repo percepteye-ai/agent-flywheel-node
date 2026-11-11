@@ -21,6 +21,7 @@ import {
   createTurnCapture,
 } from "../src/capture.js";
 import { TransportError } from "../src/errors.js";
+import { ControlPlaneClient } from "../src/http.js";
 import * as plugin from "../src/index.js";
 import { AttachTransport } from "../src/transport.js";
 import { recordTurnText, turnDir } from "../src/turns.js";
@@ -68,6 +69,27 @@ function uploaderFor(root, transport, { mayUpload = true, warnings = [] } = {}) 
   });
   u.setVerdict({ mayUpload, reason: mayUpload ? null : "opt-in per agent" });
   return u;
+}
+
+/**
+ * The REAL `ControlPlaneClient` and `AttachTransport`, answered in-process:
+ * `routes` maps "METHOD /path" to `[status, body]` or to a function of the
+ * parsed request body returning one. Anything else is 200 `{}`. `seen`
+ * records every request as "METHOD /path".
+ */
+function overHttp(routes) {
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    const key = `${init.method} ${new URL(url).pathname}`;
+    seen.push(key);
+    let answer = routes[key] ?? [200, {}];
+    if (typeof answer === "function") answer = answer(JSON.parse(init.body));
+    const [status, body] = answer;
+    return new Response(JSON.stringify(body), {
+      status, headers: { "content-type": "application/json" } });
+  };
+  const client = new ControlPlaneClient("https://cp.invalid", "pefw_x", { fetchImpl });
+  return { transport: new AttachTransport(client, { agentId: "a1" }), seen };
 }
 
 /** Queue without the kicked flush racing the test's own. */
@@ -328,6 +350,78 @@ describe("reportOutcome: consent not yet known", () => {
     assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
     u.setVerdict({ mayUpload: false, reason: "opt-in per agent" });
     assert.equal(u.reportOutcome("resolved", { turnId: "t1" }), null);
+  });
+
+  // A 401, 403 or 404 on the verdict read, or an answer with no verdict in
+  // it, will be said again to every read: it is an answer, and it is no. Read
+  // as "unknown", every outcome reported was kept on disk for good and every
+  // report cost another read. Through the REAL client.
+  for (const [name, answer] of [
+    ["401", [401, { detail: "invalid key" }]],
+    ["403", [403, { detail: "this key may not read capture" }]],
+    ["404", [404, { detail: "Not Found" }]],
+    ["no-capture-block", [200, { agent_id: "a1" }]],
+  ]) {
+    it(`ends the waiting on a definitive verdict read (${name})`, async () => {
+      const root = tmp();
+      const { transport, seen } = overHttp({ "GET /agents/a1/capture": answer });
+      const u = createTurnUploader({ transport, agentId: "a1", root });
+      assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
+      await settle(u);
+      assert.ok(seen.includes("GET /agents/a1/capture"));
+      assert.equal(u.reportOutcome("reopened", { turnId: "t1" }), null,
+                   "a definitive answer is no longer 'unknown'");
+      assert.match(u.refusal, /did not grant/);
+      if (answer[0] !== 200) assert.match(u.refusal, new RegExp(`HTTP ${answer[0]}`));
+      assert.equal(pending(root).length, 1, "kept like a refused turn");
+    });
+  }
+
+  it("expires an outcome kept while consent is unknown", async () => {
+    // The week's expiry ran inside the upload, which runs only once consent
+    // is yes: an outcome kept while the answer never came stayed forever.
+    const root = tmp();
+    const warnings = [];
+    const u = createTurnUploader({
+      transport: fakeTransport(), agentId: "a1", root,
+      logger: { warn: (m) => warnings.push(m) },
+    });
+    u.reportOutcome("resolved", { turnId: "t1" });
+    await settle(u);
+    const [stale] = pending(root);
+    const longAgo = (Date.now() - OUTCOME_MAX_AGE_MS - 60_000) / 1000;
+    utimesSync(join(root, stale), longAgo, longAgo);
+    await settle(u);
+    assert.equal(u.mayUpload, false);
+    assert.deepEqual(pending(root), []);
+    assert.ok(warnings.some((w) => w.includes("for a week")));
+  });
+
+  it("keeps at most so many outcomes while consent is unknown, oldest dropped", async () => {
+    const root = tmp();
+    const warnings = [];
+    const tr = fakeTransport();
+    let later = {};
+    tr.captureCurrent = async () => later;
+    const u = createTurnUploader({
+      transport: tr, agentId: "a1", root, maxOutcomesWhileUnknown: 3,
+      logger: { warn: (m) => warnings.push(m) },
+    });
+    for (let n = 0; n < 5; n += 1) {
+      u.reportOutcome("resolved", { turnId: "t1", outcomeId: `o${n}` });
+      const when = (Date.now() - 1_000_000 + n * 1000) / 1000;
+      for (const name of pending(root)) {
+        const body = JSON.parse(readFileSync(join(root, name), "utf8"));
+        if (body.outcome_id === `o${n}`) utimesSync(join(root, name), when, when);
+      }
+    }
+    const kept = pending(root).map((name) =>
+      JSON.parse(readFileSync(join(root, name), "utf8")).outcome_id).sort();
+    assert.deepEqual(kept, ["o2", "o3", "o4"]);
+    assert.ok(warnings.some((w) => w.includes("oldest first")));
+    later = { capture: { turns: true } };
+    await settle(u);
+    assert.deepEqual(tr.outcomes.map((o) => o.outcome_id).sort(), ["o2", "o3", "o4"]);
   });
 });
 

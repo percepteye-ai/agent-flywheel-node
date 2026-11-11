@@ -253,6 +253,27 @@ export async function declareRulebook({
   return null;
 }
 
+/**
+ * Statuses on `GET /agents/{id}/capture` that are the control plane's answer,
+ * not a blip: a key it does not accept (401), a key or agent it will not
+ * answer for (403), no such agent or no such route (404 -- a control plane
+ * older than the read). The Python SDK's `CAPTURE_READ_REFUSALS`.
+ */
+export const CAPTURE_READ_REFUSALS = new Set([401, 403, 404]);
+
+/**
+ * The verdict-read body for an answer that grants nothing: an answered
+ * refusal (`capture.turns` false) whose reason names what the control plane
+ * said, so `captureVerdict` reads it as an answer. The Python SDK's
+ * `capture_read_refusal`, word for word.
+ */
+export function captureReadRefusal(what) {
+  return { capture: { turns: false, reason:
+    "the control plane did not grant this agent production capture when " +
+    `asked (${what}), so nothing is uploaded. Turns are still captured ` +
+    "locally." } };
+}
+
 /** Bounded, header-safe idempotency identity for an opaque rollout id. */
 function rolloutOperationKey(operation, rollout) {
   const rolloutId = rollout?.rolloutId;
@@ -459,15 +480,32 @@ export class AttachTransport {
    * because keeping the current policy is the safe answer there -- the two
    * look alike and their safe directions are opposite, which is why this one
    * says so.
+   *
+   * A DEFINITIVE ANSWER IS AN ANSWER, though. A 401, 403 or 404 on this read,
+   * or a 2xx body with no `capture` block in it, is the control plane
+   * deciding, not a blip: it will say the same thing to the next read.
+   * Resolved as `{}` it read as "consent unknown", so an outcome reported
+   * meanwhile was kept on disk for good and every report re-asked. Each
+   * resolves to an answered refusal naming what was said
+   * (`captureReadRefusal`); only a failure with no answer, or a status outside
+   * `CAPTURE_READ_REFUSALS`, is `{}`. The Python SDK's `capture_current`.
    */
   async captureCurrent(agentId) {
     if (productionAgentIdentifier(agentId) === null) return {};
+    let body;
     try {
-      return (await this._c.request(
-        "GET", `/agents/${encodeURIComponent(agentId)}/capture`)) || {};
-    } catch {
+      body = await this._c.request(
+        "GET", `/agents/${encodeURIComponent(agentId)}/capture`);
+    } catch (err) {
+      if (err instanceof TransportError
+          && CAPTURE_READ_REFUSALS.has(err.statusCode)) {
+        return captureReadRefusal(String(err.message));
+      }
       return {};
     }
+    const cap = body?.capture;
+    if (cap && typeof cap === "object" && !Array.isArray(cap)) return body;
+    return captureReadRefusal("it answered with no capture verdict in the body");
   }
 
   /**

@@ -605,6 +605,13 @@ export const OUTCOME_FILE_SUFFIX = ".json";
  * `/outcomes` route yet) must not grow for the life of a deployment.
  */
 export const OUTCOME_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+/**
+ * How many outcomes are kept while consent is still UNKNOWN (the verdict read
+ * has not been answered yet). Bounded by count as well as age, because a week
+ * of a busy agent's reports is not a small outbox; past it the oldest go, out
+ * loud. The Python SDK's `_OUTCOME_MAX_KEPT_UNANSWERED`.
+ */
+export const OUTCOME_MAX_KEPT_UNANSWERED = 1000;
 
 /** Where the outcome with this id waits: a digest of the id, never the id. */
 export function outcomeFile(root, outcomeId) {
@@ -681,6 +688,7 @@ function sortedJson(wire) {
 export function createTurnUploader({
   transport, agentId, root, logger = null, flushEvery = FLUSH_EVERY,
   answersExpected = true,
+  maxOutcomesWhileUnknown = OUTCOME_MAX_KEPT_UNANSWERED,
 }) {
   let since = 0;
   let inFlight = false;
@@ -845,7 +853,9 @@ export function createTurnUploader({
    * sent on exactly the terms a turn is, and nothing is kept locally for an
    * agent that may not send it. While the answer is still UNKNOWN (the
    * verdict read failed on a blip) the outcome is kept, and the flush kicked
-   * here asks again; it is sent once the answer is yes.
+   * here asks again; it is sent once the answer is yes. At most
+   * `maxOutcomesWhileUnknown` are kept while it is unknown; past that the
+   * oldest are dropped, with a warning.
    * Returns the outcome's id once queued, else `null`; the upload itself
    * happens off the caller's path (`flush`, kicked here and not awaited).
    */
@@ -861,51 +871,87 @@ export function createTurnUploader({
       // Capture costs the observation, never the caller.
       return null;
     }
+    if (!mayUpload) capUnansweredOutcomes();
     flush({
       includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
     }).catch(() => {});
     return wire.outcome_id;
   }
 
-  /** The outcomes waiting on disk, in file-name order; week-old ones dropped. */
-  function pendingOutcomes() {
-    let names;
+  /** The outcome files waiting in the capture root, in name order. */
+  function outcomeFiles() {
     try {
-      names = readdirSync(root).filter((n) =>
+      return readdirSync(root).filter((n) =>
         n.startsWith(OUTCOME_FILE_PREFIX) && n.endsWith(OUTCOME_FILE_SUFFIX))
-        .sort();
+        .sort().map((name) => join(root, name)).filter((path) => {
+          try { return statSync(path).isFile(); } catch { return false; }
+        });
     } catch {
       return [];
     }
-    const out = [];
+  }
+
+  /**
+   * While consent is UNKNOWN, keep at most `maxOutcomesWhileUnknown`
+   * outcomes: the oldest (by when they were written, then by name) go, with a
+   * warning. The Python SDK's `_cap_unanswered_outcomes`.
+   */
+  function capUnansweredOutcomes() {
+    const files = outcomeFiles();
+    const excess = files.length - maxOutcomesWhileUnknown;
+    if (excess <= 0) return;
+    const age = (path) => {
+      try { return statSync(path).mtimeMs; } catch { return 0; }
+    };
+    const oldest = files.map((path) => [age(path), path])
+      .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+      .slice(0, excess);
+    let dropped = 0;
+    for (const [, path] of oldest) {
+      try { rmSync(path); dropped += 1; } catch { /* kept */ }
+    }
+    if (dropped) {
+      logger?.warn?.(
+        `[agent-flywheel] ${dropped} reported outcome(s) were dropped, ` +
+        `oldest first: the control plane has not yet said whether this ` +
+        `agent may upload them, and at most ${maxOutcomesWhileUnknown} are ` +
+        `kept while it has not.`);
+    }
+  }
+
+  /**
+   * Drop the outcomes undelivered for a week, out loud; the rest, in name
+   * order. Runs on EVERY flush, whatever consent says: the bound used to live
+   * inside the upload, which runs only once consent is yes, so an outcome
+   * kept while the answer was unknown -- or after a refusal -- never expired.
+   * The Python SDK's `_expire_outcomes`.
+   */
+  function expireOutcomes() {
+    const kept = [];
     let expired = 0;
-    for (const name of names) {
-      const path = join(root, name);
+    for (const path of outcomeFiles()) {
       try {
-        const st = statSync(path);
-        if (!st.isFile()) continue;
-        if (Date.now() - st.mtimeMs > OUTCOME_MAX_AGE_MS) {
+        if (Date.now() - statSync(path).mtimeMs > OUTCOME_MAX_AGE_MS) {
           rmSync(path, { force: true });
           expired += 1;
           continue;
         }
-        out.push({ path, wire: productionOutcome(
-          JSON.parse(readFileSync(path, "utf8"))) });
       } catch {
-        // Unreadable or not ours to send; one file costs that file.
+        continue;
       }
+      kept.push(path);
     }
     if (expired) {
       logger?.warn?.(
         `[agent-flywheel] ${expired} reported outcome(s) could not be ` +
         `delivered for a week and were dropped.`);
     }
-    return out;
+    return kept;
   }
 
   /**
-   * Upload the outcomes waiting on disk. Called inside `flush`, after its
-   * consent gate. THE PYTHON SDK'S `Attachment._flush_outcomes`, rule for
+   * Upload the outcomes waiting on disk (`files`, already past
+   * `expireOutcomes`). Called inside `flush`, after its consent gate. THE PYTHON SDK'S `Attachment._flush_outcomes`, rule for
    * rule. THE TURNS' RULES: an acknowledged batch is deleted; a 403 is the
    * control plane's decision, so sending stops and the outcomes stay; a blip
    * leaves the batch for the next flush. An outcome refused BY NAME inside an
@@ -923,8 +969,16 @@ export function createTurnUploader({
    * `outcomesFailed` counts each outcome still on disk once;
    * `outcomesDropped` the records the control plane refused.
    */
-  async function flushOutcomes() {
-    const waiting = pendingOutcomes();
+  async function flushOutcomes(files) {
+    const waiting = [];
+    for (const path of files) {
+      try {
+        waiting.push({ path, wire: productionOutcome(
+          JSON.parse(readFileSync(path, "utf8"))) });
+      } catch {
+        // Unreadable or not ours to send; one file costs that file.
+      }
+    }
     if (!waiting.length) return {};
     const queue = [];
     for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
@@ -1005,13 +1059,20 @@ export function createTurnUploader({
    * ONE SEAM FOR BOTH, because the consent question is one question. The
    * counts are the turns'; `outcomesSent` and `outcomesFailed` are added only
    * when outcomes were waiting.
+   *
+   * THE WEEK'S EXPIRY RUNS ON EVERY FLUSH, consent or not
+   * (`expireOutcomes`): an outcome kept while the answer is unknown, or
+   * after a refusal, is bounded like any other.
    */
   async function flush(options = {}) {
     if (inFlight) return { sent: 0, skipped: true };
     inFlight = true;
     try {
       const counts = await flushTurns(options);
-      if (mayUpload) Object.assign(counts, await flushOutcomes());
+      const waiting = expireOutcomes();
+      if (mayUpload && waiting.length) {
+        Object.assign(counts, await flushOutcomes(waiting));
+      }
       return counts;
     } finally {
       inFlight = false;
