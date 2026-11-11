@@ -1,6 +1,6 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.50.0), case for case with the Python
+ * The customer API reads (contract 1.51.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigurationError } from "../src/errors.js";
 import {
-  ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CYBER_REFUSAL_CODES, CustomerApiClient,
+  AGENT_REFUSAL_CODES, ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CYBER_REFUSAL_CODES, CustomerApiClient,
   CustomerContractTooOld, CustomerRefusal, PROMPT_RUN_REFUSAL_CODES, RUN_LIST_REFUSAL_CODES,
   TRAINING_REFUSAL_CODES, customerApiBase,
 } from "../src/customer-api.js";
@@ -26,8 +26,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.50.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.50.0");
+  it("pins contract 1.51.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.51.0");
     assert.deepEqual([...ATTACK_REFUSAL_CODES], [
       "attack_set_is_sealed",
       "attack_resistance_measuring",
@@ -59,6 +59,10 @@ describe("customer api", () => {
       "recorded_decisions_too_few", "recorded_prompt_mismatch",
       "prompt_objective_unprepared", "prompt_evolution_refused",
       "prompt_model_unreachable",
+    ]);
+    assert.deepEqual([...AGENT_REFUSAL_CODES], [
+      "practice_rollouts_not_enabled", "practice_needs_a_training_process",
+      "model_content_capture_not_enabled", "flywheel_no_task_source",
     ]);
   });
 
@@ -237,9 +241,15 @@ describe("customer api", () => {
       cyber_attack_reward_not_comparable: 422,
       opsd_chosen_model_not_trainable: 422,
       hillclimb_base_model_invalid: 422,
+      // 1.51.0: the hillclimb door's refusals of an agent's switch, raised
+      // before 1.51.0 published them.
+      practice_rollouts_not_enabled: 422,
+      practice_needs_a_training_process: 422,
+      model_content_capture_not_enabled: 422,
+      flywheel_no_task_source: 422,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
-      ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES];
+      ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];
     assert.equal(new Set(known).size, known.length, "a code is in two groups");
     assert.deepEqual([...known].sort(), Object.keys(expected).sort());
     for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);

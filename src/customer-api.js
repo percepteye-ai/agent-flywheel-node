@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.50.0).
+ * Reads of the customer-automation API (customer contract 1.51.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -22,7 +22,7 @@ import { DEFAULT_CONTROL_PLANE } from "./config.js";
 import { ConfigurationError } from "./errors.js";
 import { SDK_VERSION } from "./http.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.50.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.51.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -96,6 +96,20 @@ export const TRAINING_REFUSAL_CODES = Object.freeze([
   "training_pool_cannot_train_objective",
   "opsd_chosen_model_not_trainable",
   "hillclimb_base_model_invalid",
+]);
+/**
+ * Why a round with your agent is refused before anything is spent (1.51.0;
+ * Mission Control raised each before it published them): its "Allow practice
+ * runs" switch is off, no `serve()` process runs it with
+ * `PERCEPTEYE_AGENT_MODE=training`, its model-content capture is off for a
+ * round read from its capture, or it gives practice nothing to write tasks
+ * from.
+ */
+export const AGENT_REFUSAL_CODES = Object.freeze([
+  "practice_rollouts_not_enabled",
+  "practice_needs_a_training_process",
+  "model_content_capture_not_enabled",
+  "flywheel_no_task_source",
 ]);
 
 const FLYWHEEL_SUFFIX = "/api/flywheel/v1";
