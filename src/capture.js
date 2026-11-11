@@ -612,6 +612,14 @@ export const OUTCOME_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
  * loud. The Python SDK's `_OUTCOME_MAX_KEPT_UNANSWERED`.
  */
 export const OUTCOME_MAX_KEPT_UNANSWERED = 1000;
+/**
+ * How many requests one flush may spend splitting refused `/outcomes`
+ * batches. Isolating one bad record of 64 costs 12; the bound stops a refusal
+ * the split did not recognise as whole-batch from costing two requests per
+ * outcome, each charged against the control plane's rate limit. The Python
+ * SDK's `_OUTCOME_SPLIT_MAX_REQUESTS`.
+ */
+export const OUTCOME_SPLIT_MAX_REQUESTS = 32;
 
 /** Where the outcome with this id waits: a digest of the id, never the id. */
 export function outcomeFile(root, outcomeId) {
@@ -702,6 +710,9 @@ export function createTurnUploader({
   let consentRefused = false;
   let mayCaptureModelContent = false;
   let modelContentReason = null;
+  // The cause of the last whole-batch outcome refusal said out loud, so it is
+  // said once (`warnWholeBatchRefusal`).
+  let outcomeBatchRefusalSaid = null;
 
   function uploadedIds() {
     try {
@@ -951,20 +962,29 @@ export function createTurnUploader({
 
   /**
    * Upload the outcomes waiting on disk (`files`, already past
-   * `expireOutcomes`). Called inside `flush`, after its consent gate. THE PYTHON SDK'S `Attachment._flush_outcomes`, rule for
-   * rule. THE TURNS' RULES: an acknowledged batch is deleted; a 403 is the
-   * control plane's decision, so sending stops and the outcomes stay; a blip
-   * leaves the batch for the next flush. An outcome refused BY NAME inside an
-   * acknowledged batch would be refused again, so it is dropped and said out
-   * loud.
+   * `expireOutcomes`). Called inside `flush`, after its consent gate. THE
+   * PYTHON SDK'S `Attachment._flush_outcomes`, rule for rule. THE TURNS'
+   * RULES: an acknowledged batch is deleted; a 403 is the control plane's
+   * decision, so sending stops and the outcomes stay; a blip leaves the batch
+   * for the next flush. An outcome refused BY NAME inside an acknowledged
+   * batch would be refused again, so it is dropped and said out loud.
    *
-   * A 4xx ABOUT THE BATCH IS FINAL FOR THAT BATCH (`outcomeBatchRefused`):
-   * it is split in halves until the refused records stand alone, the good
-   * ones are sent and each bad one is dropped with a warning naming the
-   * control plane's own cause. It used to be retried for a week and then
-   * deleted with up to 63 good outcomes beside it. A 4xx about the ROUTE or
-   * the KEY (`outcomeRouteRefused`: 401, 404, 405, 410) is not the records'
-   * fault: sending stops for this flush and they stay, said out loud.
+   * A 4xx ABOUT THE RECORDS IS FINAL FOR THEM (`outcomeBatchRefused`). A
+   * refused batch is split in halves, and BOTH halves are tried before either
+   * is split again: the good ones are sent, and each bad one, once it stands
+   * alone, is dropped with a warning naming the control plane's own cause.
+   *
+   * Unless both halves are refused with the same status and the same words:
+   * then the refusal was about THE BATCH, not a record in it -- a 422 from a
+   * control plane on another contract minor, a proxy's 400 or 413 -- and
+   * splitting further would drop every outcome at two requests each. Sending
+   * stops for this flush, they stay on disk (the week's expiry still
+   * applies), and the cause is said once. Splitting is also bounded per flush
+   * (`OUTCOME_SPLIT_MAX_REQUESTS`); what the bound leaves stays for the next.
+   *
+   * A 4xx about the ROUTE or the KEY (`outcomeRouteRefused`: 401, 404, 405,
+   * 410) is not the records' fault either: sending stops for this flush and
+   * they stay, said out loud.
    *
    * `outcomesFailed` counts each outcome still on disk once;
    * `outcomesDropped` the records the control plane refused.
@@ -980,11 +1000,15 @@ export function createTurnUploader({
       }
     }
     if (!waiting.length) return {};
+    // Every GROUP still to send, in order: a batch on its own, or the two
+    // halves of one refused batch, which are tried together. A refused half's
+    // own halves go back to the front.
     const queue = [];
     for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
-      queue.push(waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS));
+      queue.push([waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS)]);
     }
-    const left = () => queue.reduce((n, b) => n + b.length, 0);
+    const count = (group) => group.reduce((n, b) => n + b.length, 0);
+    const left = () => queue.reduce((n, group) => n + count(group), 0);
     const forget = (batch) => {
       for (const { path } of batch) {
         try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
@@ -992,55 +1016,88 @@ export function createTurnUploader({
     };
     let sent = 0;
     let failed = 0;
+    let splitRequests = 0;
     const dropped = [];
-    while (queue.length) {
-      const batch = queue.shift();
-      let reply;
-      try {
-        reply = await transport.reportOutcomes(agentId, batch.map((o) => o.wire));
-      } catch (err) {
-        const refused = captureRefusal(err);
-        if (refused !== null) {
-          refuseUpload(refused);
-          failed += batch.length + left();
-          queue.length = 0;
-          break;
-        }
-        const status = err?.statusCode ?? null;
-        if (outcomeBatchRefused(status)) {
-          if (batch.length === 1) {
-            forget(batch);
-            dropped.push(String(err?.message ?? err));
-          } else {
-            const half = Math.floor(batch.length / 2);
-            queue.unshift(batch.slice(0, half), batch.slice(half));
+    flushing: while (queue.length) {
+      const group = queue.shift();
+      const halves = group.length === 2;
+      if (halves && splitRequests + 2 > OUTCOME_SPLIT_MAX_REQUESTS) {
+        failed += count(group) + left();
+        queue.length = 0;
+        logger?.warn?.(
+          `[agent-flywheel] the control plane refused reported outcomes, ` +
+          `and finding which ones reached ${OUTCOME_SPLIT_MAX_REQUESTS} ` +
+          `requests in this flush; the rest stay on disk for a later flush.`);
+        break;
+      }
+      const refused = [];
+      for (let index = 0; index < group.length; index += 1) {
+        const batch = group[index];
+        if (halves) splitRequests += 1;
+        let reply;
+        try {
+          reply = await transport.reportOutcomes(agentId, batch.map((o) => o.wire));
+        } catch (err) {
+          // Kept by a stop: this half, the half not tried yet, a half
+          // already refused beside it, the queue.
+          const untried = count(group.slice(index + 1))
+            + refused.reduce((n, r) => n + r.batch.length, 0);
+          const consent = captureRefusal(err);
+          if (consent !== null) {
+            refuseUpload(consent);
+            failed += batch.length + untried + left();
+            queue.length = 0;
+            break flushing;
           }
+          const status = err?.statusCode ?? null;
+          if (outcomeBatchRefused(status)) {
+            refused.push({ batch, status, cause: String(err?.message ?? err) });
+            continue;
+          }
+          if (outcomeRouteRefused(status)) {
+            failed += batch.length + untried + left();
+            queue.length = 0;
+            logger?.warn?.(
+              `[agent-flywheel] the control plane did not take reported ` +
+              `outcomes (${err?.message ?? err}); they stay on disk and are sent again on a ` +
+              `later flush.`);
+            break flushing;
+          }
+          failed += batch.length;
           continue;
         }
-        if (outcomeRouteRefused(status)) {
-          failed += batch.length + left();
-          queue.length = 0;
+        forget(batch);
+        sent += batch.length;
+        const refusedByName = [...new Set(
+          (Array.isArray(reply?.outcomes) ? reply.outcomes : [])
+            .filter((r) => r?.accepted === false)
+            .map((r) => String(r.error || "refused")),
+        )].sort();
+        if (refusedByName.length) {
           logger?.warn?.(
-            `[agent-flywheel] the control plane did not take reported ` +
-            `outcomes (${err?.message ?? err}); they stay on disk and are ` +
-            `sent again on a later flush.`);
-          break;
+            `[agent-flywheel] the control plane did not record some reported ` +
+            `outcomes (${refusedByName.join(", ")}); they will not be sent again.`);
         }
-        failed += batch.length;
-        continue;
       }
-      forget(batch);
-      sent += batch.length;
-      const refusedByName = [...new Set(
-        (Array.isArray(reply?.outcomes) ? reply.outcomes : [])
-          .filter((r) => r?.accepted === false)
-          .map((r) => String(r.error || "refused")),
-      )].sort();
-      if (refusedByName.length) {
-        logger?.warn?.(
-          `[agent-flywheel] the control plane did not record some reported ` +
-          `outcomes (${refusedByName.join(", ")}); they will not be sent again.`);
+      if (halves && refused.length === 2
+          && refused[0].status === refused[1].status
+          && refused[0].cause === refused[1].cause) {
+        failed += refused[0].batch.length + refused[1].batch.length + left();
+        queue.length = 0;
+        warnWholeBatchRefusal(refused[0].cause);
+        break;
       }
+      const split = [];
+      for (const { batch, cause } of refused) {
+        if (batch.length === 1) {
+          forget(batch);
+          dropped.push(cause);
+        } else {
+          const half = Math.floor(batch.length / 2);
+          split.push([batch.slice(0, half), batch.slice(half)]);
+        }
+      }
+      queue.unshift(...split);
     }
     if (dropped.length) {
       logger?.warn?.(
@@ -1052,6 +1109,22 @@ export function createTurnUploader({
       outcomesSent: sent, outcomesFailed: failed,
       outcomesDropped: dropped.length,
     };
+  }
+
+  /**
+   * Say ONCE per cause that the control plane refuses whole outcome batches:
+   * it holds for every flush until one side is upgraded, and a warning per
+   * flush would be a week of the same line. The Python SDK's
+   * `_warn_whole_batch_refusal`.
+   */
+  function warnWholeBatchRefusal(cause) {
+    if (cause === outcomeBatchRefusalSaid) return;
+    outcomeBatchRefusalSaid = cause;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane refused whole batches of reported ` +
+      `outcomes (${cause}), which is about the batch, not a record in it; ` +
+      `they stay on disk, are sent again on a later flush, and are dropped ` +
+      `only after a week undelivered.`);
   }
 
   /**

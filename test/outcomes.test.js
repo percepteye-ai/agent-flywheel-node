@@ -17,8 +17,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  createTurnUploader, OUTCOME_MAX_AGE_MS, pruneTurns, registerTurnCapture,
-  createTurnCapture,
+  createTurnUploader, OUTCOME_MAX_AGE_MS, OUTCOME_SPLIT_MAX_REQUESTS,
+  pruneTurns, registerTurnCapture, createTurnCapture,
 } from "../src/capture.js";
 import { TransportError } from "../src/errors.js";
 import { ControlPlaneClient } from "../src/http.js";
@@ -649,16 +649,88 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
       [8, 0, 1]);
   });
 
-  it("drops each record of a batch refused whole and sends nothing", async () => {
+  it("keeps every outcome of a batch refused whole, at three requests", async () => {
+    // Every part of the batch refused alike -- the same status, the same
+    // words -- is a refusal of THE BATCH: a 422 from a control plane on
+    // another contract minor, a proxy's 400 or 413. It used to be bisected to
+    // singles and every outcome dropped, 64 outcomes costing 127 requests.
     const root = tmp();
-    const tr = refusing(() => [400, "bad body"]);
-    seed(root, ["a", "b", "c"]);
+    const warnings = [];
+    const ids = Array.from({ length: PRODUCTION_OUTCOME_BATCH_MAX_ITEMS },
+                           (_, n) => `o${String(n).padStart(2, "0")}`);
+    const tr = refusing(() => [422, "outcomes.0.note: Extra inputs are not permitted"]);
+    seed(root, ids);
+    const u = uploaderFor(root, tr, { warnings });
+    const counts = await settle(u);
+    const again = await settle(u);
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [0, ids.length, 0]);
+    assert.equal(again.outcomesFailed, ids.length);
+    assert.equal(pending(root).length, ids.length, "nothing is dropped");
+    const [batch] = tr.tried;
+    const half = batch.length / 2;
+    assert.deepEqual(tr.tried, [batch, batch.slice(0, half), batch.slice(half),
+                                batch, batch.slice(0, half), batch.slice(half)],
+                     "the batch and its two halves, per flush");
+    const said = warnings.filter((w) => w.includes("whole batches"));
+    assert.equal(said.length, 1, "said once, not once per flush");
+    assert.ok(said[0].includes("HTTP 422"));
+    assert.ok(!warnings.some((w) => w.includes("were dropped")));
+    assert.deepEqual(tr.outcomes, []);
+  });
+
+  it("still isolates two records refused for different causes", async () => {
+    const root = tmp();
+    const ids = Array.from({ length: 8 }, (_, n) => `o${n}`);
+    const tr = refusing((batch) => {
+      if (batch.includes("o1") && batch.includes("o6")) {
+        return [422, "outcomes: two records are invalid"];
+      }
+      if (batch.includes("o1")) return [422, "o1: value must be finite"];
+      if (batch.includes("o6")) return [409, "o6: replayed with different content"];
+      return null;
+    });
+    seed(root, ids);
     const counts = await settle(uploaderFor(root, tr));
     assert.deepEqual(
       [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
-      [0, 0, 3]);
+      [6, 0, 2]);
     assert.deepEqual(pending(root), []);
-    assert.deepEqual(tr.outcomes, []);
+  });
+
+  it("counts the half refused beside a stop", async () => {
+    // One half refused for a record, the other answered with a 403: every
+    // outcome is still on disk, and each is counted once.
+    const root = tmp();
+    const ids = Array.from({ length: 8 }, (_, n) => `o${n}`);
+    const tr = refusing((batch) => (batch.includes("o1")
+      ? [422, "o1: value must be finite"]
+      : [403, "production capture is opt-in per agent"]));
+    seed(root, ids);
+    const u = uploaderFor(root, tr);
+    const counts = await settle(u);
+    assert.equal(u.mayUpload, false);
+    assert.equal(pending(root).length, ids.length);
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [0, ids.length, 0]);
+  });
+
+  it("bounds the requests one flush spends splitting", async () => {
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: PRODUCTION_OUTCOME_BATCH_MAX_ITEMS },
+                           (_, n) => `o${String(n).padStart(2, "0")}`);
+    const tr = refusing((batch) => [422, `${batch[0]}: refused`]);
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr, { warnings }));
+    assert.ok(tr.tried.length <= 1 + OUTCOME_SPLIT_MAX_REQUESTS, tr.tried.length);
+    assert.equal(counts.outcomesSent, 0);
+    assert.equal(counts.outcomesFailed + counts.outcomesDropped, ids.length);
+    assert.ok(counts.outcomesFailed > 0);
+    assert.equal(pending(root).length, counts.outcomesFailed);
+    assert.ok(warnings.some((w) => w.includes(`${OUTCOME_SPLIT_MAX_REQUESTS} requests`)));
   });
 
   for (const status of [401, 404, 405, 410]) {
