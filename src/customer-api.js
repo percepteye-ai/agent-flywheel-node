@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.31.0).
+ * Reads of the customer-automation API (customer contract 1.50.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -12,12 +12,17 @@
  * name (snake_case there). A refusal's `customerMessage` (1.29.0) is the cause
  * in plain words for a person; `customerWords` is the code's remedy in plain
  * words; `plainWords` is what to show a person. The words are the server's.
+ *
+ * Every read works against any 1.x server from 1.30.0 on. One argument needs a
+ * newer one: `trainingEligibility({ trainingLocation })` needs 1.50.0, and an
+ * older server, which ignores the query and answers for the organization's own
+ * setting, is refused with `CustomerContractTooOld` rather than believed.
  */
 import { DEFAULT_CONTROL_PLANE } from "./config.js";
 import { ConfigurationError } from "./errors.js";
 import { SDK_VERSION } from "./http.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.31.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.50.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -25,14 +30,28 @@ export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
 export const RUN_LIST_REFUSAL_CODES = Object.freeze([
   "launch_uri_outside_org", "run_page_too_deep",
 ]);
+/**
+ * 1.29.0: why a prompt run cannot start (`prompt_optimization` says ahead).
+ * 1.38.0: a prompt-objective hill climb's evolution could not start; 1.39.0:
+ * the customer's own model is unreachable (no stand-in is ever used). The
+ * three 1.40.0 codes (`prompt_box_*`) are not carried: they are the platform's
+ * own prompt-optimization host, the platform's fault, and one names its
+ * serving stack, which this package does not publish.
+ */
 export const PROMPT_RUN_REFUSAL_CODES = Object.freeze([
   "prompt_run_balance_too_small",
   "recorded_prompt_absent",
   "recorded_decisions_too_few",
   "recorded_prompt_mismatch",
+  "prompt_objective_unprepared",
+  "prompt_evolution_refused",
+  "prompt_model_unreachable",
 ]);
-/** 1.30.0: the held-out attack set a promotion is measured on never changes. */
-/** 1.31.0: the attack gate and the attack measurement refuse by name. */
+/**
+ * 1.30.0: the held-out attack set a promotion is measured on never changes.
+ * 1.31.0: the attack gate and the attack measurement refuse by name.
+ * 1.34.0: a person's yes that was not shown an unmeasured attack resistance.
+ */
 export const ATTACK_REFUSAL_CODES = Object.freeze([
   "attack_set_is_sealed",
   "attack_resistance_measuring",
@@ -44,6 +63,39 @@ export const ATTACK_REFUSAL_CODES = Object.freeze([
   "hillclimb_not_found",
   "round_not_found",
   "event_kind_is_the_platforms",
+  "attack_unmeasured_undisclosed",
+]);
+/**
+ * Why a hill climb's cyber choice cannot apply: refused, never downgraded
+ * (1.44.0), and a trainer whose rewards cannot compare attacks (1.46.0).
+ */
+export const CYBER_REFUSAL_CODES = Object.freeze([
+  "cyber_disabled",
+  "cyber_training_disabled",
+  "cyber_needs_training",
+  "cyber_no_training_entry",
+  "cyber_lane_has_no_attack_reward",
+  "hillclimb_security_unknown",
+  "cyber_attack_reward_not_comparable",
+]);
+/**
+ * Why a training run is refused or stopped: the GPU host's prompt fit, the
+ * recipe tokenizer and the teacher gate's evidence (1.32.0); a diverged or
+ * unhealthy train (1.36.0, 1.37.0; `CustomerRefusal.detail` carries the
+ * evidence); a pool that cannot train the objective (1.46.0); a chosen model
+ * that cannot be trained (1.49.0).
+ */
+export const TRAINING_REFUSAL_CODES = Object.freeze([
+  "opsd_prompts_exceed_host",
+  "opsd_recipe_tokenizer_hub_unavailable",
+  "opsd_recipe_tokenizer_refused",
+  "opsd_recipe_tokenizer_platform_fault",
+  "opsd_teacher_preflight_no_evidence_decisions",
+  "training_diverged_at_lr",
+  "training_unhealthy",
+  "training_pool_cannot_train_objective",
+  "opsd_chosen_model_not_trainable",
+  "hillclimb_base_model_invalid",
 ]);
 
 const FLYWHEEL_SUFFIX = "/api/flywheel/v1";
@@ -80,6 +132,12 @@ export class CustomerRefusal extends Error {
     this.customerMessage = text(refusal.customer_message);
     this.customerWords = text(refusal.customer_words);
     this.remediation = text(refusal.remediation);
+    /**
+     * The refusal's own evidence (`Refusal.detail`), such as `waiting_on`,
+     * `host_prompt_fit`, `cause` or `chosen_model`; null when it carries none.
+     */
+    this.detail = refusal.detail && typeof refusal.detail === "object" && !Array.isArray(refusal.detail)
+      ? { ...refusal.detail } : null;
     this.faultOwner = text(refusal.fault_owner);
     this.retryable = typeof refusal.retryable === "boolean" ? refusal.retryable : null;
   }
@@ -87,6 +145,17 @@ export class CustomerRefusal extends Error {
   /** The cause in plain words, else the remedy in plain words, else the message. */
   get plainWords() {
     return this.customerMessage ?? this.customerWords ?? this.refusalMessage;
+  }
+}
+
+/**
+ * The server answered, but on a customer contract older than the one a
+ * requested argument needs, so its answer is not the one asked for.
+ */
+export class CustomerContractTooOld extends ConfigurationError {
+  constructor(message) {
+    super(message);
+    this.name = "CustomerContractTooOld";
   }
 }
 
@@ -146,8 +215,14 @@ export class CustomerApiClient {
   /**
    * GET /runs. With `includePromptEvolutions` each prompt evolution is one row
    * (`prompt_evolution` set) in place of its arms; every run of an evolution
-   * names it in `prompt_evolution_id`. Paging past the server's depth is
-   * refused `run_page_too_deep`: use `startedBefore`.
+   * names it in `prompt_evolution_id`. A run also names what it was admitted
+   * to optimise (`objective`, `security_mode`, `benchmark_eval_set_id`,
+   * 1.42.0), the model it trains (`base_model`, 1.43.0), its trainer
+   * (`algorithm`, 1.46.0) and the run it belongs to (`owner_run_id`, 1.47.0;
+   * null for a run the customer started): one row per run the customer
+   * started, the rest folded under it. A server older than those versions
+   * omits the fields. Paging past the server's depth is refused
+   * `run_page_too_deep`: use `startedBefore`.
    */
   listRuns({
     status, limit, offset, startedAfter, startedBefore, productId,
@@ -163,12 +238,42 @@ export class CustomerApiClient {
 
   /**
    * GET /training/eligibility; `prompt_optimization` says the agent's prompt
-   * path, (1.29.0) `model_under_test` the model a prompt run would test on,
-   * and (1.30.0) `security`: its default, whether it is enabled, each
-   * objective's mode, and `measurement_funding` (always "platform").
+   * path, (1.29.0) `model_under_test` the model a prompt run would test on.
+   * `security` (1.30.0; 1.44.0) is the `default` ("off": cyber is a choice),
+   * whether it is `enabled`, per objective whether cyber is `available` (else
+   * its `refusal`, one of `CYBER_REFUSAL_CODES`), and `measurement_funding`
+   * ("run_quote": the attack arms are on the run's quote). `flash_reinforce`
+   * (1.46.0) is that practice lane's `allowed`, `refusals` and `cost_bound`;
+   * `opsd.trainable_models` (1.49.0) the models a hill climb may choose to
+   * train.
+   *
+   * `trainingLocation` (1.50.0: "platform_pool" or "platform_gpu"; the server
+   * refuses any other) answers for a run trained there instead of at the
+   * organization's own setting; `training_locations` names the place answered
+   * for (`answered_for`), the `default`, and per `options` entry whether it is
+   * `available` (else its `refusal`) and, on our GPUs, `gpu_hosts` and
+   * `gpu_hosts_free`. A server older than 1.50.0 ignores the argument and
+   * answers for the organization's own setting; that answer is refused,
+   * `CustomerContractTooOld`, never returned as the one asked for.
    */
-  trainingEligibility({ agentId, productId } = {}) {
-    return this._get("/training/eligibility", { agent_id: agentId, product_id: productId });
+  async trainingEligibility({ agentId, productId, trainingLocation } = {}) {
+    const body = await this._get("/training/eligibility", {
+      agent_id: agentId, product_id: productId, training_location: trainingLocation,
+    });
+    if (trainingLocation !== undefined && trainingLocation !== null) {
+      const locations = body && typeof body === "object" && !Array.isArray(body)
+        ? body.training_locations : null;
+      const answered = locations && typeof locations === "object" ? locations.answered_for : null;
+      if (answered !== trainingLocation) {
+        throw new CustomerContractTooOld(
+          `the control plane at ${this.baseUrl} answered /training/eligibility without `
+          + `answering for training_location=${JSON.stringify(trainingLocation)}: choosing `
+          + "where a run trains needs customer contract 1.50.0, and an older server answers "
+          + "for the organization's own setting instead. Omit trainingLocation, or use a "
+          + "newer Mission Control.");
+      }
+    }
+    return body;
   }
 
   /** GET /eval-sets: a Product's evaluation sets, one page. */
@@ -180,8 +285,14 @@ export class CustomerApiClient {
    * GET /hillclimbs/{runId}/security (1.30.0): the run's security mode and
    * why, and its attack-resistance measurement. `measurement.state` is never
    * a pass by omission: not_measured, measuring, not_enough_attacks,
-   * attacks_unpaired, no_regression or regressed. A run that is not a hill
-   * climb of this organization is refused 404 `hillclimb_not_found`.
+   * attacks_unpaired, no_regression or regressed; its `readout.benchmarks`
+   * (1.35.0) holds each attack benchmark to the same rule. `base` and
+   * `checkpoints` (1.44.0) are the base model's and each certified round's
+   * held-out attack pass rate; `external_benchmarks`, `benchmark_coverage` and
+   * `capability` (1.45.0) are unpaired, ungated arms. Each is null
+   * (`checkpoints` []) on a run that did not choose cyber, and absent on an
+   * older server. A run that is not a hill climb of this organization is
+   * refused 404 `hillclimb_not_found`.
    */
   getHillclimbSecurity(runId) {
     return this._get(`/hillclimbs/${encodeURIComponent(String(runId))}/security`, {});
