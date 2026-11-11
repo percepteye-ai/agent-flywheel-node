@@ -58,6 +58,7 @@ describe("customer api", () => {
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], [
       "launch_uri_outside_org", "run_page_too_deep",
       "launch_input_requires_platform_operator",
+      "code_sandbox_not_configured", "code_sandbox_unreachable",
     ]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
@@ -264,6 +265,10 @@ describe("customer api", () => {
       // Decision's answer, eval-set comparisons and saves, observability
       // sources, serving an artifact, a champion's rollback).
       launch_input_requires_platform_operator: 403,
+      // 1.51.0: a coding agent's launch on a deployment with no isolated
+      // sandbox for its code, or one not answering.
+      code_sandbox_not_configured: 503,
+      code_sandbox_unreachable: 503,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
       ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];
