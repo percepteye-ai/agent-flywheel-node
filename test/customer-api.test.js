@@ -55,7 +55,10 @@ describe("customer api", () => {
       "base_model_unresolvable", "destination_algorithm_unsupported",
       "provider_checkpoint_not_owned",
     ]);
-    assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
+    assert.deepEqual([...RUN_LIST_REFUSAL_CODES], [
+      "launch_uri_outside_org", "run_page_too_deep",
+      "launch_input_requires_platform_operator",
+    ]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
       "recorded_decisions_too_few", "recorded_prompt_mismatch",
@@ -255,6 +258,12 @@ describe("customer api", () => {
       base_model_unresolvable: 422,
       destination_algorithm_unsupported: 422,
       provider_checkpoint_not_owned: 403,
+      // 1.51.0: a hill climb request naming an input only a platform operator
+      // may set. The other fourteen codes 1.51.0 added or published are
+      // answered by operations this SDK neither calls nor documents (a
+      // Decision's answer, eval-set comparisons and saves, observability
+      // sources, serving an artifact, a champion's rollback).
+      launch_input_requires_platform_operator: 403,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
       ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];

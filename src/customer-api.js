@@ -27,8 +27,14 @@ const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
 
+/**
+ * 1.29.0: what a launch may read and how far the runs list reaches. 1.51.0: a
+ * launch input only a platform operator may set (the experiment-only
+ * `environment_task_grader`, which left the hill climb request's schema).
+ */
 export const RUN_LIST_REFUSAL_CODES = Object.freeze([
   "launch_uri_outside_org", "run_page_too_deep",
+  "launch_input_requires_platform_operator",
 ]);
 /**
  * 1.29.0: why a prompt run cannot start (`prompt_optimization` says ahead).
