@@ -680,6 +680,30 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
     assert.deepEqual(tr.outcomes, []);
   });
 
+  it("the same words at two statuses are no refusal of the batch", async () => {
+    // Whole-batch means the same STATUS and the same words, in unison with
+    // the Python SDK: halves refused in the same words at 400 and 422 are two
+    // answers, so the split goes on. The status rides only on the error
+    // here, as a client that does not spell it into the message.
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: 8 }, (_, n) => `o${n}`);
+    const tr = refusing(() => null);
+    tr.reportOutcomes = async (agentId, outcomes) => {
+      const batch = outcomes.map((o) => o.outcome_id);
+      tr.tried.push(batch);
+      // The two halves of a split are tried one after the other, so
+      // alternating answers refuse every pair of halves at two statuses.
+      const status = tr.tried.length % 2 ? 400 : 422;
+      throw new TransportError("refused", { statusCode: status });
+    };
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr, { warnings }));
+    assert.ok(!warnings.some((w) => w.includes("whole batches")));
+    assert.equal(counts.outcomesDropped, ids.length);
+    assert.ok(tr.tried.length > 3, "split on, not stopped at the halves");
+  });
+
   it("splits on through a 413, which is about size, until the parts fit", async () => {
     // Both halves of a batch too large for a proxy answer the same words, and
     // halves too large still is not a refusal of the batch: quarters may fit.
