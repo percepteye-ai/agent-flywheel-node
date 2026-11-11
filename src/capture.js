@@ -1057,9 +1057,13 @@ export function createTurnUploader({
           if (outcomeRouteRefused(status)) {
             failed += batch.length + untried + left();
             queue.length = 0;
+            // A 410 is a `LeaseLost`, whose words are the detail alone: the
+            // status is named either way.
+            let said = String(err?.message ?? err);
+            if (!said.includes(`HTTP ${status}`)) said = `HTTP ${status}: ${said}`;
             logger?.warn?.(
               `[agent-flywheel] the control plane did not take reported ` +
-              `outcomes (${err?.message ?? err}); they stay on disk and are sent again on a ` +
+              `outcomes (${said}); they stay on disk and are sent again on a ` +
               `later flush.`);
             break flushing;
           }

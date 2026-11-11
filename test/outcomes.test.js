@@ -735,18 +735,24 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
 
   for (const status of [401, 404, 405, 410]) {
     it(`drops nothing on a ${status}: the route, not the records`, async () => {
+      // Through the REAL client: a 410 is a `LeaseLost`, and the status it
+      // carries is what makes it a refusal of the route, not a blip.
       const root = tmp();
       const warnings = [];
-      const tr = refusing(() => [status, "Not Found"]);
-      seed(root, ["a", "b", "c"]);
-      const u = uploaderFor(root, tr, { warnings });
+      const total = PRODUCTION_OUTCOME_BATCH_MAX_ITEMS + 3;
+      const { transport, seen } = overHttp({
+        "POST /outcomes": [status, { detail: "Not Found" }] });
+      seed(root, Array.from({ length: total }, (_, n) => `o${n}`));
+      const u = uploaderFor(root, transport, { warnings });
       const counts = await settle(u);
-      assert.equal(pending(root).length, 3);
+      assert.equal(pending(root).length, total);
       assert.deepEqual(
         [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
-        [0, 3, 0]);
-      assert.deepEqual(tr.tried, [["a", "b", "c"]], "one try, not a bisection");
-      assert.ok(warnings.some((w) => w.includes(`HTTP ${status}`)));
+        [0, total, 0]);
+      assert.equal(seen.filter((k) => k === "POST /outcomes").length, 1,
+                   "one try, not a bisection");
+      assert.ok(warnings.some((w) => w.includes(`HTTP ${status}`)
+                                  && w.includes("did not take")));
       assert.equal(u.mayUpload, true, "not a consent refusal");
     });
   }
