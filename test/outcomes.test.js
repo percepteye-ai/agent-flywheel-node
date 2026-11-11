@@ -282,6 +282,55 @@ describe("reportOutcome: a no-op without consent", () => {
   });
 });
 
+describe("reportOutcome: consent not yet known", () => {
+  it("keeps an outcome reported before the verdict arrived, and asks again", async () => {
+    // `mayUpload` is false both after an explicit no and before any answer
+    // (the verdict read failed on a blip). Read as a no, the second dropped
+    // every outcome until something else re-asked.
+    const root = tmp();
+    const tr = fakeTransport();
+    let later = {};
+    let asked = 0;
+    tr.captureCurrent = async () => { asked += 1; return later; };
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    assert.equal(u.mayUpload, false);
+    const id = u.reportOutcome("resolved", { turnId: "t1" });
+    assert.ok(id);
+    await settle(u);
+    assert.ok(asked >= 1, "reporting it started the flush that re-asks");
+    assert.deepEqual(tr.outcomes, []);
+    assert.equal(pending(root).length, 1);
+    later = { capture: { turns: true } };
+    const counts = await settle(u);
+    assert.equal(u.mayUpload, true);
+    assert.equal(counts.outcomesSent, 1);
+    assert.deepEqual(tr.outcomes.map((o) => o.outcome_id), [id]);
+    assert.deepEqual(pending(root), []);
+  });
+
+  it("is a no-op again once the control plane answers no", async () => {
+    const root = tmp();
+    const tr = fakeTransport();
+    tr.captureCurrent = async () => ({
+      capture: { turns: false, reason: "opt-in per agent" } });
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
+    await settle(u);
+    assert.equal(u.refusal, "opt-in per agent");
+    assert.equal(u.reportOutcome("reopened", { turnId: "t1" }), null);
+    assert.equal(pending(root).length, 1);
+    assert.deepEqual(tr.outcomes, []);
+  });
+
+  it("treats a verdict that did not answer as unknown, not as a no", () => {
+    const u = createTurnUploader({ transport: fakeTransport(), agentId: "a1", root: tmp() });
+    u.setVerdict({ mayUpload: false, reason: "no answer", answered: false });
+    assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
+    u.setVerdict({ mayUpload: false, reason: "opt-in per agent" });
+    assert.equal(u.reportOutcome("resolved", { turnId: "t1" }), null);
+  });
+});
+
 describe("reportOutcome: the plugin's capture handle", () => {
   it("exposes reportOutcome beside prune, wired to the uploader", async () => {
     const root = tmp();

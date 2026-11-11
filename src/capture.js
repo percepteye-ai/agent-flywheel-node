@@ -686,6 +686,12 @@ export function createTurnUploader({
   let inFlight = false;
   let mayUpload = false;
   let refusal = null;
+  // Whether the control plane SAID NO -- an answered verdict, or the intake's
+  // 403 -- as opposed to not having answered yet. `mayUpload` is false in
+  // both; an outcome reported while the answer is UNKNOWN is kept for the
+  // flush that re-asks, and only an explicit no makes `reportOutcome` a
+  // no-op. The Python SDK's `Attachment._consent_refused`.
+  let consentRefused = false;
   let mayCaptureModelContent = false;
   let modelContentReason = null;
 
@@ -775,8 +781,10 @@ export function createTurnUploader({
     if (v.mayUpload) {
       mayUpload = true;
       refusal = null;
+      consentRefused = false;
     } else if (v.answered) {
       refusal = v.reason;
+      consentRefused = true;
     }
     if (v.answered) {
       mayCaptureModelContent = v.mayCaptureModelContent && mayUpload;
@@ -795,6 +803,7 @@ export function createTurnUploader({
   function refuseUpload(reason) {
     mayUpload = false;
     refusal = reason;
+    consentRefused = true;
     mayCaptureModelContent = false;
     modelContentReason = reason;
     logger?.warn?.(
@@ -831,15 +840,18 @@ export function createTurnUploader({
    * turned out. THE PYTHON SDK'S `Attachment.report_outcome`, rule for rule.
    *
    * Validated first, capture enabled or not (`InvalidOutcome`). Then A NO-OP
-   * UNTIL PRODUCTION CAPTURE IS ENABLED for this agent: an outcome is a fact
-   * about the end users' traffic, so it is sent on exactly the terms a turn
-   * is, and nothing is kept locally for an agent that may not send it.
+   * ONCE THE CONTROL PLANE HAS SAID production capture is not enabled for
+   * this agent: an outcome is a fact about the end users' traffic, so it is
+   * sent on exactly the terms a turn is, and nothing is kept locally for an
+   * agent that may not send it. While the answer is still UNKNOWN (the
+   * verdict read failed on a blip) the outcome is kept, and the flush kicked
+   * here asks again; it is sent once the answer is yes.
    * Returns the outcome's id once queued, else `null`; the upload itself
    * happens off the caller's path (`flush`, kicked here and not awaited).
    */
   function reportOutcome(outcome, options = {}) {
     const wire = outcomeWire(outcome, options);
-    if (!mayUpload) return null;
+    if (!mayUpload && consentRefused) return null;
     const path = outcomeFile(root, wire.outcome_id);
     try {
       mkdirSync(root, { recursive: true });
@@ -1063,6 +1075,8 @@ export function createTurnUploader({
     setVerdict(v) {
       mayUpload = Boolean(v?.mayUpload);
       refusal = v?.reason ?? null;
+      // An answered no; `captureVerdict`'s `answered: false` is no answer.
+      consentRefused = !mayUpload && v?.answered !== false;
       mayCaptureModelContent = mayUpload && v?.mayCaptureModelContent === true;
       modelContentReason = mayCaptureModelContent ? null
         : (v?.modelContentReason ?? refusal);
@@ -1300,8 +1314,9 @@ export function registerTurnCapture(api, {
    * omitted) and `outcomeId` (this report's idempotency key; minted when
    * omitted). Throws `InvalidOutcome` for what the wire cannot carry, whether
    * or not capture is on; otherwise returns the outcome's id once queued, or
-   * `null` -- a no-op -- when this agent may not upload (no key, or
-   * production capture not enabled).
+   * `null` -- a no-op -- when this agent may not upload (no key, or the
+   * control plane said production capture is not enabled). While that answer
+   * is still unknown the outcome is kept and the upload asks again.
    */
   function reportOutcome(outcome, options = {}) {
     if (!uploader) {
