@@ -99,10 +99,10 @@ function overHttp(routes) {
     const key = `${init.method} ${new URL(url).pathname}`;
     seen.push(key);
     const route = routes[key] ?? [200, {}];
-    const [status, body] = typeof route === "function"
+    const [status, body, headers = {}] = typeof route === "function"
       ? route(JSON.parse(init.body)) : route;
     return new Response(JSON.stringify(body), {
-      status, headers: { "content-type": "application/json" } });
+      status, headers: { "content-type": "application/json", ...headers } });
   };
   const client = new ControlPlaneClient("https://cp.invalid", "pefw_x", { fetchImpl });
   return { transport: new AttachTransport(client, { agentId: "a1" }), seen };
@@ -387,6 +387,39 @@ describe("reportTurnFeedback", () => {
       await settle(u);
     });
   }
+
+  it("keeps every report for later when the intake is switched off (503)", async () => {
+    // A control plane whose episode intake is switched off answers 503 with a
+    // Retry-After: not a missing route (which drops what is waiting), not a
+    // refusal of the key (which stops sending). THROUGH THE REAL HTTP CLIENT:
+    // retried as the header says, both kinds kept, nothing said as a no, and
+    // sent once it is on.
+    const root = tmp();
+    const warnings = [];
+    const off = [503, { detail: "episode reports are switched off" },
+      { "retry-after": "0" }];
+    const routes = { "POST /turn-feedback": off, "POST /outcomes": off };
+    const { transport, seen } = overHttp(routes);
+    const u = uploaderFor(root, transport, { warnings });
+    u.reportTurnFeedback("accepted", { episodeId: EPISODE, turnIndex: 0 });
+    u.reportOutcome("resolved", { episodeId: EPISODE });
+    await settle(u);
+    assert.equal(waiting(root).length, 1, "the feedback is kept");
+    assert.equal(pending(root).length, 1, "the outcome is kept");
+    assert.ok(seen.filter((k) => k === "POST /turn-feedback").length > 1,
+      "retried as told");
+    assert.ok(seen.filter((k) => k === "POST /outcomes").length > 1,
+      "retried as told");
+    assert.deepEqual(said(warnings, "predate"), [], "not a missing route");
+    assert.deepEqual(said(warnings, "refused"), [], "not a refusal");
+    assert.notEqual(u.reportTurnFeedback(
+      "accepted", { episodeId: EPISODE, turnIndex: 1 }), null);
+    await settle(u);
+    routes["POST /turn-feedback"] = [200, {}];
+    routes["POST /outcomes"] = [200, {}];
+    await settle(u);
+    assert.deepEqual([...waiting(root), ...pending(root)], []);
+  });
 
   for (const status of [404, 405]) {
     it(`a control plane with no feedback route (${status}) never reaches the caller`, async () => {
