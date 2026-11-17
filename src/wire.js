@@ -61,8 +61,27 @@ export const productionAgentIdentifier = productionTurnIdentifier;
 export const WIRE_KEYS = Object.freeze([
   "final_text", "tool_calls", "tool_calls_omitted_count", "artifacts",
   "events", "timing", "llm_call_count", "reward", "success",
-  "agent_fingerprint", "exclusion",
+  "agent_fingerprint", "exclusion", "checks", "termination", "seeds",
 ]);
+
+/** The state a reported check is in. Only `measured` carries a `value`. */
+export const CHECK_STATUSES = Object.freeze([
+  "measured", "unavailable", "error", "abstained", "not_applicable",
+]);
+/** What a reported check proves. */
+export const CHECK_ESTABLISHES = Object.freeze([
+  "action_taken", "state_reached", "output_matched",
+  "message_communicated", "call_returned_without_error",
+]);
+/**
+ * How an episode ended. The agent states the class; who is answerable for it
+ * is decided by the platform, from its own records.
+ */
+export const TERMINATION_CLASSES = Object.freeze([
+  "completed", "turn_limit", "token_limit", "time_limit", "error", "cancelled",
+]);
+/** Most checks one report may carry. */
+export const MAX_REPORTED_CHECKS = 200;
 
 const WIRE_KEY_SET = new Set(WIRE_KEYS);
 
@@ -258,6 +277,115 @@ export function rolloutRequestFromWire(raw) {
  * is a positive assertion. An agent that reports nothing must not accidentally
  * assert zero, so the default is the honest one (`contract.py:300-310`).
  */
+const CHECK_KEYS = new Set(["id", "status", "value", "basis", "required", "establishes"]);
+const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+function shortText(value, limit, what) {
+  if (typeof value !== "string" || value.length === 0 || [...value].length > limit) {
+    throw new ContractError(
+      `${what} must be a non-empty string of at most ${limit} characters`,
+    );
+  }
+  return value;
+}
+
+function unknownKeys(obj, allowed, what) {
+  const extra = Object.keys(obj).filter((k) => !allowed.has(k)).sort();
+  if (extra.length) {
+    throw new ContractError(`${what} carries unknown key(s) ${extra.join(", ")}`);
+  }
+}
+
+/**
+ * The wire form of the checks an agent's own environment ran on an episode:
+ * `[{id, status, value, basis, required, establishes}]`, only `id` and
+ * `status` required. Mirrors `contract.py checks_to_wire`.
+ */
+export function checksToWire(checks) {
+  if (!Array.isArray(checks)) throw new ContractError("checks must be a list");
+  if (checks.length > MAX_REPORTED_CHECKS) {
+    throw new ContractError(
+      `checks carries ${checks.length} rows; at most ${MAX_REPORTED_CHECKS} are accepted`,
+    );
+  }
+  return checks.map((row, i) => {
+    const where = `checks[${i}]`;
+    if (!isObject(row)) throw new ContractError(`${where} must be an object`);
+    unknownKeys(row, CHECK_KEYS, where);
+    const out = { id: shortText(row.id, 200, `${where}.id`) };
+    if (!CHECK_STATUSES.includes(row.status)) {
+      throw new ContractError(
+        `${where}.status must be one of ${CHECK_STATUSES.join(", ")}`,
+      );
+    }
+    out.status = row.status;
+    if (row.value !== undefined && row.value !== null) {
+      if (typeof row.value !== "number" || !Number.isFinite(row.value)) {
+        throw new ContractError(`${where}.value must be a finite number or null`);
+      }
+      if (row.status !== "measured") {
+        throw new ContractError(
+          `${where}.value is stated but its status is ${row.status}; ` +
+          `only a measured check has a value`,
+        );
+      }
+      out.value = row.value;
+    }
+    if (row.basis !== undefined && row.basis !== null) {
+      out.basis = shortText(row.basis, 200, `${where}.basis`);
+    }
+    if (row.required !== undefined && row.required !== null) {
+      if (typeof row.required !== "boolean") {
+        throw new ContractError(`${where}.required must be a boolean`);
+      }
+      out.required = row.required;
+    }
+    if (row.establishes !== undefined && row.establishes !== null) {
+      if (!CHECK_ESTABLISHES.includes(row.establishes)) {
+        throw new ContractError(
+          `${where}.establishes must be one of ${CHECK_ESTABLISHES.join(", ")}`,
+        );
+      }
+      out.establishes = row.establishes;
+    }
+    return out;
+  });
+}
+
+/** The wire form of how the episode ended: `{class, detail}`. */
+export function terminationToWire(termination) {
+  if (!isObject(termination)) throw new ContractError("termination must be an object");
+  unknownKeys(termination, new Set(["class", "detail"]), "termination");
+  if (!TERMINATION_CLASSES.includes(termination.class)) {
+    throw new ContractError(
+      `termination.class must be one of ${TERMINATION_CLASSES.join(", ")}`,
+    );
+  }
+  const out = { class: termination.class };
+  if (termination.detail !== undefined && termination.detail !== null) {
+    out.detail = shortText(termination.detail, 500, "termination.detail");
+  }
+  return out;
+}
+
+/** The wire form of the seeds the episode ran under: `{environment, sampling}`. */
+export function seedsToWire(seeds) {
+  if (!isObject(seeds)) throw new ContractError("seeds must be an object");
+  unknownKeys(seeds, new Set(["environment", "sampling"]), "seeds");
+  const out = {};
+  for (const key of ["environment", "sampling"]) {
+    const value = seeds[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string") {
+      shortText(value, 128, `seeds.${key}`);
+    } else if (!Number.isSafeInteger(value)) {
+      throw new ContractError(`seeds.${key} must be an integer or a string`);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 export function rolloutOutputToWire(output) {
   if (!output || typeof output !== "object") {
     throw new ContractError("report is not an object");
@@ -296,6 +424,17 @@ export function rolloutOutputToWire(output) {
     ["exclusion", output.exclusion],
   ]) {
     if (value !== undefined && value !== null) wire[key] = value;
+  }
+
+  if (Array.isArray(output.checks) ? output.checks.length : output.checks != null) {
+    wire.checks = checksToWire(output.checks);
+  }
+  if (output.termination !== undefined && output.termination !== null) {
+    wire.termination = terminationToWire(output.termination);
+  }
+  if (output.seeds !== undefined && output.seeds !== null) {
+    const seeds = seedsToWire(output.seeds);
+    if (Object.keys(seeds).length) wire.seeds = seeds;
   }
 
   for (const key of Object.keys(wire)) {

@@ -307,7 +307,8 @@ export function createOutbox({
       return output;
     } catch (err) {
       const dropped = ["toolCalls", "llmCallCount", "reward", "success",
-        "agentFingerprint", "artifacts", "events", "timing"]
+        "agentFingerprint", "artifacts", "events", "timing",
+        "checks", "termination", "seeds"]
         .filter((name) => output?.[name] !== undefined && output?.[name] !== null);
       const detail = [
         `the SDK could not represent this rollout's result on the ` +
