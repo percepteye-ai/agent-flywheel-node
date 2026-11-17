@@ -403,12 +403,16 @@ describe("reportTurnFeedback", () => {
     const u = uploaderFor(root, transport, { warnings });
     u.reportTurnFeedback("accepted", { episodeId: EPISODE, turnIndex: 0 });
     u.reportOutcome("resolved", { episodeId: EPISODE });
-    await settle(u);
+    await idle(u);
+    const before = seen.length;
+    await u.flush();
+    const one = seen.slice(before);
     assert.equal(waiting(root).length, 1, "the feedback is kept");
     assert.equal(pending(root).length, 1, "the outcome is kept");
-    assert.ok(seen.filter((k) => k === "POST /turn-feedback").length > 1,
+    // More than one request IN ONE FLUSH: the client retried the 503 itself.
+    assert.ok(one.filter((k) => k === "POST /turn-feedback").length > 1,
       "retried as told");
-    assert.ok(seen.filter((k) => k === "POST /outcomes").length > 1,
+    assert.ok(one.filter((k) => k === "POST /outcomes").length > 1,
       "retried as told");
     assert.deepEqual(said(warnings, "predate"), [], "not a missing route");
     assert.deepEqual(said(warnings, "refused"), [], "not a refusal");
