@@ -68,8 +68,8 @@ import { LeaseLost } from "./errors.js";
 import { percepteyeHome } from "./session.js";
 import { quoteIdentifier } from "./transport.js";
 import {
-  ContractError, checksToWire, rolloutOutputToWire, seedsToWire,
-  terminationToWire,
+  ContractError, MAX_REPORTED_CHECKS, checksNotCarried, checksOverLimit,
+  checksToWire, rolloutOutputToWire, seedsToWire, terminationToWire,
 } from "./wire.js";
 
 const EVIDENCE_PARTS = [
@@ -313,6 +313,15 @@ export function createOutbox({
   function sendable(rolloutId, output) {
     try {
       JSON.stringify(rolloutOutputToWire(output));
+      const over = checksOverLimit(output.checks);
+      if (over) {
+        warn(
+          `[agent-flywheel] rollout ${rolloutId} states ` +
+          `${output.checks.length} checks and a report carries at most ` +
+          `${MAX_REPORTED_CHECKS}; the first ${MAX_REPORTED_CHECKS} were ` +
+          `sent and the report says ${over} were not.`,
+        );
+      }
       return output;
     } catch (err) {
       // The evidence parts are statements ABOUT the outcome, not the outcome.
@@ -328,12 +337,17 @@ export function createOutbox({
       if (unsendable.length) {
         const kept = { ...output };
         for (const name of unsendable) delete kept[name];
+        // Checks removed here are counted, so the stored episode says its
+        // checks are missing and not that it ran none.
+        const missing = unsendable.includes("checks") ? checksNotCarried(output) : 0;
+        if (missing) kept.checksDropped = missing;
         try {
           JSON.stringify(rolloutOutputToWire(kept));
           warn(
             `[agent-flywheel] rollout ${rolloutId}'s ${unsendable.join(", ")} ` +
             `could not be represented (${err?.message ?? err}) and was not ` +
-            `sent; the rest of the result was.`,
+            `sent; the rest of the result was` +
+            (missing ? `, and it says ${missing} checks are missing.` : "."),
           );
           return kept;
         } catch { /* something else is wrong too: the full salvage below */ }
@@ -352,9 +366,11 @@ export function createOutbox({
         `whole (${err?.message ?? err}); reporting what can be carried and ` +
         `naming the rest.`,
       );
+      const missing = checksNotCarried(output);
       return {
         finalText: typeof output?.finalText === "string" ? output.finalText : "",
         exclusion: { reason: "flywheel_crash", detail: detail.slice(0, 4000) },
+        ...(missing ? { checksDropped: missing } : {}),
       };
     }
   }

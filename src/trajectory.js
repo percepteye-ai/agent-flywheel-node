@@ -15,11 +15,15 @@
  *
  * Zero dependencies, `node:fs` only. This runs inside someone else's agent.
  */
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+
+import { reportedOutcome } from "./wire.js";
 
 export const TRAJECTORY_DIR_ENV = "PERCEPTEYE_TRAJECTORY_DIR";
 export const TOOL_CALLS_FILENAME = "tool_calls.jsonl";
+/** Where an agent's own environment states its grade: `runner.py OUTCOME_FILENAME`. */
+export const OUTCOME_FILENAME = "outcome.json";
 
 /** Keys the contract accepts, in the order `to_wire()` emits them. */
 const OPTIONAL_KEYS = [
@@ -146,4 +150,53 @@ export function readTrajectory(dir) {
     }
   }
   return { calls, malformed };
+}
+
+/**
+ * `outcome.json`'s text as a value. JSON, and the three constants a Python
+ * writer emits for a non-finite number -- `NaN`, `Infinity`, `-Infinity` --
+ * read as `null`, which is how `JSON.stringify` spells them too. Python's own
+ * reader takes those constants, so refusing them here would make one file a
+ * grade under the Python runner and nothing under this one; the Python
+ * reader maps them to None for the same reason. Throws on anything else that
+ * is not JSON.
+ */
+function parseOutcome(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Strings are matched first and kept, so a constant's name inside one is
+    // left alone.
+    return JSON.parse(text.replace(
+      /"(?:[^"\\]|\\.)*"|-?\bInfinity\b|\bNaN\b/g,
+      (found) => (found[0] === '"' ? found : "null"),
+    ));
+  }
+}
+
+/**
+ * Read AND REMOVE `<dir>/outcome.json`: what the agent's own environment
+ * stated about the episode that just ran, as `wire.js reportedOutcome` reads
+ * it. `{}` when there is no directory, no file, or nothing well-formed in it.
+ *
+ * REMOVED ONCE READ, because the rollout driver has one trajectory directory
+ * for the process and not one per rollout (the Python runner makes a fresh
+ * directory each time): a file left behind would grade the next episode with
+ * this one's reward. Never throws.
+ */
+export function takeReportedOutcome(dir) {
+  if (!dir) return {};
+  const path = join(dir, OUTCOME_FILENAME);
+  let data = null;
+  try {
+    data = parseOutcome(readFileSync(path, "utf8"));
+  } catch {
+    /* absent, unreadable or not JSON: the episode stated nothing */
+  }
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* a file we cannot remove is read again; nothing here can fix that */
+  }
+  return reportedOutcome(data);
 }

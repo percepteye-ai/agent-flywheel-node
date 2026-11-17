@@ -13,6 +13,10 @@ import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveDeclaration } from "../src/declaration.js";
 import { LeaseLost } from "../src/errors.js";
@@ -22,6 +26,8 @@ import {
   MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
   driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
 } from "../src/rollout.js";
+import { OUTCOME_FILENAME, TRAJECTORY_DIR_ENV } from "../src/trajectory.js";
+import { rolloutOutputToWire } from "../src/wire.js";
 
 // ROLLOUT-EXCLUSIVE hooks only. `agent_end` used to be in this list and had
 // to come out: production turn capture subscribes it too, to record the
@@ -450,6 +456,118 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(tx.calls.abandon.length, 0);
     // `success` is not asserted true on a failed run, and never `[]` for calls.
     assert.equal(tx.calls.report[0][1].success, undefined);
+  });
+
+  // THE AGENT'S OWN GRADE. The Python runner reads
+  // `$PERCEPTEYE_TRAJECTORY_DIR/outcome.json` for a command agent; this lane
+  // had no reader, so an agent driven from here could not be scored by its
+  // own environment. Same file, same rules (`wire.js reportedOutcome`).
+  async function driven(body, { event = { success: false }, write = "during" } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "percepteye-outcome-"));
+    const path = join(dir, OUTCOME_FILENAME);
+    const tx = fakeTransport();
+    const d = createRolloutDriver({
+      env: testEnv({ [TRAJECTORY_DIR_ENV]: dir }), transport: tx,
+      enqueue: async () => ({ enqueued: true }),
+    });
+    const put = () => writeFileSync(
+      path, typeof body === "string" ? body : JSON.stringify(body));
+    if (write === "before") put();
+    await d.onSessionStart({ sessionKey: "s1" });
+    if (write === "during") put();
+    await d.onAgentEnd(
+      { ...event, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(tx.calls.report.length, 1);
+    return { output: tx.calls.report[0][1], path };
+  }
+
+  it("reports the grade the agent's own environment stated", async () => {
+    const { output, path } = await driven({
+      reward: 0.25, success: true,
+      checks: [{ id: "db_state", status: "measured", value: 0 }],
+      termination: { class: "nonsense" },
+      seeds: { environment: 11 },
+    });
+    assert.equal(output.reward, 0.25);
+    assert.equal(output.success, true);
+    assert.deepEqual(output.checks, [{ id: "db_state", status: "measured", value: 0 }]);
+    // A malformed part is ignored whole and costs the episode nothing else.
+    assert.equal(output.termination, undefined);
+    assert.deepEqual(output.seeds, { environment: 11 });
+    assert.equal(output.finalText, "done");
+    const wire = rolloutOutputToWire(output);
+    assert.equal(wire.reward, 0.25);
+    assert.deepEqual(wire.seeds, { environment: 11 });
+    // Read once: the directory is the process's, not the rollout's, and a
+    // file left behind would grade the next episode with this one's reward.
+    assert.equal(existsSync(path), false);
+  });
+
+  it("does not let the file take back a success the host reported", async () => {
+    const { output } = await driven(
+      { success: false, reward: 0 }, { event: { success: true } });
+    assert.equal(output.success, true);
+    assert.equal(output.reward, 0);
+  });
+
+  it("ignores a malformed grade and never coerces one", async () => {
+    const { output } = await driven({ reward: "1", success: "yes" });
+    assert.equal(output.reward, undefined);
+    assert.equal(output.success, undefined);
+  });
+
+  for (const [what, body] of [
+    ["is not JSON", "{not json"], ["is not an object", "[1, 2]"], ["is empty", ""],
+  ]) {
+    it(`reports the answer when the outcome file ${what}`, async () => {
+      const { output, path } = await driven(body);
+      assert.equal(output.finalText, "done");
+      assert.equal(output.reward, undefined);
+      assert.equal(existsSync(path), false);
+    });
+  }
+
+  it("reads NaN and Infinity in an outcome file as nothing stated", async () => {
+    // The Python reader takes the same file; `json.dump` writes these.
+    const { output } = await driven(
+      '{"reward": NaN, "success": true, "seeds": {"sampling": "NaN"}, ' +
+      '"checks": [{"id": "a", "status": "abstained", "value": -Infinity}]}');
+    assert.equal(output.reward, undefined);
+    assert.equal(output.success, true);
+    assert.deepEqual(output.seeds, { sampling: "NaN" });
+    assert.deepEqual(output.checks, [{ id: "a", status: "abstained" }]);
+  });
+
+  it("keeps the first checks of an outcome file that states too many", async () => {
+    const { output } = await driven({
+      checks: Array.from({ length: 203 }, (_, i) => ({ id: String(i), status: "measured" })),
+    });
+    assert.equal(output.checks.length, 200);
+    assert.equal(rolloutOutputToWire(output).checks_dropped, 3);
+  });
+
+  it("does not grade a rollout with a file written before it ran", async () => {
+    // An episode that never reached `onAgentEnd` leaves its file behind.
+    const { output, path } = await driven({ reward: 1, success: true }, { write: "before" });
+    assert.equal(output.reward, undefined);
+    assert.equal(output.success, undefined);
+    assert.equal(existsSync(path), false);
+  });
+
+  it("reads no outcome file when no trajectory directory is set", async () => {
+    const tx = fakeTransport();
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    await d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "a" }] },
+      { sessionKey: "s1" },
+    );
+    assert.deepEqual(Object.keys(tx.calls.report[0][1]).filter(
+      (k) => tx.calls.report[0][1][k] !== undefined).sort(), ["finalText", "success"]);
   });
 
   it("gives back a rollout whose session ended with no answer", async () => {

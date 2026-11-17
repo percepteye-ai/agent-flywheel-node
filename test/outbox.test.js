@@ -25,7 +25,9 @@ import { LeaseLost, TransportError } from "../src/errors.js";
 import {
   MAX_AGE_MS, OUTBOX_SCHEMA, createOutbox, outboxDir, spoolName,
 } from "../src/outbox.js";
-import { ContractError } from "../src/wire.js";
+import {
+  ContractError, MAX_REPORTED_CHECKS, rolloutOutputToWire,
+} from "../src/wire.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "percepteye-outbox-"));
 
@@ -395,6 +397,67 @@ describe("an outcome the wire cannot carry", () => {
     assert.deepEqual(sent[0].seeds, { environment: 7 });
     assert.ok(warns.some((w) => w.includes("checks")), warns.join(" | "));
     assert.ok(output.checks, "the caller's object was mutated");
+    // ...AND THE STORED EPISODE SAYS SO. A warning reaches the process that
+    // ran the agent and nobody who reads the episode: without the count, an
+    // episode whose checks could not be sent reads as one that ran none.
+    assert.equal(sent[0].checksDropped, 1);
+    assert.equal(rolloutOutputToWire(sent[0]).checks_dropped, 1);
+    assert.ok(warns.some((w) => w.includes("says 1 checks are missing")), warns.join(" | "));
+  });
+
+  it("claims no missing checks when another evidence part is unsendable", async () => {
+    const sent = [];
+    const outbox = createOutbox({
+      dir: tmp(), logger: { warn() {} },
+      send: async (_r, output) => { sent.push(output); },
+    });
+    await outbox.deliver(ROLLOUT, {
+      finalText: "done", checks: [{ id: "a", status: "measured" }],
+      termination: { class: "gave_up" },
+    });
+    const wire = rolloutOutputToWire(sent[0]);
+    assert.deepEqual(wire.checks, [{ id: "a", status: "measured" }]);
+    assert.equal("termination" in wire, false);
+    assert.equal("checks_dropped" in wire, false);
+  });
+
+  it("says out loud that a report carries only the first checks", async () => {
+    // Over the limit is not a refusal: the first rows go, the count goes
+    // with them, and whoever stated too many is told once per report.
+    const sent = [];
+    const warns = [];
+    const outbox = createOutbox({
+      dir: tmp(), logger: { warn: (m) => warns.push(String(m)) },
+      send: async (_r, output) => { sent.push(output); },
+    });
+    const checks = Array.from({ length: MAX_REPORTED_CHECKS + 2 },
+      (_, i) => ({ id: String(i), status: "measured" }));
+    assert.equal(await outbox.deliver(ROLLOUT, { finalText: "done", reward: 1, checks }), true);
+    const wire = rolloutOutputToWire(sent[0]);
+    assert.equal(wire.checks.length, MAX_REPORTED_CHECKS);
+    assert.equal(wire.checks_dropped, 2);
+    assert.equal(wire.reward, 1);
+    assert.equal("exclusion" in wire, false);
+    assert.equal(warns.filter((w) => w.includes("says 2 were not")).length, 1,
+      warns.join(" | "));
+  });
+
+  it("the salvage says the checks it could not carry", async () => {
+    // When something besides the evidence is unsendable the report is
+    // rebuilt from the two always-sendable fields, and it carries no check.
+    const sent = [];
+    const outbox = createOutbox({
+      dir: tmp(), logger: { warn() {} },
+      send: async (_r, output) => { sent.push(output); },
+    });
+    await outbox.deliver(ROLLOUT, {
+      finalText: "done", llmCallCount: -1,
+      checks: [{ id: "a", status: "measured" }, { id: "b", status: "error" }],
+    });
+    const wire = rolloutOutputToWire(sent[0]);
+    assert.equal(wire.exclusion.reason, "flywheel_crash");
+    assert.equal("checks" in wire, false);
+    assert.equal(wire.checks_dropped, 2);
   });
 
   it("retires a contract refusal rather than retrying the same bytes forever", async () => {

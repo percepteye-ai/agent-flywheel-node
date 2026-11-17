@@ -116,6 +116,7 @@ import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
 import { createOutbox, outboxDir } from "./outbox.js";
 import { declareRulebook, rulesNeverSent } from "./transport.js";
+import { takeReportedOutcome, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
 
@@ -454,6 +455,9 @@ export function createRolloutDriver({
 
   /** Record a rollout as running in `sessionKey`, so `onAgentEnd` reports it. */
   function track(sessionKey, rollout) {
+    // An outcome file already there was written before this rollout ran --
+    // by an episode that never reached `onAgentEnd` -- and is not its grade.
+    takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
     inFlight.set(sessionKey, rollout);
     startHeartbeat(sessionKey, rollout);
     try {
@@ -712,6 +716,13 @@ export function createRolloutDriver({
         `on-policy training.`,
       );
     }
+    // THE AGENT'S OWN GRADE, from `$PERCEPTEYE_TRAJECTORY_DIR/outcome.json`:
+    // reward, success, checks, termination and seeds as its environment
+    // stated them. The Python runner has read this file for a command agent
+    // all along (`runner.py _attach_reported_outcome`); this lane had no
+    // reader, so an agent driven from here could never be scored by its own
+    // environment. Same rules, one table (`wire.js reportedOutcome`).
+    const stated = takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
     try {
       // SPOOLED BEFORE IT IS SENT, and never merely awaited. `deliver` writes
       // the outcome to the outbox before the first network call and settles
@@ -721,11 +732,16 @@ export function createRolloutDriver({
       // and a rollout the reaper marks `abandoned` twenty minutes later. It
       // does not throw: the failure IS the return value.
       const delivered = await spool.deliver(rollout, {
+        ...stated,
         finalText,
         // `undefined`, never `[]`. The recorder owns tool calls and writes
         // them to the trajectory; asserting zero here would overwrite what it
         // observed with a claim this function cannot make.
-        success: event?.success === true ? true : undefined,
+        //
+        // A value this lane already has is not replaced by the file's: the
+        // host saying the run succeeded stands, and otherwise the
+        // environment's own verdict is the only one there is.
+        success: event?.success === true ? true : stated.success,
         // Counted from the host's provider-call lifecycle and reconciled by
         // run/call ids. Never copied from the control plane's gateway.
         llmCallCount: modelCallMeasurement.count ?? undefined,

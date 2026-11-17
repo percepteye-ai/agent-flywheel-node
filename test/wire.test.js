@@ -7,8 +7,10 @@
  */
 import "./support/home.js";
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+
+import { pythonFile } from "./support/python-sdk.js";
 import {
   CONTRACT_VERSION, ContractError, RULEBOOK_RECEIPT_KEYS,
   RULEBOOK_RECEIPT_STATUSES, WIRE_KEYS, rolloutOutputToWire,
@@ -37,12 +39,7 @@ describe("the vendored schema IS the contract", () => {
   });
 
   it("matches the Python authority for both production-turn definitions", () => {
-    // The Python checkout beside this one: `agent-flywheel` is what a clone
-    // of the repo is called, the prefixed name what older checkouts carry.
-    const sibling = [
-      "../../agent-flywheel/schema/flywheel-1.json",
-      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("schema/flywheel-1.json");
     assert.ok(schema.$defs.ProductionTurn);
     assert.ok(schema.$defs.ProductionTurnBatch);
     if (!sibling) return;
@@ -60,10 +57,7 @@ describe("the vendored schema IS the contract", () => {
     // The two SDKs ship in unison: one contract file, vendored twice. Equal
     // definitions in a different order or spelling are already two files a
     // reviewer has to diff by hand, so the bytes are what is held equal.
-    const sibling = [
-      "../../agent-flywheel/schema/flywheel-1.json",
-      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("schema/flywheel-1.json");
     if (!sibling) return;
     assert.equal(
       readFileSync(new URL("../schema/flywheel-1.json", import.meta.url), "utf8"),
@@ -274,12 +268,15 @@ describe("checks, termination and seeds", () => {
     [{ checks: [{ id: "a", status: "measured", value: NaN }] }, /checks\[0\]\.value/],
     [{ checks: [{ id: "a", status: "measured", establishes: "won" }] }, /checks\[0\]\.establishes/],
     [{ checks: [{ id: "a", status: "measured", source: "human_label" }] }, /unknown key/],
-    [{ checks: Array.from({ length: 201 }, (_, i) => ({ id: String(i), status: "measured" })) }, /at most 200/],
     [{ termination: { class: "gave_up" } }, /termination\.class/],
     [{ termination: { class: "time_limit", corroborated_by: "mission_control_gateway" } }, /unknown key/],
     [{ termination: { class: "time_limit", attributed_to: "platform" } }, /unknown key/],
     [{ seeds: { environment: 1.5 } }, /seeds\.environment/],
     [{ seeds: { sampling: true } }, /seeds\.sampling/],
+    [{ seeds: { environment: 2 ** 53 } }, /seeds\.environment/],
+    [{ seeds: { environment: NaN } }, /seeds\.environment/],
+    [{ seeds: { sampling: "s".repeat(129) } }, /seeds\.sampling/],
+    [{ seeds: { sampling: "" } }, /seeds\.sampling/],
   ]) {
     it(`refuses ${JSON.stringify(output).slice(0, 70)} by name`, () => {
       assert.throws(
@@ -288,4 +285,52 @@ describe("checks, termination and seeds", () => {
       );
     });
   }
+
+  const rows = (n) => Array.from({ length: n }, (_, i) => (
+    { id: String(i), status: "measured", value: i }));
+
+  it("keeps the first checks a report carries and says how many it left", async () => {
+    // One check too many used to refuse the list whole, so the episode lost
+    // every check it ran. The first MAX_REPORTED_CHECKS are sent and the
+    // report states the rest as `checks_dropped`, the field the stored
+    // episode keeps. Mirrors `test_contract.py`.
+    const { MAX_REPORTED_CHECKS } = await import("../src/wire.js");
+    const checks = rows(MAX_REPORTED_CHECKS + 3);
+    const wire = rolloutOutputToWire({ finalText: "x", checks });
+    assert.deepEqual(wire.checks.map((r) => r.id),
+      checks.slice(0, MAX_REPORTED_CHECKS).map((r) => r.id));
+    assert.equal(wire.checks_dropped, 3);
+    // A count the output already carries is added to, never replaced.
+    assert.equal(
+      rolloutOutputToWire({ finalText: "x", checks, checksDropped: 4 }).checks_dropped, 7);
+    const declared = schema.$defs.RolloutOutput.properties.checks_dropped;
+    assert.deepEqual([declared.type, declared.minimum], ["integer", 1]);
+  });
+
+  for (const dropped of [0, -1, true, "3", null, 1.5]) {
+    it(`a report with nothing dropped does not say so (${JSON.stringify(dropped)})`, () => {
+      const wire = rolloutOutputToWire({
+        finalText: "x", checks: [{ id: "a", status: "measured" }],
+        checksDropped: dropped,
+      });
+      assert.equal("checks_dropped" in wire, false);
+    });
+  }
+
+  it("does not read a row past the limit", async () => {
+    const { MAX_REPORTED_CHECKS, checksOverLimit, checksToWire } =
+      await import("../src/wire.js");
+    const checks = [...rows(MAX_REPORTED_CHECKS), { id: "", status: "?" }];
+    assert.equal(checksToWire(checks).length, MAX_REPORTED_CHECKS);
+    assert.equal(checksOverLimit(checks), 1);
+    assert.equal(checksOverLimit(null), 0);
+    assert.equal(checksOverLimit(checks.slice(0, 5)), 0);
+  });
+
+  it("sends the largest integer seed a JSON number carries exactly", async () => {
+    const { seedsToWire } = await import("../src/wire.js");
+    assert.deepEqual(
+      seedsToWire({ environment: Number.MAX_SAFE_INTEGER, sampling: -3 }),
+      { environment: Number.MAX_SAFE_INTEGER, sampling: -3 });
+  });
 });

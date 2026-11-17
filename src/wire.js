@@ -61,7 +61,8 @@ export const productionAgentIdentifier = productionTurnIdentifier;
 export const WIRE_KEYS = Object.freeze([
   "final_text", "tool_calls", "tool_calls_omitted_count", "artifacts",
   "events", "timing", "llm_call_count", "reward", "success",
-  "agent_fingerprint", "exclusion", "checks", "termination", "seeds",
+  "agent_fingerprint", "exclusion", "checks", "checks_dropped",
+  "termination", "seeds",
 ]);
 
 /** The state a reported check is in. Only `measured` carries a `value`. */
@@ -396,15 +397,16 @@ function unknownKeys(obj, allowed, what) {
  * The wire form of the checks an agent's own environment ran on an episode:
  * `[{id, status, value, basis, required, establishes}]`, only `id` and
  * `status` required. Mirrors `contract.py checks_to_wire`.
+ *
+ * AT MOST `MAX_REPORTED_CHECKS` ROWS, THE FIRST ONES. A longer list used to
+ * be refused whole, which cost the episode every check it ran for stating
+ * one too many. The rows past the limit are not carried and not read;
+ * `checksOverLimit` counts them, and the report states the count as
+ * `checks_dropped` (`rolloutOutputToWire`).
  */
 export function checksToWire(checks) {
   if (!Array.isArray(checks)) throw new ContractError("checks must be a list");
-  if (checks.length > MAX_REPORTED_CHECKS) {
-    throw new ContractError(
-      `checks carries ${checks.length} rows; at most ${MAX_REPORTED_CHECKS} are accepted`,
-    );
-  }
-  return checks.map((row, i) => {
+  return checks.slice(0, MAX_REPORTED_CHECKS).map((row, i) => {
     const where = `checks[${i}]`;
     if (!isObject(row)) throw new ContractError(`${where} must be an object`);
     unknownKeys(row, CHECK_KEYS, where);
@@ -448,6 +450,30 @@ export function checksToWire(checks) {
   });
 }
 
+/**
+ * How many of `checks` `checksToWire` leaves behind: the rows past
+ * `MAX_REPORTED_CHECKS`. 0 for anything that is not a list.
+ */
+export function checksOverLimit(checks) {
+  return Array.isArray(checks)
+    ? Math.max(checks.length - MAX_REPORTED_CHECKS, 0) : 0;
+}
+
+/** A count of dropped checks an output states: a positive whole number, else 0. */
+function statedDropped(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+/**
+ * `checks_dropped` for a report that carries NONE of `output`'s checks: every
+ * row the episode ran, and the ones it already counted as dropped. The one
+ * evidence part with a place on the wire to say it went missing. Never throws.
+ */
+export function checksNotCarried(output) {
+  return (Array.isArray(output?.checks) ? output.checks.length : 0)
+    + statedDropped(output?.checksDropped);
+}
+
 /** The wire form of how the episode ended: `{class, detail}`. */
 export function terminationToWire(termination) {
   if (!isObject(termination)) throw new ContractError("termination must be an object");
@@ -464,7 +490,16 @@ export function terminationToWire(termination) {
   return out;
 }
 
-/** The wire form of the seeds the episode ran under: `{environment, sampling}`. */
+/**
+ * The wire form of the seeds the episode ran under: `{environment, sampling}`,
+ * each an integer or a short string.
+ *
+ * ONE RULE WITH THE PYTHON SDK's `seeds_to_wire`, which reads the same
+ * `outcome.json`: a string is 1 to 128 characters; an integer is one a JSON
+ * number carries exactly in every language (`Number.isSafeInteger`). A
+ * boolean, a fraction, NaN and a larger integer are refused. The Python
+ * suite drives one table through both (`tests/test_reported_outcome_parity.py`).
+ */
 export function seedsToWire(seeds) {
   if (!isObject(seeds)) throw new ContractError("seeds must be an object");
   unknownKeys(seeds, new Set(["environment", "sampling"]), "seeds");
@@ -480,6 +515,49 @@ export function seedsToWire(seeds) {
     out[key] = value;
   }
   return out;
+}
+
+/**
+ * What an agent's own environment stated about the episode in
+ * `$PERCEPTEYE_TRAJECTORY_DIR/outcome.json`, as output fields:
+ * `{reward, success, checks, checksDropped, termination, seeds}`, each present
+ * only when the file states it well-formed. `data` is the parsed file.
+ *
+ * THE PYTHON SDK READS THE SAME FILE BY THE SAME RULES
+ * (`runner.py _attach_reported_outcome`), and its suite drives one table of
+ * files through both (`tests/test_reported_outcome_parity.py`). Only a finite
+ * number is a reward and only a boolean a success; anything else is ignored,
+ * never coerced. Each evidence part is kept when well-formed and ignored
+ * whole when not -- a malformed part must not cost the episode its report.
+ * More checks than a report carries is not malformed: the first are kept and
+ * the rest counted. Never throws.
+ */
+export function reportedOutcome(data) {
+  const stated = {};
+  if (!isObject(data)) return stated;
+  if (typeof data.reward === "number" && Number.isFinite(data.reward)) {
+    stated.reward = data.reward;
+  }
+  if (typeof data.success === "boolean") stated.success = data.success;
+  for (const [name, toWire] of [
+    ["checks", checksToWire], ["termination", terminationToWire],
+    ["seeds", seedsToWire],
+  ]) {
+    if (data[name] === undefined || data[name] === null) continue;
+    let part;
+    try {
+      part = toWire(data[name]);
+    } catch {
+      continue;
+    }
+    if (!(Array.isArray(part) ? part.length : Object.keys(part).length)) continue;
+    stated[name] = part;
+    if (name === "checks") {
+      const over = checksOverLimit(data[name]);
+      if (over) stated.checksDropped = over;
+    }
+  }
+  return stated;
 }
 
 export function rolloutOutputToWire(output) {
@@ -522,9 +600,15 @@ export function rolloutOutputToWire(output) {
     if (value !== undefined && value !== null) wire[key] = value;
   }
 
+  // `checks_dropped`: how many checks the episode ran that this report does
+  // not carry -- what the output already counted, plus the rows past the
+  // limit here. Present only when positive.
+  let dropped = statedDropped(output.checksDropped);
   if (Array.isArray(output.checks) ? output.checks.length : output.checks != null) {
     wire.checks = checksToWire(output.checks);
+    dropped += checksOverLimit(output.checks);
   }
+  if (dropped) wire.checks_dropped = dropped;
   if (output.termination !== undefined && output.termination !== null) {
     wire.termination = terminationToWire(output.termination);
   }
