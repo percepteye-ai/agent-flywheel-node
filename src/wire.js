@@ -26,10 +26,22 @@ function withinProductionIdentifierLimit(value) {
   return [...value].length <= PRODUCTION_IDENTIFIER_MAX_CHARS;
 }
 
+/**
+ * A string with a LONE SURROGATE is not Unicode text a JSON parser takes:
+ * `JSON.stringify` escapes it, and the control plane refuses the whole batch
+ * (422), after which the split drops the record. Refused at the call instead,
+ * so what is refused at the call and at the wire cannot differ. The Python
+ * SDK's `contract._well_formed_text`.
+ */
+function wellFormedText(value) {
+  return value.isWellFormed();
+}
+
 /** Return an exact opaque production correlation id, or null. Never rewrite. */
 export function productionIdentifier(value) {
   return typeof value === "string"
     && value.length > 0
+    && wellFormedText(value)
     && withinProductionIdentifierLimit(value)
     && PRODUCTION_IDENTIFIER_RE.test(value)
     ? value
@@ -40,6 +52,7 @@ export function productionIdentifier(value) {
 export function productionTurnIdentifier(value) {
   return typeof value === "string"
     && value.length > 0
+    && wellFormedText(value)
     && withinProductionIdentifierLimit(value)
     && PRODUCTION_TURN_IDENTIFIER_RE.test(value)
     ? value
@@ -241,6 +254,9 @@ export function productionOutcome(wire) {
       throw new InvalidOutcome(
         "note must be a non-empty string of at most " +
         `${PRODUCTION_OUTCOME_NOTE_MAX_CHARS} characters`);
+    }
+    if (!wellFormedText(wire.note)) {
+      throw new InvalidOutcome("note must be well-formed Unicode text");
     }
     out.note = wire.note;
   }
