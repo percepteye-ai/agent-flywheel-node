@@ -348,6 +348,9 @@ describe("an outcome the wire cannot carry", () => {
       // `environment` is refused outright by the contract: it is the control
       // plane's fact about the rollout, not the agent's to assert.
       toolCalls: [{ name: "exec", outcome: "ok", environment: "prod" }],
+      checks: [{ id: "balance_restored", status: "measured", value: 1 }],
+      termination: { class: "completed" },
+      seeds: { environment: 7 },
     });
     assert.equal(ok, true);
     assert.equal(sent.length, 1);
@@ -358,6 +361,10 @@ describe("an outcome the wire cannot carry", () => {
     assert.equal(sent[0].exclusion.reason, "flywheel_crash");
     assert.match(sent[0].exclusion.detail, /environment/);
     assert.match(sent[0].exclusion.detail, /dropped by the salvage:.*toolCalls/);
+    for (const part of ["checks", "termination", "seeds"]) {
+      assert.match(sent[0].exclusion.detail,
+        new RegExp(`dropped by the salvage:.*${part}`), part);
+    }
   });
 
   it("retires a contract refusal rather than retrying the same bytes forever", async () => {
