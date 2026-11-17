@@ -697,6 +697,23 @@ export const OUTCOME_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
  * loud. The Python SDK's `_OUTCOME_MAX_KEPT_UNANSWERED`.
  */
 export const OUTCOME_MAX_KEPT_UNANSWERED = 1000;
+
+/**
+ * The one sentence for outcomes dropped by the count bound while the consent
+ * question is unanswered -- its cause, which is not a refusal: the control
+ * plane has not answered (it could not be reached, or did not say). The Python
+ * SDK's `_unanswered_outcomes_dropped`.
+ */
+export function unansweredOutcomesDropped(
+  dropped, kept = OUTCOME_MAX_KEPT_UNANSWERED,
+) {
+  return (
+    `[agent-flywheel] ${dropped} reported outcome(s) were dropped, oldest ` +
+    `first: the control plane has not answered whether this agent may ` +
+    `upload production traffic (it could not be reached, or did not say), ` +
+    `and at most ${kept} outcomes that wait on that answer are kept until ` +
+    `it does.`);
+}
 /**
  * How many requests one flush may spend splitting refused `/outcomes`
  * batches. Isolating one bad record of 64 costs 12; the bound stops a refusal
@@ -1016,7 +1033,9 @@ export function createTurnUploader({
       // Capture costs the observation, never the caller.
       return null;
     }
-    if (!mayUpload) capUnansweredOutcomes();
+    // Only an outcome consent is the question for waits on its answer; one
+    // naming only an episode is sent regardless.
+    if (!mayUpload && !namesOnlyAnEpisode(wire)) capUnansweredOutcomes();
     flush({
       includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
     }).catch(() => {});
@@ -1174,18 +1193,29 @@ export function createTurnUploader({
   }
 
   /**
-   * While consent is UNKNOWN, keep at most `maxOutcomesWhileUnknown`
-   * outcomes: the oldest (by when they were written, then by name) go, with a
-   * warning. The Python SDK's `_cap_unanswered_outcomes`.
+   * While consent is UNKNOWN, keep at most `maxOutcomesWhileUnknown` of the
+   * outcomes that wait on it: the oldest (by when they were written, then by
+   * name) go, with a warning naming that cause. An outcome that names only an
+   * episode (`namesOnlyAnEpisode`) does not wait on consent, so it is neither
+   * counted nor dropped here. The Python SDK's `_cap_unanswered_outcomes`.
    */
   function capUnansweredOutcomes() {
     const files = outcomeFiles();
-    const excess = files.length - maxOutcomesWhileUnknown;
+    if (files.length <= maxOutcomesWhileUnknown) return;
+    const waiting = [];
+    for (const path of files) {
+      let wire;
+      try { wire = JSON.parse(readFileSync(path, "utf8")); } catch { continue; }
+      const episodeOnly = wire !== null && typeof wire === "object"
+        && !Array.isArray(wire) && namesOnlyAnEpisode(wire);
+      if (!episodeOnly) waiting.push(path);
+    }
+    const excess = waiting.length - maxOutcomesWhileUnknown;
     if (excess <= 0) return;
     const age = (path) => {
       try { return statSync(path).mtimeMs; } catch { return 0; }
     };
-    const oldest = files.map((path) => [age(path), path])
+    const oldest = waiting.map((path) => [age(path), path])
       .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
       .slice(0, excess);
     let dropped = 0;
@@ -1193,11 +1223,7 @@ export function createTurnUploader({
       try { rmSync(path); dropped += 1; } catch { /* kept */ }
     }
     if (dropped) {
-      logger?.warn?.(
-        `[agent-flywheel] ${dropped} reported outcome(s) were dropped, ` +
-        `oldest first: the control plane has not yet said whether this ` +
-        `agent may upload them, and at most ${maxOutcomesWhileUnknown} are ` +
-        `kept while it has not.`);
+      logger?.warn?.(unansweredOutcomesDropped(dropped, maxOutcomesWhileUnknown));
     }
   }
 

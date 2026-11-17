@@ -425,6 +425,41 @@ describe("reportOutcome: consent not yet known", () => {
   });
 });
 
+describe("reportOutcome: the bound while consent is unknown", () => {
+  it("holds no outcome that names only an episode, and names the cause", () => {
+    // An outcome naming only an episode does not wait on consent, so the
+    // count bound neither counts nor drops it -- it once did both, and said
+    // consent was the cause. The warning names the actual one: no answer.
+    const root = tmp();
+    const warnings = [];
+    const tr = fakeTransport();
+    tr.captureCurrent = async () => ({});
+    const u = createTurnUploader({
+      transport: tr, agentId: "a1", root, maxOutcomesWhileUnknown: 3,
+      logger: { warn: (m) => warnings.push(m) },
+    });
+    for (let n = 0; n < 5; n += 1) {
+      u.reportOutcome("resolved", { episodeId: `rl_${n}`, outcomeId: `e${n}` });
+    }
+    assert.equal(pending(root).length, 5, "episodes are not bounded");
+    assert.deepEqual(warnings.filter((w) => w.includes("oldest first")), []);
+    for (let n = 0; n < 5; n += 1) {
+      u.reportOutcome("resolved", { turnId: "t1", outcomeId: `o${n}` });
+      const when = (Date.now() - 1_000_000 + n * 1000) / 1000;
+      for (const name of pending(root)) {
+        const body = JSON.parse(readFileSync(join(root, name), "utf8"));
+        if (body.outcome_id === `o${n}`) utimesSync(join(root, name), when, when);
+      }
+    }
+    const kept = pending(root).map((name) =>
+      JSON.parse(readFileSync(join(root, name), "utf8")).outcome_id).sort();
+    assert.deepEqual(kept, ["e0", "e1", "e2", "e3", "e4", "o2", "o3", "o4"]);
+    const said = warnings.filter((w) => w.includes("oldest first"));
+    assert.ok(said.length && said.at(-1).includes("has not answered"));
+    assert.ok(!said.at(-1).includes("has not yet said"));
+  });
+});
+
 describe("reportOutcome: the plugin's capture handle", () => {
   it("exposes reportOutcome beside prune, wired to the uploader", async () => {
     const root = tmp();
