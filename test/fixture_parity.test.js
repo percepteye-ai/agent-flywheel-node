@@ -31,6 +31,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
+import { pythonRoot } from "./support/python-sdk.js";
+
 /** Each shared fixture and the sha256 every copy of it was made from. */
 const SHARED = {
   "policy_current_gateway.json":
@@ -44,20 +46,6 @@ const SHARED = {
 };
 
 const ours = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
-
-/**
- * The Python SDK's checkout beside this one, or null. `agent-flywheel` is what
- * a clone of the repo is called, the prefixed name what older checkouts carry
- * -- the same two names `wire.test.js` and `genai-otlp.test.js` look for.
- * Found by the repo's own marker, not by the fixture, so a checkout that is
- * there but lacks the file fails instead of passing.
- */
-const pythonRoot = [
-  "../../agent-flywheel/",
-  "../../percepteye-agent-flywheel/",
-].map((rel) => new URL(rel, import.meta.url))
-  .find((root) => existsSync(new URL("pyproject.toml", root))
-    && existsSync(new URL("src/agent_flywheel/", root))) ?? null;
 
 describe("the shared fixtures", () => {
   for (const [name, digest] of Object.entries(SHARED)) {

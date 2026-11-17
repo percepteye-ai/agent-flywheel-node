@@ -10,8 +10,10 @@
  */
 import "./support/home.js";
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+
+import { pythonFile } from "./support/python-sdk.js";
 
 import {
   RESPONSE_FORMAT_ATTR, SCOPE_NAME, contentJson, newSpanId, newTraceId,
@@ -64,10 +66,7 @@ describe("the golden both SDKs render", () => {
   }
 
   it("is the Python authority's golden, byte for byte", () => {
-    const sibling = [
-      "../../agent-flywheel/tests/fixtures/genai_capture_golden.json",
-      "../../percepteye-agent-flywheel/tests/fixtures/genai_capture_golden.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("tests/fixtures/genai_capture_golden.json");
     if (!sibling) return;
     assert.ok(readFileSync(sibling).equals(GOLDEN_BYTES),
       "test/fixtures/genai-capture-golden.json is not the Python SDK's golden");
