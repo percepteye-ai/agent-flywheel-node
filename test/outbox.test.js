@@ -367,6 +367,36 @@ describe("an outcome the wire cannot carry", () => {
     }
   });
 
+  it("drops one malformed evidence part and keeps the outcome", async () => {
+    // The checks, the termination and the seeds are statements ABOUT an
+    // outcome. A check row the wire refuses used to send the whole result
+    // down the salvage: reward and tool calls dropped, the episode a crash.
+    const dir = tmp();
+    const sent = [];
+    const warns = [];
+    const outbox = createOutbox({
+      dir, logger: { warn: (m) => warns.push(String(m)) },
+      send: async (_r, output) => { sent.push(output); },
+    });
+    const output = {
+      finalText: "the real answer", success: true, reward: 0.75,
+      toolCalls: [{ name: "exec", outcome: "ok" }],
+      checks: [{ id: "balance_restored", status: "measured", value: NaN }],
+      termination: { class: "completed" },
+      seeds: { environment: 7 },
+    };
+    assert.equal(await outbox.deliver(ROLLOUT, output), true);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].exclusion, undefined);
+    assert.equal(sent[0].reward, 0.75);
+    assert.equal(sent[0].toolCalls.length, 1);
+    assert.equal(sent[0].checks, undefined);
+    assert.deepEqual(sent[0].termination, { class: "completed" });
+    assert.deepEqual(sent[0].seeds, { environment: 7 });
+    assert.ok(warns.some((w) => w.includes("checks")), warns.join(" | "));
+    assert.ok(output.checks, "the caller's object was mutated");
+  });
+
   it("retires a contract refusal rather than retrying the same bytes forever", async () => {
     const dir = tmp();
     const outbox = createOutbox({

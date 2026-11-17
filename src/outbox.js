@@ -67,7 +67,16 @@ import { join } from "node:path";
 import { LeaseLost } from "./errors.js";
 import { percepteyeHome } from "./session.js";
 import { quoteIdentifier } from "./transport.js";
-import { ContractError, rolloutOutputToWire } from "./wire.js";
+import {
+  ContractError, checksToWire, rolloutOutputToWire, seedsToWire,
+  terminationToWire,
+} from "./wire.js";
+
+const EVIDENCE_PARTS = [
+  ["checks", checksToWire],
+  ["termination", terminationToWire],
+  ["seeds", seedsToWire],
+];
 
 /**
  * Version tag on a spooled outcome. A file written by a future SDK with a
@@ -306,6 +315,29 @@ export function createOutbox({
       JSON.stringify(rolloutOutputToWire(output));
       return output;
     } catch (err) {
+      // The evidence parts are statements ABOUT the outcome, not the outcome.
+      // One malformed check row must not cost the episode its reward, tool
+      // calls and artifacts: drop the part that cannot be carried, say so,
+      // and send the rest whole. Mirrors `runner.py _wire_payload`.
+      const unsendable = EVIDENCE_PARTS
+        .filter(([name, toWire]) => {
+          if (output?.[name] === undefined || output?.[name] === null) return false;
+          try { JSON.stringify(toWire(output[name])); return false; } catch { return true; }
+        })
+        .map(([name]) => name);
+      if (unsendable.length) {
+        const kept = { ...output };
+        for (const name of unsendable) delete kept[name];
+        try {
+          JSON.stringify(rolloutOutputToWire(kept));
+          warn(
+            `[agent-flywheel] rollout ${rolloutId}'s ${unsendable.join(", ")} ` +
+            `could not be represented (${err?.message ?? err}) and was not ` +
+            `sent; the rest of the result was.`,
+          );
+          return kept;
+        } catch { /* something else is wrong too: the full salvage below */ }
+      }
       const dropped = ["toolCalls", "llmCallCount", "reward", "success",
         "agentFingerprint", "artifacts", "events", "timing",
         "checks", "termination", "seeds"]
