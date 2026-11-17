@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { InvalidFeedback } from "../src/wire.js";
+import { InvalidFeedback, rfc3339UnixNanos } from "../src/wire.js";
 import { createTurnUploader, reportTurnFeedbackOnItsSpan } from "../src/capture.js";
 import { __resetTracerForTests, recordTurnSpan } from "../src/tracing.js";
 
@@ -162,6 +162,14 @@ describe("feedback on a production turn", () => {
       reportTurnFeedbackOnItsSpan("accepted", { turnId: TURN, occurredAt: AT });
       assert.deepEqual(t.spans.at(-1).links, []);
     });
+  });
+
+  it("times the event to the nanosecond the report states", () => {
+    assert.equal(rfc3339UnixNanos("2026-11-10T09:00:00.123456789+05:30"),
+      1794281400123456789n);
+    assert.equal(rfc3339UnixNanos("2026-11-10T09:00:00.1234567891Z"),
+      1794301200123456789n);
+    assert.equal(rfc3339UnixNanos("0050-01-01T00:00:00Z"), -60589296000000000000n);
   });
 
   it("records nothing without a tracer", () => {
