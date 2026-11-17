@@ -20,9 +20,10 @@ import { TransportError } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
-  PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
+  PRODUCTION_TURN_BATCH_MAX_ITEMS, TURN_FEEDBACK_BATCH_MAX_ITEMS,
+  productionAgentIdentifier,
   productionIdentifier, productionOutcome, productionTurnIdentifier,
-  rolloutOutputToWire,
+  rolloutOutputToWire, turnFeedback,
   rolloutRequestFromWire, rulebookReceiptFromWire, rulebookRequestToWire,
 } from "./wire.js";
 
@@ -597,6 +598,38 @@ export class AttachTransport {
     return this._c.request("POST", "/outcomes", {
       jsonBody: { agent_id: agentId, outcomes: body },
       idempotencyKey: `outcomes-${quoteIdentifier(agentId)}-${bodyDigest(body)}`,
+    });
+  }
+
+  /**
+   * Upload a batch of per-turn feedback: `POST /turn-feedback`.
+   *
+   * What the user did with one turn of one episode, each in the shape
+   * `turnFeedback` validates -- which every report is passed through again
+   * here. REPLAYABLE, like `reportOutcomes`: the control plane keys each
+   * report on its `feedback_id` and answers a replay as a duplicate. The
+   * idempotency key is the outcome batch's derivation over the feedback,
+   * matching `agent_flywheel.transport.report_turn_feedback`.
+   */
+  reportTurnFeedback(agentId, feedback) {
+    if (productionAgentIdentifier(agentId) === null) {
+      throw new ContractError(
+        "turn feedback agent_id does not match the published production agent identifier grammar",
+      );
+    }
+    if (
+      !Array.isArray(feedback)
+      || feedback.length < 1
+      || feedback.length > TURN_FEEDBACK_BATCH_MAX_ITEMS
+    ) {
+      throw new ContractError(
+        `turn feedback batches must contain between 1 and ${TURN_FEEDBACK_BATCH_MAX_ITEMS} reports`,
+      );
+    }
+    const body = feedback.map(turnFeedback);
+    return this._c.request("POST", "/turn-feedback", {
+      jsonBody: { agent_id: agentId, feedback: body },
+      idempotencyKey: `turn-feedback-${quoteIdentifier(agentId)}-${bodyDigest(body)}`,
     });
   }
 

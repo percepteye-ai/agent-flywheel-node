@@ -94,8 +94,8 @@ export class ContractError extends Error {
 
 /**
  * `reportOutcome` was handed something the outcome wire cannot carry: a word
- * outside the closed vocabulary, no turn or conversation to attach it to, an
- * id, number, note or time the published schema refuses. The Python SDK's
+ * outside the closed vocabulary, no turn, conversation or episode to attach it
+ * to, an id, number, note or time the published schema refuses. The Python SDK's
  * `InvalidOutcome`. Thrown BEFORE anything is stored or sent, whether or not
  * production capture is enabled.
  */
@@ -103,6 +103,20 @@ export class InvalidOutcome extends ContractError {
   constructor(message) {
     super(message);
     this.name = "InvalidOutcome";
+  }
+}
+
+/**
+ * `reportTurnFeedback` was handed something the feedback wire cannot carry: a
+ * word outside the closed vocabulary (the message names the allowed ones), an
+ * episode id or turn index that is none, or a time the published schema
+ * refuses. The Python SDK's `InvalidFeedback`. Thrown BEFORE anything is
+ * stored or sent.
+ */
+export class InvalidFeedback extends ContractError {
+  constructor(message) {
+    super(message);
+    this.name = "InvalidFeedback";
   }
 }
 
@@ -154,8 +168,8 @@ export function isRfc3339Instant(text) {
   return true;
 }
 const OUTCOME_WIRE_KEYS = new Set([
-  "outcome_id", "outcome", "turn_id", "conversation_id", "value", "note",
-  "occurred_at",
+  "outcome_id", "outcome", "turn_id", "conversation_id", "episode_id",
+  "value", "note", "occurred_at",
 ]);
 
 /**
@@ -200,9 +214,17 @@ export function productionOutcome(wire) {
     }
     out.conversation_id = wire.conversation_id;
   }
-  if (!("turn_id" in out) && !("conversation_id" in out)) {
+  if (present(wire.episode_id)) {
+    // The `rolloutId` the platform handed the agent with the episode.
+    if (productionIdentifier(wire.episode_id) === null) {
+      throw new InvalidOutcome("episode_id is not a valid identifier");
+    }
+    out.episode_id = wire.episode_id;
+  }
+  if (!("turn_id" in out) && !("conversation_id" in out) && !("episode_id" in out)) {
     throw new InvalidOutcome(
-      "an outcome names the turn_id or the conversation_id it is the outcome of");
+      "an outcome names the turn_id, the conversation_id or the episode_id " +
+      "it is the outcome of");
   }
   if (present(wire.value)) {
     if (typeof wire.value !== "number" || !Number.isFinite(wire.value)) {
@@ -228,6 +250,80 @@ export function productionOutcome(wire) {
   }
   out.occurred_at = wire.occurred_at;
   return out;
+}
+
+/**
+ * Whether a reported outcome names an episode and nothing else. Such an
+ * outcome is about a platform-run episode, not the agent's end users'
+ * traffic, so it is sent without the production-capture consent a turn's or a
+ * conversation's outcome needs. The Python SDK's `names_only_an_episode`.
+ */
+export function namesOnlyAnEpisode(outcome) {
+  return "episode_id" in outcome && !("turn_id" in outcome)
+    && !("conversation_id" in outcome);
+}
+
+/**
+ * THE closed vocabulary of `reportTurnFeedback`: what the user did with one
+ * turn. Asserted verbatim against `schema/flywheel-1.json`
+ * (`TurnFeedback.signal`); the Python SDK's `TURN_FEEDBACK_SIGNALS`.
+ */
+export const TURN_FEEDBACK_SIGNALS = Object.freeze([
+  "accepted", "corrected", "repeated", "escalated", "abandoned",
+]);
+/** A turn index is a position inside one episode (the schema's `maximum`). */
+export const TURN_FEEDBACK_TURN_INDEX_MAX = 100000;
+export const TURN_FEEDBACK_BATCH_MAX_ITEMS = 64;
+const FEEDBACK_WIRE_KEYS = new Set([
+  "feedback_id", "episode_id", "turn_index", "signal", "occurred_at",
+]);
+
+/**
+ * One per-turn feedback report exactly as the wire carries it, or
+ * `InvalidFeedback` naming what is wrong.
+ *
+ * THE one validator, as `productionOutcome` is for outcomes:
+ * `reportTurnFeedback` builds its record through it and the transport passes
+ * every report through it again before a batch leaves. The Python SDK's
+ * `turn_feedback`, rule for rule and message for message.
+ */
+export function turnFeedback(wire) {
+  if (!wire || typeof wire !== "object" || Array.isArray(wire)) {
+    throw new InvalidFeedback(`feedback must be an object, got ${jsonType(wire)}`);
+  }
+  const unknown = Object.keys(wire).filter((k) => !FEEDBACK_WIRE_KEYS.has(k)).sort();
+  if (unknown.length) {
+    throw new InvalidFeedback(`feedback has no field ${JSON.stringify(unknown[0])}`);
+  }
+  const { signal } = wire;
+  if (typeof signal !== "string" || !TURN_FEEDBACK_SIGNALS.includes(signal)) {
+    const got = typeof signal === "string" ? JSON.stringify(signal) : jsonType(signal ?? null);
+    throw new InvalidFeedback(
+      `signal must be one of ${TURN_FEEDBACK_SIGNALS.join(", ")}; got ${got}`);
+  }
+  if (productionTurnIdentifier(wire.feedback_id) === null) {
+    throw new InvalidFeedback("feedback_id is not a valid identifier");
+  }
+  if (productionIdentifier(wire.episode_id) === null) {
+    throw new InvalidFeedback("episode_id is not a valid identifier");
+  }
+  const turnIndex = wire.turn_index;
+  if (
+    typeof turnIndex !== "number" || !Number.isInteger(turnIndex)
+    || turnIndex < 0 || turnIndex > TURN_FEEDBACK_TURN_INDEX_MAX
+  ) {
+    throw new InvalidFeedback(
+      `turn_index must be a whole number from 0 to ${TURN_FEEDBACK_TURN_INDEX_MAX}`);
+  }
+  if (!isRfc3339Instant(wire.occurred_at)) {
+    throw new InvalidFeedback(
+      "occurred_at must be an RFC 3339 time with its offset, such as " +
+      "2026-11-10T09:00:00Z");
+  }
+  return {
+    feedback_id: wire.feedback_id, episode_id: wire.episode_id,
+    turn_index: turnIndex, signal, occurred_at: wire.occurred_at,
+  };
 }
 
 /**

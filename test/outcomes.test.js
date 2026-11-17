@@ -200,7 +200,7 @@ describe("reportOutcome: validated where it is called", () => {
   });
 
   const refused = [
-    [{}, "turn_id or the conversation_id"],
+    [{}, "conversation_id or the episode_id it is the outcome of"],
     [{ turnId: "../escape" }, "turn_id"],
     [{ turnId: 7 }, "turn_id"],
     [{ conversationId: " padded" }, "conversation_id"],
@@ -906,7 +906,7 @@ describe("the outcome wire: the schema and the code are one vocabulary", () => {
       batch.properties.outcomes.maxItems, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS);
     assert.deepEqual(
       Object.keys(outcome.properties).sort(),
-      ["conversation_id", "note", "occurred_at", "outcome", "outcome_id",
+      ["conversation_id", "episode_id", "note", "occurred_at", "outcome", "outcome_id",
        "turn_id", "value"]);
     assert.throws(
       () => productionOutcome({ outcome_id: "o1", outcome: "resolved",

@@ -80,8 +80,9 @@ import {
   AttachTransport, declareRulebook, rulesNeverSent, sentence,
 } from "./transport.js";
 import {
-  CONTRACT_VERSION, InvalidOutcome, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
-  productionOutcome,
+  CONTRACT_VERSION, InvalidFeedback, InvalidOutcome,
+  PRODUCTION_OUTCOME_BATCH_MAX_ITEMS, TURN_FEEDBACK_BATCH_MAX_ITEMS,
+  namesOnlyAnEpisode, productionOutcome, turnFeedback,
 } from "./wire.js";
 import {
   listTurnDirs, readConversationId, readModelBoundary, readTaskId,
@@ -621,6 +622,12 @@ export function createTurnCapture({ root, logger = null }) {
 export const OUTCOME_FILE_PREFIX = ".outcome.";
 export const OUTCOME_FILE_SUFFIX = ".json";
 /**
+ * Per-turn feedback waits the same way, under its own name:
+ * `.feedback.<digest of its id>.json`. The outcomes' week and count bounds
+ * apply to it. The Python SDK's `_FEEDBACK_FILE_PREFIX`.
+ */
+export const FEEDBACK_FILE_PREFIX = ".feedback.";
+/**
  * How long an outcome that could not be delivered is kept: a week, the
  * rollout outbox's bound. An outbox nothing can drain (a control plane with no
  * `/outcomes` route yet) must not grow for the life of a deployment.
@@ -649,17 +656,34 @@ export function outcomeFile(root, outcomeId) {
   return join(root, `${OUTCOME_FILE_PREFIX}${digest}${OUTCOME_FILE_SUFFIX}`);
 }
 
+/** Where the feedback with this id waits (`outcomeFile`). */
+export function feedbackFile(root, feedbackId) {
+  const digest = createHash("sha256").update(feedbackId, "utf8")
+    .digest("hex").slice(0, 32);
+  return join(root, `${FEEDBACK_FILE_PREFIX}${digest}${OUTCOME_FILE_SUFFIX}`);
+}
+
+/**
+ * Whether an answer is a 4xx that sending again cannot change: not a timeout
+ * (408) or a rate limit (429), which are blips. The Python SDK's
+ * `_final_refusal`.
+ */
+function finalRefusal(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500
+    && status !== 408 && status !== 429;
+}
+
 /**
  * `occurredAt` as the wire spells it. Absent is now; a `Date` becomes UTC
  * with milliseconds and `Z` (what the Python SDK writes for a `datetime`); a
  * string goes through untouched for the validator to judge. A `Date` that is
  * not a time is refused: it names no instant.
  */
-function rfc3339(value) {
+function rfc3339(value, Refusal = InvalidOutcome) {
   const at = value === undefined || value === null ? new Date() : value;
   if (at instanceof Date) {
     if (Number.isNaN(at.getTime())) {
-      throw new InvalidOutcome("occurredAt is not a valid Date");
+      throw new Refusal("occurredAt is not a valid Date");
     }
     return at.toISOString();
   }
@@ -672,7 +696,7 @@ function rfc3339(value) {
  * `Attachment.report_outcome` builds the same record from the same arguments.
  */
 export function outcomeWire(outcome, {
-  turnId, conversationId, value, note, occurredAt, outcomeId,
+  turnId, conversationId, value, note, occurredAt, outcomeId, episodeId,
 } = {}) {
   const wire = {
     outcome_id: outcomeId === undefined || outcomeId === null
@@ -682,11 +706,30 @@ export function outcomeWire(outcome, {
   };
   for (const [name, given] of [
     ["turn_id", turnId], ["conversation_id", conversationId],
-    ["value", value], ["note", note],
+    ["episode_id", episodeId], ["value", value], ["note", note],
   ]) {
     if (given !== undefined && given !== null) wire[name] = given;
   }
   return productionOutcome(wire);
+}
+
+/**
+ * One `reportTurnFeedback` call as the feedback wire carries it, validated
+ * (`turnFeedback`); throws `InvalidFeedback`. The Python SDK's
+ * `Attachment.report_turn_feedback` builds the same record from the same
+ * arguments.
+ */
+export function feedbackWire(signal, {
+  episodeId, turnIndex, occurredAt, feedbackId,
+} = {}) {
+  return turnFeedback({
+    feedback_id: feedbackId === undefined || feedbackId === null
+      ? `f_${randomUUID().replaceAll("-", "")}` : feedbackId,
+    episode_id: episodeId,
+    turn_index: turnIndex,
+    signal,
+    occurred_at: rfc3339(occurredAt, InvalidFeedback),
+  });
 }
 
 /** `JSON.stringify` with sorted keys: the bytes Python's `sort_keys` writes
@@ -729,6 +772,14 @@ export function createTurnUploader({
   // flush that re-asks, and only an explicit no makes `reportOutcome` a
   // no-op. The Python SDK's `Attachment._consent_refused`.
   let consentRefused = false;
+  // The control plane refused an outcome that names only an episode while
+  // production capture is not enabled -- one that predates the episode join.
+  // Said once; no more are sent on those terms by this process. The Python
+  // SDK's `Attachment._episode_outcomes_refused`.
+  let episodeOutcomesRefused = false;
+  // The control plane will not take per-turn feedback (one that predates the
+  // route answers 404). Said once; after it `reportTurnFeedback` is a no-op.
+  let turnFeedbackRefused = false;
   let mayCaptureModelContent = false;
   let modelContentReason = null;
   // The cause of the last whole-batch outcome refusal said out loud, so it is
@@ -876,8 +927,9 @@ export function createTurnUploader({
   }
 
   /**
-   * Queue one outcome for upload: how a turn or a conversation actually
-   * turned out. THE PYTHON SDK'S `Attachment.report_outcome`, rule for rule.
+   * Queue one outcome for upload: how a turn, a conversation or an episode
+   * actually turned out. THE PYTHON SDK'S `Attachment.report_outcome`, rule
+   * for rule.
    *
    * Validated first, capture enabled or not (`InvalidOutcome`). Then A NO-OP
    * ONCE THE CONTROL PLANE HAS SAID production capture is not enabled for
@@ -888,12 +940,24 @@ export function createTurnUploader({
    * here asks again; it is sent once the answer is yes. At most
    * `maxOutcomesWhileUnknown` are kept while it is unknown; past that the
    * oldest are dropped, with a warning.
+   *
+   * EXCEPT AN OUTCOME THAT NAMES ONLY AN EPISODE (`namesOnlyAnEpisode`): it
+   * carries nothing about the end users' traffic, so it is queued and sent
+   * whether or not production capture is enabled -- until a control plane
+   * that predates the episode join refuses one, which is said once.
    * Returns the outcome's id once queued, else `null`; the upload itself
    * happens off the caller's path (`flush`, kicked here and not awaited).
    */
   function reportOutcome(outcome, options = {}) {
     const wire = outcomeWire(outcome, options);
-    if (!mayUpload && consentRefused) return null;
+    if (!mayUpload) {
+      if (namesOnlyAnEpisode(wire)) {
+        // Not about end users' traffic: consent is not its question.
+        if (episodeOutcomesRefused) return null;
+      } else if (consentRefused) {
+        return null;
+      }
+    }
     const path = outcomeFile(root, wire.outcome_id);
     try {
       mkdirSync(root, { recursive: true });
@@ -910,17 +974,136 @@ export function createTurnUploader({
     return wire.outcome_id;
   }
 
-  /** The outcome files waiting in the capture root, in name order. */
-  function outcomeFiles() {
+  /**
+   * Queue one per-turn feedback report: what the user did with one turn of
+   * an episode. THE PYTHON SDK'S `Attachment.report_turn_feedback`, rule for
+   * rule. Validated first (`InvalidFeedback`). It needs no production-capture
+   * consent -- it carries ids, one word and a time -- and is a no-op once the
+   * control plane has refused feedback. Returns the feedback's id once
+   * queued, else `null`; the upload happens off the caller's path.
+   */
+  function reportTurnFeedback(signal, options = {}) {
+    const wire = feedbackWire(signal, options);
+    if (turnFeedbackRefused) return null;
+    const path = feedbackFile(root, wire.feedback_id);
+    try {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(`${path}.tmp`, sortedJson(wire), "utf8");
+      renameSync(`${path}.tmp`, path);
+    } catch {
+      // Capture costs the observation, never the caller.
+      return null;
+    }
+    flush({
+      includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
+    }).catch(() => {});
+    return wire.feedback_id;
+  }
+
+  /**
+   * Upload the per-turn feedback waiting on disk. Called inside `flush`.
+   * Never throws. THE PYTHON SDK'S `Attachment._flush_feedback`, rule for
+   * rule, and simpler than `flushOutcomes` on purpose, because feedback is
+   * the weakest label there is: an acknowledged batch is deleted; a blip (no
+   * answer, a 5xx, a 408 or 429) leaves what is waiting for the next flush,
+   * bounded by the outcomes' week and count; ANY OTHER 4xx IS FINAL -- a
+   * control plane that predates the route (404), a key it does not take --
+   * so what is waiting is dropped, it is said once, and `reportTurnFeedback`
+   * is a no-op for the rest of the process.
+   *
+   * Counts, only when feedback was waiting: `feedbackSent`, `feedbackFailed`
+   * (still on disk), `feedbackDropped`.
+   */
+  async function flushFeedback() {
+    const age = (path) => {
+      try { return statSync(path).mtimeMs; } catch { return 0; }
+    };
+    const files = queuedFiles(FEEDBACK_FILE_PREFIX)
+      .map((path) => [age(path), path])
+      .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    const now = Date.now();
+    const stale = files.filter(([at]) => now - at > OUTCOME_MAX_AGE_MS);
+    const fresh = files.filter(([at]) => now - at <= OUTCOME_MAX_AGE_MS);
+    const excess = Math.max(fresh.length - OUTCOME_MAX_KEPT_UNANSWERED, 0);
+    let dropped = 0;
+    for (const [, path] of [...stale, ...fresh.slice(0, excess)]) {
+      try { rmSync(path); dropped += 1; } catch { /* kept */ }
+    }
+    const waiting = [];
+    for (const [, path] of fresh.slice(excess)) {
+      try {
+        waiting.push({ path, wire: turnFeedback(
+          JSON.parse(readFileSync(path, "utf8"))) });
+      } catch {
+        // Unreadable or not ours to send; one file costs that file.
+      }
+    }
+    if (!waiting.length || turnFeedbackRefused) {
+      return dropped ? { feedbackDropped: dropped } : {};
+    }
+    let sent = 0;
+    let left = waiting.length;
+    for (let i = 0; i < waiting.length; i += TURN_FEEDBACK_BATCH_MAX_ITEMS) {
+      const batch = waiting.slice(i, i + TURN_FEEDBACK_BATCH_MAX_ITEMS);
+      try {
+        await transport.reportTurnFeedback(agentId, batch.map((f) => f.wire));
+      } catch (err) {
+        if (finalRefusal(err?.statusCode ?? null)) {
+          turnFeedbackRefused = true;
+          for (const { path } of waiting.slice(i)) {
+            try { rmSync(path, { force: true }); } catch { /* kept */ }
+          }
+          dropped += left;
+          left = 0;
+          logger?.warn?.(
+            `[agent-flywheel] the control plane did not take per-turn ` +
+            `feedback (${err?.message ?? err}); it may predate it. What was ` +
+            `waiting is dropped and no more is sent by this process.`);
+        }
+        break;
+      }
+      for (const { path } of batch) {
+        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
+      }
+      sent += batch.length;
+      left -= batch.length;
+    }
+    return { feedbackSent: sent, feedbackFailed: left, feedbackDropped: dropped };
+  }
+
+  /** The files with this prefix waiting in the capture root, in name order. */
+  function queuedFiles(prefix) {
     try {
       return readdirSync(root).filter((n) =>
-        n.startsWith(OUTCOME_FILE_PREFIX) && n.endsWith(OUTCOME_FILE_SUFFIX))
+        n.startsWith(prefix) && n.endsWith(OUTCOME_FILE_SUFFIX))
         .sort().map((name) => join(root, name)).filter((path) => {
           try { return statSync(path).isFile(); } catch { return false; }
         });
     } catch {
       return [];
     }
+  }
+
+  /** The outcome files waiting in the capture root, in name order. */
+  function outcomeFiles() {
+    return queuedFiles(OUTCOME_FILE_PREFIX);
+  }
+
+  /**
+   * The control plane refused outcomes that name only an episode, for want
+   * of production capture: it predates the episode join (or has it switched
+   * off). Said ONCE; they stay on disk, go with the rest if capture is
+   * enabled, and no more are queued or sent on those terms by this process.
+   * The Python SDK's `_refuse_episode_outcomes`.
+   */
+  function refuseEpisodeOutcomes(reason) {
+    if (episodeOutcomesRefused) return;
+    episodeOutcomesRefused = true;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane did not take outcomes reported ` +
+      `for an episode (${reason}); it may predate them. They stay on disk ` +
+      `and no more are sent by this process unless production capture is ` +
+      `enabled.`);
   }
 
   /**
@@ -983,7 +1166,10 @@ export function createTurnUploader({
 
   /**
    * Upload the outcomes waiting on disk (`files`, already past
-   * `expireOutcomes`). Called inside `flush`, after its consent gate. THE
+   * `expireOutcomes`). Called inside `flush`, after its consent gate -- or
+   * with `episodesOnly`, which sends just the outcomes that name an episode
+   * and nothing else (`namesOnlyAnEpisode`), the ones consent is not the
+   * question for; a 403 then stops those alone (`refuseEpisodeOutcomes`). THE
    * PYTHON SDK'S `Attachment._flush_outcomes`, rule for rule. THE TURNS'
    * RULES: an acknowledged batch is deleted; a 403 is the control plane's
    * decision, so sending stops and the outcomes stay; a blip leaves the batch
@@ -1018,12 +1204,12 @@ export function createTurnUploader({
    * `outcomesFailed` counts each outcome still on disk once;
    * `outcomesDropped` the records the control plane refused.
    */
-  async function flushOutcomes(files) {
+  async function flushOutcomes(files, { episodesOnly = false } = {}) {
     const waiting = [];
     for (const path of files) {
       try {
-        waiting.push({ path, wire: productionOutcome(
-          JSON.parse(readFileSync(path, "utf8"))) });
+        const wire = productionOutcome(JSON.parse(readFileSync(path, "utf8")));
+        if (!episodesOnly || namesOnlyAnEpisode(wire)) waiting.push({ path, wire });
       } catch {
         // Unreadable or not ours to send; one file costs that file.
       }
@@ -1073,7 +1259,8 @@ export function createTurnUploader({
             + refused.reduce((n, r) => n + r.batch.length, 0);
           const consent = captureRefusal(err);
           if (consent !== null) {
-            refuseUpload(consent);
+            if (episodesOnly) refuseEpisodeOutcomes(consent);
+            else refuseUpload(consent);
             failed += batch.length + untried + left();
             queue.length = 0;
             break flushing;
@@ -1170,6 +1357,11 @@ export function createTurnUploader({
    * counts are the turns'; `outcomesSent` and `outcomesFailed` are added only
    * when outcomes were waiting.
    *
+   * EXCEPT WHAT IS NOT ABOUT END USERS' TRAFFIC, which consent is not the
+   * question for: an outcome that names only an episode the platform ran,
+   * and per-turn feedback (`flushFeedback`). Those go whenever there is a
+   * control plane to send to.
+   *
    * THE WEEK'S EXPIRY RUNS ON EVERY FLUSH, consent or not
    * (`expireOutcomes`): an outcome kept while the answer is unknown, or
    * after a refusal, is bounded like any other.
@@ -1182,7 +1374,11 @@ export function createTurnUploader({
       const waiting = expireOutcomes();
       if (mayUpload && waiting.length) {
         Object.assign(counts, await flushOutcomes(waiting));
+      } else if (waiting.length && !episodeOutcomesRefused) {
+        Object.assign(
+          counts, await flushOutcomes(waiting, { episodesOnly: true }));
       }
+      Object.assign(counts, await flushFeedback());
       return counts;
     } finally {
       inFlight = false;
@@ -1275,6 +1471,7 @@ export function createTurnUploader({
     },
     flush,
     reportOutcome,
+    reportTurnFeedback,
   };
 }
 
@@ -1476,10 +1673,13 @@ export function registerTurnCapture(api, {
   }
 
   /**
-   * Tell the control plane how a turn or a conversation turned out: the
-   * Python SDK's `Attachment.report_outcome`. `outcome` is one of
-   * `PRODUCTION_OUTCOMES`; `turnId` is the run id the turn was captured under
-   * and `conversationId` its conversation -- give either or both. Optional
+   * Tell the control plane how a turn, a conversation or an episode turned
+   * out: the Python SDK's `Attachment.report_outcome`. `outcome` is one of
+   * `PRODUCTION_OUTCOMES`; `turnId` is the run id the turn was captured under,
+   * `conversationId` its conversation, and `episodeId` the `rolloutId` the
+   * platform handed the agent with an episode it ran -- give at least one. An
+   * outcome that names only an episode joins that episode's reward evidence
+   * as a weak reading and needs no production-capture consent. Optional
    * `value` (a number of your own), `note` (at most 1,000 characters, masked
    * by the control plane), `occurredAt` (a `Date` or RFC 3339 string; now when
    * omitted) and `outcomeId` (this report's idempotency key; minted when
@@ -1497,11 +1697,34 @@ export function registerTurnCapture(api, {
     return uploader.reportOutcome(outcome, options);
   }
 
+  /**
+   * Tell the control plane what the user did with one turn of an episode:
+   * the Python SDK's `Attachment.report_turn_feedback`. `signal` is one of
+   * `TURN_FEEDBACK_SIGNALS`; `episodeId` is the `rolloutId` the platform
+   * handed the agent with the episode and `turnIndex` the zero-based position
+   * of the turn in it. Optional `occurredAt` (a `Date` or RFC 3339 string;
+   * now when omitted) and `feedbackId` (this report's idempotency key; minted
+   * when omitted). A WEAK LABEL and not an outcome: it scores nothing and is
+   * stored apart from reported outcomes. Throws `InvalidFeedback` for what
+   * the wire cannot carry (the message names the allowed words); otherwise
+   * returns the feedback's id once queued, or `null` -- a no-op -- with no
+   * key, or once the control plane has refused feedback (one that predates
+   * it answers 404; said once). No answer of the control plane ever reaches
+   * the caller.
+   */
+  function reportTurnFeedback(signal, options = {}) {
+    if (!uploader) {
+      feedbackWire(signal, options);
+      return null;
+    }
+    return uploader.reportTurnFeedback(signal, options);
+  }
+
   // `transport` is handed out so the serving-policy read reuses THIS client
   // rather than constructing a second one against the same base URL and key.
   return {
     turns, uploader, root, transport, started, rulebook, prune, retentionTurns,
-    reportOutcome,
+    reportOutcome, reportTurnFeedback,
     get rulebookRefusal() { return rulebookRefusal; },
   };
 }
