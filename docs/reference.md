@@ -104,6 +104,8 @@ export PERCEPTEYE_AGENT_MODE=production   # the default — for the process serv
 
 **In `training` the plugin works the flywheel on its own**, starting each rollout's turn in its own `percepteye-rollout-*` session — never one you are using. If the host closes that seam, it says so once and falls back to delivering the task into the next turn you start; rollouts keep working either way.
 
+**An agent whose own environment grades the episode says so in a file.** When the plugin drives a rollout it reads `outcome.json` from `PERCEPTEYE_TRAJECTORY_DIR` as the agent's run ends: one JSON object, every key optional — `reward` (a finite number), `success` (`true` or `false`), and `checks`, `termination` and `seeds` as the report carries them. These are the Python runner's rules for the same file, and the Python SDK's suite drives one table of files through both readers. Nothing is coerced, and a part that is malformed is ignored alone: the rollout is still reported. More than 200 checks is not malformed — the first 200 are reported and the report says how many were not (`checks_dropped`); the same count says so when a report's checks could not be sent at all. `NaN` and `Infinity` are read as `null`. The file is read once and removed, and one left by an earlier run is discarded when a rollout starts, so no episode is graded by another's file. A success the host itself reported is never taken back by the file.
+
 `PERCEPTEYE_TRAJECTORY_DIR` names where a **training** rollout's outcomes are written, and the rollout driver sets it per rollout. It is not an off switch. These are:
 
 ```bash
