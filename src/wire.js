@@ -305,10 +305,35 @@ const FEEDBACK_WIRE_KEYS = new Set([
  * `turn_feedback`, rule for rule and message for message.
  */
 export function turnFeedback(wire) {
+  const signal = feedbackHead(wire, FEEDBACK_WIRE_KEYS);
+  if (productionIdentifier(wire.episode_id) === null) {
+    throw new InvalidFeedback("episode_id is not a valid identifier");
+  }
+  const turnIndex = wire.turn_index;
+  if (
+    typeof turnIndex !== "number" || !Number.isInteger(turnIndex)
+    || turnIndex < 0 || turnIndex > TURN_FEEDBACK_TURN_INDEX_MAX
+  ) {
+    throw new InvalidFeedback(
+      `turn_index must be a whole number from 0 to ${TURN_FEEDBACK_TURN_INDEX_MAX}`);
+  }
+  feedbackTime(wire);
+  return {
+    feedback_id: wire.feedback_id, episode_id: wire.episode_id,
+    turn_index: turnIndex, signal, occurred_at: wire.occurred_at,
+  };
+}
+
+/**
+ * The checks every per-turn feedback report shares, in their order -- an
+ * object, no field outside `keys`, a `signal` from the vocabulary, a
+ * `feedback_id` -- and the signal. The Python SDK's `_feedback_head`.
+ */
+function feedbackHead(wire, keys) {
   if (!wire || typeof wire !== "object" || Array.isArray(wire)) {
     throw new InvalidFeedback(`feedback must be an object, got ${jsonType(wire)}`);
   }
-  const unknown = Object.keys(wire).filter((k) => !FEEDBACK_WIRE_KEYS.has(k)).sort();
+  const unknown = Object.keys(wire).filter((k) => !keys.has(k)).sort();
   if (unknown.length) {
     throw new InvalidFeedback(`feedback has no field ${JSON.stringify(unknown[0])}`);
   }
@@ -321,26 +346,69 @@ export function turnFeedback(wire) {
   if (productionTurnIdentifier(wire.feedback_id) === null) {
     throw new InvalidFeedback("feedback_id is not a valid identifier");
   }
-  if (productionIdentifier(wire.episode_id) === null) {
-    throw new InvalidFeedback("episode_id is not a valid identifier");
-  }
-  const turnIndex = wire.turn_index;
-  if (
-    typeof turnIndex !== "number" || !Number.isInteger(turnIndex)
-    || turnIndex < 0 || turnIndex > TURN_FEEDBACK_TURN_INDEX_MAX
-  ) {
-    throw new InvalidFeedback(
-      `turn_index must be a whole number from 0 to ${TURN_FEEDBACK_TURN_INDEX_MAX}`);
-  }
+  return signal;
+}
+
+function feedbackTime(wire) {
   if (!isRfc3339Instant(wire.occurred_at)) {
     throw new InvalidFeedback(
       "occurred_at must be an RFC 3339 time with its offset, such as " +
       "2026-11-10T09:00:00Z");
   }
+}
+
+/**
+ * What feedback on a PRODUCTION TURN carries: the turn's own id in place of
+ * an episode and a position. Not sent to `POST /turn-feedback` (whose turns
+ * are an episode's); it is an event on that turn's trace.
+ */
+const SPAN_FEEDBACK_KEYS = new Set(["feedback_id", "turn_id", "signal", "occurred_at"]);
+
+/**
+ * Per-turn feedback on a production turn, `{feedback_id, turn_id, signal,
+ * occurred_at}`, or `InvalidFeedback` naming what is wrong: `turnFeedback`'s
+ * vocabulary, ids and time, with the turn named by the `turn_id` its span
+ * carries (`percepteye.turn.id`). What `recordTurnFeedbackSpan` emits. The
+ * Python SDK's `contract.turn_feedback_on_a_span`, same rules, same messages.
+ */
+export function turnFeedbackOnASpan(wire) {
+  const signal = feedbackHead(wire, SPAN_FEEDBACK_KEYS);
+  if (productionTurnIdentifier(wire.turn_id) === null) {
+    throw new InvalidFeedback("turn_id is not a valid turn identifier");
+  }
+  feedbackTime(wire);
   return {
-    feedback_id: wire.feedback_id, episode_id: wire.episode_id,
-    turn_index: turnIndex, signal, occurred_at: wire.occurred_at,
+    feedback_id: wire.feedback_id, turn_id: wire.turn_id, signal,
+    occurred_at: wire.occurred_at,
   };
+}
+
+/**
+ * An RFC 3339 instant (one `isRfc3339Instant` takes) as Unix nanoseconds, a
+ * BigInt, exactly: the fraction's first nine digits, the offset applied. What
+ * an OTel event's `timeUnixNano` carries. The Python SDK's
+ * `contract.rfc3339_unix_nanos`.
+ */
+export function rfc3339UnixNanos(value) {
+  const m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(Z|([+-])([0-9]{2}):([0-9]{2}))$/
+    .exec(String(value));
+  if (m === null) {
+    throw new InvalidFeedback(
+      "occurred_at must be an RFC 3339 time with its offset, such as " +
+      "2026-11-10T09:00:00Z");
+  }
+  const [y, mo, d, h, mi, sec] = m.slice(1, 7).map(Number);
+  // setUTCFullYear, not Date.UTC: Date.UTC reads a year below 100 as 19xx.
+  const at = new Date(0);
+  at.setUTCFullYear(y, mo - 1, d);
+  at.setUTCHours(h, mi, sec, 0);
+  let seconds = BigInt(at.getTime() / 1000);
+  if (m[8] !== "Z") {
+    const offset = BigInt(Number(m[10]) * 3600 + Number(m[11]) * 60);
+    seconds -= m[9] === "+" ? offset : -offset;
+  }
+  const fraction = BigInt(`${m[7] ?? ""}000000000`.slice(0, 9));
+  return seconds * 1_000_000_000n + fraction;
 }
 
 /**

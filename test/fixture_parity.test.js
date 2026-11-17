@@ -43,6 +43,11 @@ const SHARED = {
   // SDK's `adapters._media.media_part`).
   "media_parts.json":
     "a317549fe426f8351a4aabf8e97bda99f35ab7af0dd74b5587eac5e50f0eccac",
+  // A production turn and the feedback on it, as both SDKs export them over
+  // OTLP (`turn-feedback-span.test.js`); what the control plane's reader of
+  // the feedback event is driven with.
+  "turn_feedback_span.json":
+    "8b9ba5c2c548942aa868128988140f86505f2fa685279d7f5d004e6ebcf1fb01",
 };
 
 const ours = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url));

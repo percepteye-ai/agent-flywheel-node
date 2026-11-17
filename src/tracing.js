@@ -53,6 +53,42 @@ export const MAX_ATTRIBUTE_CHARS = 2000;
  */
 export const MAX_TURN_CHARS = 20000;
 
+/**
+ * PER-TURN FEEDBACK ON A TURN'S TRACE. What a user did with a production turn
+ * is an EVENT on that turn: the event Mission Control's OTLP intake reads,
+ * with the signal (one of `TURN_FEEDBACK_SIGNALS`) and the report's own id.
+ * The Python SDK's `tracing.TURN_FEEDBACK_*`.
+ */
+export const TURN_FEEDBACK_EVENT = "percepteye.turn.feedback";
+export const TURN_FEEDBACK_SIGNAL_ATTRIBUTE = "percepteye.turn.feedback.signal";
+export const TURN_FEEDBACK_ID_ATTRIBUTE = "percepteye.turn.feedback.id";
+
+/**
+ * The span contexts of the production turns this process recorded, so
+ * feedback reported after them LINKS to them (`recordTurnFeedbackSpan`).
+ * Bounded: the oldest turns are forgotten first (a Map iterates in insertion
+ * order), and feedback on one of them still names its turn by
+ * `percepteye.turn.id`.
+ */
+const turnSpans = new Map();
+const TURN_SPANS_MAX = 1024;
+/** Spans one turn records (its question and its answer, each its own span). */
+const TURN_SPANS_PER_TURN = 8;
+
+function rememberTurnSpan(turnId, span) {
+  try {
+    const context = span.spanContext();
+    const kept = [...(turnSpans.get(turnId) ?? []), context].slice(-TURN_SPANS_PER_TURN);
+    turnSpans.delete(turnId);
+    turnSpans.set(turnId, kept);
+    while (turnSpans.size > TURN_SPANS_MAX) {
+      turnSpans.delete(turnSpans.keys().next().value);
+    }
+  } catch {
+    /* the link is lost, never the turn */
+  }
+}
+
 //: Resolved once. ``null`` means the OTel API is not installed, which is the
 //: normal case: it is an optional peer dependency and this package ships with
 //: no runtime dependencies.
@@ -260,6 +296,9 @@ export function recordTurnSpan(opts = {}) {
         setIf(span, "percepteye.task.id", taskId && String(taskId));
         setIf(span, "percepteye.agent.execution_sha256",
               executionSha256 && String(executionSha256));
+        // A production turn: what its user does next may be reported after
+        // this span has ended (recordTurnFeedbackSpan).
+        if (turnId && !rolloutId) rememberTurnSpan(String(turnId), span);
       } finally {
         try { span.end(); } catch { /* nothing left to do */ }
       }
@@ -269,9 +308,60 @@ export function recordTurnSpan(opts = {}) {
   }
 }
 
+/**
+ * Put what a user did with a production turn on that turn's trace. Returns
+ * whether a span was recorded. Never throws.
+ *
+ * THE TURN'S SPAN HAS ENDED by the time its user acts -- `recordTurnSpan` ends
+ * it at once -- and an ended span takes no event. So the event rides a span
+ * of its own, `percepteye.turn.feedback`, LINKED to the span(s) of the turn
+ * this process recorded: a link is OpenTelemetry's relation between spans
+ * that are causally related but not parent and child, as a later reaction is
+ * to the answer it reacts to. The span also carries the turn's
+ * `percepteye.turn.id`, so it names its turn after this process forgot the
+ * turn's spans, or never recorded them. It starts a trace of its own (the
+ * root context), never a child of whatever span is active where the caller
+ * reports it.
+ *
+ * The event: `percepteye.turn.feedback` at `occurredAtUnixNano` (a BigInt:
+ * when the user acted), with `percepteye.turn.feedback.signal` and, when
+ * given, `percepteye.turn.feedback.id`. The Python SDK's
+ * `record_turn_feedback_span`.
+ */
+export function recordTurnFeedbackSpan({
+  turnId, signal, occurredAtUnixNano, feedbackId = null,
+} = {}) {
+  const t = tracer();
+  if (t === null) return false;
+  try {
+    const links = (turnSpans.get(String(turnId)) ?? []).map((context) => ({ context }));
+    const root = _api?.ROOT_CONTEXT;
+    const span = t.startSpan(TURN_FEEDBACK_EVENT, { links }, root);
+    try {
+      if (typeof span.isRecording === "function" && !span.isRecording()) return false;
+      span.setAttribute("percepteye.turn.id", String(turnId));
+      const attributes = { [TURN_FEEDBACK_SIGNAL_ATTRIBUTE]: String(signal) };
+      if (feedbackId) attributes[TURN_FEEDBACK_ID_ATTRIBUTE] = String(feedbackId);
+      // HrTime, [seconds, nanoseconds]: a number of milliseconds would lose
+      // the nanoseconds the report states.
+      const nanos = BigInt(occurredAtUnixNano);
+      const second = 1_000_000_000n;
+      const whole = nanos >= 0n ? nanos / second : -((-nanos + second - 1n) / second);
+      span.addEvent(TURN_FEEDBACK_EVENT, attributes,
+        [Number(whole), Number(nanos - whole * second)]);
+      return true;
+    } finally {
+      try { span.end(); } catch { /* nothing left to do */ }
+    }
+  } catch {
+    return false;
+  }
+}
+
 /** Test seam: forget the resolved tracer so a suite can install a fake. */
 export function __resetTracerForTests(fake = undefined, api = undefined) {
   _tracer = fake ?? null;
   _api = api ?? null;
   _resolved = fake !== undefined;
+  turnSpans.clear();
 }

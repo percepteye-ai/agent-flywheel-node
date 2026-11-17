@@ -82,8 +82,10 @@ import {
 import {
   CONTRACT_VERSION, InvalidFeedback, InvalidOutcome,
   PRODUCTION_OUTCOME_BATCH_MAX_ITEMS, TURN_FEEDBACK_BATCH_MAX_ITEMS,
-  namesOnlyAnEpisode, productionOutcome, turnFeedback,
+  namesOnlyAnEpisode, productionOutcome, rfc3339UnixNanos, turnFeedback,
+  turnFeedbackOnASpan,
 } from "./wire.js";
+import { recordTurnFeedbackSpan } from "./tracing.js";
 import {
   listTurnDirs, readConversationId, readModelBoundary, readTaskId,
   recordConversationId,
@@ -796,6 +798,45 @@ export function feedbackWire(signal, {
   });
 }
 
+/** Whether a `reportTurnFeedback` call names a production turn (`turnId`). */
+function namesAProductionTurn(options) {
+  return options?.turnId !== undefined && options?.turnId !== null;
+}
+
+/**
+ * `reportTurnFeedback` for a PRODUCTION TURN (`turnId`, the run id the turn
+ * was captured under, in place of `episodeId` and `turnIndex`): validated by
+ * `turnFeedbackOnASpan`, emitted by `recordTurnFeedbackSpan` -- an event on
+ * the turn's trace, through the customer's TracerProvider, which an OTLP
+ * export to the control plane delivers with the turn. `POST /turn-feedback`
+ * takes an episode's turns only, so nothing is queued for it. The id once the
+ * span is recorded, else `null`. The Python SDK's
+ * `Attachment._report_turn_feedback_on_its_span`.
+ */
+export function reportTurnFeedbackOnItsSpan(signal, {
+  turnId, episodeId, turnIndex, occurredAt, feedbackId,
+} = {}) {
+  if (episodeId !== undefined && episodeId !== null
+      || turnIndex !== undefined && turnIndex !== null) {
+    throw new InvalidFeedback(
+      "feedback names one turn: a production turn's turn_id, or an " +
+      "episode's episode_id and turn_index, not both");
+  }
+  const wire = turnFeedbackOnASpan({
+    feedback_id: feedbackId === undefined || feedbackId === null
+      ? `f_${randomUUID().replaceAll("-", "")}` : feedbackId,
+    turn_id: turnId,
+    signal,
+    occurred_at: rfc3339(occurredAt, InvalidFeedback),
+  });
+  const recorded = recordTurnFeedbackSpan({
+    turnId: wire.turn_id, signal: wire.signal,
+    occurredAtUnixNano: rfc3339UnixNanos(wire.occurred_at),
+    feedbackId: wire.feedback_id,
+  });
+  return recorded ? wire.feedback_id : null;
+}
+
 /** `JSON.stringify` with sorted keys: the bytes Python's `sort_keys` writes
  * are not promised, only that either SDK reads the other's file. */
 function sortedJson(wire) {
@@ -1052,6 +1093,9 @@ export function createTurnUploader({
    * queued, else `null`; the upload happens off the caller's path.
    */
   function reportTurnFeedback(signal, options = {}) {
+    if (namesAProductionTurn(options)) {
+      return reportTurnFeedbackOnItsSpan(signal, options);
+    }
     const wire = feedbackWire(signal, options);
     if (turnFeedbackRefused) return null;
     const path = feedbackFile(root, wire.feedback_id);
@@ -1847,9 +1891,14 @@ export function registerTurnCapture(api, {
    * key, or once the control plane has refused this key feedback (a 403;
    * what is waiting stays on disk) or shown it has no route for it (a 404 or
    * 405; what was waiting is dropped) -- each said once. No answer of the control plane ever reaches
-   * the caller.
+   * the caller. A PRODUCTION TURN is named by `turnId` instead, and its
+   * feedback is an event on its trace (`reportTurnFeedbackOnItsSpan`).
    */
   function reportTurnFeedback(signal, options = {}) {
+    if (namesAProductionTurn(options)) {
+      // Its trace carries it, not the control plane's route: no key needed.
+      return reportTurnFeedbackOnItsSpan(signal, options);
+    }
     if (!uploader) {
       feedbackWire(signal, options);
       return null;
