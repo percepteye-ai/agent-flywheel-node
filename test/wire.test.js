@@ -14,7 +14,8 @@ import { pythonFile } from "./support/python-sdk.js";
 import {
   CONTRACT_VERSION, ContractError, RULEBOOK_RECEIPT_KEYS,
   RULEBOOK_RECEIPT_STATUSES, WIRE_KEYS, rolloutOutputToWire,
-  rolloutRequestFromWire, rulebookRequestToWire,
+  rolloutRequestFromWire, rulebookRequestToWire, productionOutcome,
+  turnFeedback, productionIdentifier, productionTurnIdentifier,
 } from "../src/wire.js";
 
 const schema = JSON.parse(
@@ -332,5 +333,35 @@ describe("checks, termination and seeds", () => {
     assert.deepEqual(
       seedsToWire({ environment: Number.MAX_SAFE_INTEGER, sampling: -3 }),
       { environment: Number.MAX_SAFE_INTEGER, sampling: -3 });
+  });
+});
+
+describe("text the control plane's parser takes", () => {
+  // A LONE SURROGATE is escaped by JSON.stringify and refused by the control
+  // plane's parser: a 422 for the batch, then a record dropped by the split.
+  const lone = "case-\ud800";
+  const emoji = "case-\u{1F600}";
+  const at = "2026-11-10T09:00:00Z";
+  const outcome = { outcome_id: "o-1", outcome: "resolved", episode_id: "e-1", occurred_at: at };
+  const feedback = { feedback_id: "f-1", signal: "accepted", episode_id: "e-1", turn_index: 0, occurred_at: at };
+
+  it("refuses an id with a lone surrogate, and keeps an emoji", () => {
+    for (const check of [productionIdentifier, productionTurnIdentifier]) {
+      assert.equal(check(lone), null);
+      assert.equal(check(emoji), emoji);
+    }
+    for (const field of ["outcome_id", "turn_id", "conversation_id", "episode_id"]) {
+      assert.throws(() => productionOutcome({ ...outcome, [field]: lone }), ContractError, field);
+      assert.equal(productionOutcome({ ...outcome, [field]: emoji })[field], emoji);
+    }
+    for (const field of ["feedback_id", "episode_id"]) {
+      assert.throws(() => turnFeedback({ ...feedback, [field]: lone }), ContractError, field);
+    }
+  });
+
+  it("refuses a note with a lone surrogate", () => {
+    assert.throws(() => productionOutcome({ ...outcome, note: `x${lone}` }),
+      /note must be well-formed Unicode text/);
+    assert.equal(productionOutcome({ ...outcome, note: emoji }).note, emoji);
   });
 });
