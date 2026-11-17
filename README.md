@@ -38,9 +38,9 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
      repo went public and the workflow was enabled again on 2026-10-20.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 989 was true on 2026-11-17 (it had drifted to 983, 944, 862, 861, 859, 850, 829, 826, 781, 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
+     its 1001 was true on 2026-11-17 (it had drifted to 989, 983, 944, 862, 861, 859, 850, 829, 826, 781, 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 989" / "skipped 0")
+     (prints "tests 1001" / "skipped 0")
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -48,7 +48,7 @@ One plugin. Zero runtime dependencies. Zero lines changed in your agent.
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
 [![lines changed in your agent](https://img.shields.io/badge/lines_changed_in_your_agent-0-ec4899?style=for-the-badge)](#-install-in-one-call)
-[![tests](https://img.shields.io/badge/tests-989_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-1001_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -335,6 +335,8 @@ capture.reportTurnFeedback("corrected", { episodeId,              // ...and what
 ```
 
 `episodeId` is one more thing an outcome can name, alone or beside a `turnId` or `conversationId`. `reportTurnFeedback` is the Python SDK's `report_turn_feedback`: one word from a closed vocabulary — `accepted`, `corrected`, `repeated`, `escalated`, `abandoned` (`TURN_FEEDBACK_SIGNALS`) — and anything else throws `InvalidFeedback` naming the five. It returns the feedback's id (`feedbackId` is the idempotency key if you want your own; `occurredAt` defaults to now) and is queued as one `.feedback.<digest>.json` file, uploaded without being awaited and retried exactly as an outcome is. Neither is your end users' production traffic, so **neither waits for production capture to be enabled**: an outcome naming only an episode, and all feedback, are sent as soon as the plugin has a key. Both are weak labels — kept beside the episode's evidence as readings, never a grade. No answer of the control plane reaches your code. Per-turn feedback follows the outcomes' rules: a report the control plane refuses — in a 4xx, or by name inside a 200 (`accepted: false`) — is dropped alone, named in one warning with the control plane's own word, and the rest of its batch is sent; a 403 (a key without the scope) stops sending for that process and keeps what is waiting on disk; a 401 or 410 keeps it for a later flush. Only a control plane with no feedback route at all (a 404 or 405: it predates it) has what was waiting dropped, said once, and no more sent by that process. A control plane whose episode intake is switched off answers 503 with a Retry-After: the request is retried as the header says, and what is waiting stays for a later flush. An id or a note holding a lone surrogate throws where you wrote it, as the control plane would refuse it.
+
+**Feedback on a production turn rides its trace.** A production turn has no episode, so `capture.reportTurnFeedback("corrected", { turnId })` names it by the run id it was captured under instead, and its feedback goes where the turn went: your TracerProvider (with `@opentelemetry/api` installed). The turn's span has ended by the time its user acts, and an ended span takes no event, so the plugin records a span of its own, `percepteye.turn.feedback`, LINKED to the turn's spans (OpenTelemetry's relation between causally related spans that are not parent and child) and carrying the turn's `percepteye.turn.id`, with one event: `percepteye.turn.feedback` at `occurredAt`, attributes `percepteye.turn.feedback.signal` and `percepteye.turn.feedback.id`. It starts a trace of its own. An OTLP export of your traces to the control plane delivers it with the turn. It returns the feedback's id once that span is recorded and `null` when nothing records it — nothing is queued, because `POST /turn-feedback` takes an episode's turns only. Name a turn one way: `turnId`, or `episodeId` and `turnIndex`. The Python SDK's `report_turn_feedback(..., turn_id=)`, the same span.
 
 **What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the plugin also records each run's model boundary from the host's own `llm_input` and `agent_end` events — the assembled system prompt, the history, the prompt, the tool definitions, every model answer and every tool result — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. An image the model saw -- in the prompt, the history or a tool's result -- is recorded as the GenAI `blob` part both SDKs emit. Both hooks are void-returning observers and both need `hooks.allowConversationAccess: true`. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the plugin stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product; if the agent becomes shared, recording stops on that refusal and resumes once the grant is back. The host brackets an *attempt*, not each provider call, so a run the plugin cannot reconstruct faithfully records no model boundary at all rather than a guessed one: a second `llm_input` in one run, a prompt whose images the transcript does not hold as `llm_input` counted them, a runtime-context carrier, a history message the host converts out of sight, or a user message steered into the run while it was working (the model saw it, and no `llm_input` says so).
 
@@ -633,7 +635,7 @@ One host setting is not ours and has no environment form: `plugins.entries.agent
 ## 🛠 Develop
 
 ```bash
-npm test     # 989 tests, no install step — node:test, zero dependencies
+npm test     # 1001 tests, no install step — node:test, zero dependencies
 ```
 
 The tests that compare this package with the Python SDK (fixtures, the wire schema, the evidence vocabulary) read a Python checkout: name one with `PERCEPTEYE_PYTHON_SDK`, or keep it as a sibling directory. A named checkout that lacks a file fails the test; with none found, those tests skip.
