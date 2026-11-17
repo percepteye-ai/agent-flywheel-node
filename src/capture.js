@@ -402,6 +402,63 @@ export function outcomeBatchRefused(status) {
 }
 
 /**
+ * Whether an answer says THE ROUTE IS NOT THERE: a control plane older than
+ * it answers 404, or 405 where another method has the path. Every other 4xx
+ * is about the key or the records, and must never be read as this: per-turn
+ * feedback deletes its queue on it (`flushFeedback`). The Python SDK's
+ * `_route_absent`.
+ */
+export function routeAbsent(status) {
+  return status === 404 || status === 405;
+}
+
+/**
+ * What `sendReports` needs to know about each of the two report routes: how
+ * to say it (`many`, `counted`, `one`), where the reply lists its records
+ * (`results`) and a record names itself (`id`), the route's batch limit, and
+ * the transport method that sends one batch. The Python SDK's `_ReportKind`.
+ */
+const OUTCOMES = Object.freeze({
+  many: "reported outcomes", counted: "reported outcome(s)",
+  one: "an outcome", results: "outcomes", id: "outcome_id",
+  batchMax: PRODUCTION_OUTCOME_BATCH_MAX_ITEMS, send: "reportOutcomes",
+});
+const FEEDBACK = Object.freeze({
+  many: "per-turn feedback reports", counted: "per-turn feedback report(s)",
+  one: "a feedback report", results: "feedback", id: "feedback_id",
+  batchMax: TURN_FEEDBACK_BATCH_MAX_ITEMS, send: "reportTurnFeedback",
+});
+
+/** The per-record answers of an acknowledged batch; `[]` when it has none. */
+function replyRecords(reply, kind) {
+  const results = reply?.[kind.results];
+  return Array.isArray(results)
+    ? results.filter((r) => r !== null && typeof r === "object") : [];
+}
+
+/**
+ * Each record of an acknowledged batch the control plane did NOT record
+ * (`accepted: false`), as `<its id> (<the control plane's word>)`. The Python
+ * SDK's `_refused_by_name`.
+ */
+function refusedByName(reply, kind) {
+  return replyRecords(reply, kind).filter((r) => r.accepted === false)
+    .map((r) => `${r[kind.id] || "unnamed"} (${r.error || "refused"})`);
+}
+
+/**
+ * Each record the control plane recorded WITHOUT its note
+ * (`note.stored: false`), as `<its id> (<the control plane's word>)`. The
+ * Python SDK's `_notes_not_stored`.
+ */
+function notesNotStored(reply, kind) {
+  return replyRecords(reply, kind)
+    .filter((r) => r.accepted === true && r.note !== null
+      && typeof r.note === "object" && r.note.stored === false)
+    .map((r) => `${r[kind.id] || "unnamed"} (${r.note.error || "not stored"})`);
+}
+
+/**
  * The intake's sentence when it REFUSED a batch of turns, else `null`.
  *
  * THE PYTHON SDK'S `_capture_refusal`. A 403 is a DECISION -- an operator
@@ -664,16 +721,6 @@ export function feedbackFile(root, feedbackId) {
 }
 
 /**
- * Whether an answer is a 4xx that sending again cannot change: not a timeout
- * (408) or a rate limit (429), which are blips. The Python SDK's
- * `_final_refusal`.
- */
-function finalRefusal(status) {
-  return Number.isInteger(status) && status >= 400 && status < 500
-    && status !== 408 && status !== 429;
-}
-
-/**
  * `occurredAt` as the wire spells it. Absent is now; a `Date` becomes UTC
  * with milliseconds and `Z` (what the Python SDK writes for a `datetime`); a
  * string goes through untouched for the validator to judge. A `Date` that is
@@ -777,14 +824,16 @@ export function createTurnUploader({
   // Said once; no more are sent on those terms by this process. The Python
   // SDK's `Attachment._episode_outcomes_refused`.
   let episodeOutcomesRefused = false;
-  // The control plane will not take per-turn feedback (one that predates the
-  // route answers 404). Said once; after it `reportTurnFeedback` is a no-op.
+  // The control plane will not take per-turn feedback from this process: it
+  // has no such route (404, 405 -- what was waiting was dropped) or it
+  // refused this key (403 -- what was waiting stays on disk). Said once;
+  // after it `reportTurnFeedback` is a no-op.
   let turnFeedbackRefused = false;
   let mayCaptureModelContent = false;
   let modelContentReason = null;
-  // The cause of the last whole-batch outcome refusal said out loud, so it is
-  // said once (`warnWholeBatchRefusal`).
-  let outcomeBatchRefusalSaid = null;
+  // The cause of the last whole-batch refusal said out loud, per kind of
+  // report, so it is said once (`warnWholeBatchRefusal`).
+  const batchRefusalSaid = new Map();
 
   function uploadedIds() {
     try {
@@ -979,7 +1028,8 @@ export function createTurnUploader({
    * an episode. THE PYTHON SDK'S `Attachment.report_turn_feedback`, rule for
    * rule. Validated first (`InvalidFeedback`). It needs no production-capture
    * consent -- it carries ids, one word and a time -- and is a no-op once the
-   * control plane has refused feedback. Returns the feedback's id once
+   * control plane has refused feedback or shown it has no route for it.
+   * Returns the feedback's id once
    * queued, else `null`; the upload happens off the caller's path.
    */
   function reportTurnFeedback(signal, options = {}) {
@@ -1003,13 +1053,22 @@ export function createTurnUploader({
   /**
    * Upload the per-turn feedback waiting on disk. Called inside `flush`.
    * Never throws. THE PYTHON SDK'S `Attachment._flush_feedback`, rule for
-   * rule, and simpler than `flushOutcomes` on purpose, because feedback is
-   * the weakest label there is: an acknowledged batch is deleted; a blip (no
-   * answer, a 5xx, a 408 or 429) leaves what is waiting for the next flush,
-   * bounded by the outcomes' week and count; ANY OTHER 4xx IS FINAL -- a
-   * control plane that predates the route (404), a key it does not take --
-   * so what is waiting is dropped, it is said once, and `reportTurnFeedback`
-   * is a no-op for the rest of the process.
+   * rule.
+   *
+   * THE OUTCOMES' RULES, through the outcomes' own sender (`sendReports`):
+   * an acknowledged batch is deleted, and a report the control plane refused
+   * by name inside it is said by name and not sent again; a blip leaves what
+   * is waiting for the next flush, bounded by the outcomes' week and count;
+   * a 403 is its decision (a key without the scope, a key bound elsewhere),
+   * so sending stops for this process and what is waiting stays on disk; a
+   * 401 or 410 stops this flush and it stays; any other 4xx is about the
+   * records, so the batch is split and only the report it refused is
+   * dropped.
+   *
+   * ONE DIFFERENCE: AN ABSENT ROUTE (`routeAbsent`, 404 or 405) is a control
+   * plane that predates per-turn feedback, and nothing will ever take what is
+   * waiting. It is dropped, said once, and `reportTurnFeedback` is a no-op
+   * for the rest of the process.
    *
    * Counts, only when feedback was waiting: `feedbackSent`, `feedbackFailed`
    * (still on disk), `feedbackDropped`.
@@ -1041,34 +1100,42 @@ export function createTurnUploader({
     if (!waiting.length || turnFeedbackRefused) {
       return dropped ? { feedbackDropped: dropped } : {};
     }
-    let sent = 0;
-    let left = waiting.length;
-    for (let i = 0; i < waiting.length; i += TURN_FEEDBACK_BATCH_MAX_ITEMS) {
-      const batch = waiting.slice(i, i + TURN_FEEDBACK_BATCH_MAX_ITEMS);
-      try {
-        await transport.reportTurnFeedback(agentId, batch.map((f) => f.wire));
-      } catch (err) {
-        if (finalRefusal(err?.statusCode ?? null)) {
-          turnFeedbackRefused = true;
-          for (const { path } of waiting.slice(i)) {
-            try { rmSync(path, { force: true }); } catch { /* kept */ }
-          }
-          dropped += left;
-          left = 0;
-          logger?.warn?.(
-            `[agent-flywheel] the control plane did not take per-turn ` +
-            `feedback (${err?.message ?? err}); it may predate it. What was ` +
-            `waiting is dropped and no more is sent by this process.`);
-        }
-        break;
-      }
-      for (const { path } of batch) {
-        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
-      }
-      sent += batch.length;
-      left -= batch.length;
-    }
-    return { feedbackSent: sent, feedbackFailed: left, feedbackDropped: dropped };
+    const result = await sendReports(waiting, FEEDBACK, {
+      onRefusal: refuseTurnFeedback, onAbsent: turnFeedbackAbsent,
+    });
+    return {
+      feedbackSent: result.sent, feedbackFailed: result.failed,
+      feedbackDropped: dropped + result.dropped,
+    };
+  }
+
+  /**
+   * The control plane refused per-turn feedback (a 403: its decision about
+   * this key). Said ONCE; what is waiting stays on disk for its week, and no
+   * more is queued or sent by this process. The Python SDK's
+   * `_refuse_turn_feedback`.
+   */
+  function refuseTurnFeedback(reason) {
+    if (turnFeedbackRefused) return;
+    turnFeedbackRefused = true;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane refused per-turn feedback ` +
+      `(${reason}). What is waiting stays on disk and no more is sent by ` +
+      `this process.`);
+  }
+
+  /**
+   * The control plane has no per-turn feedback route (404, 405): it predates
+   * it. Said ONCE; the sender has dropped what was waiting, and no more is
+   * queued or sent by this process. The Python SDK's `_turn_feedback_absent`.
+   */
+  function turnFeedbackAbsent(reason) {
+    if (turnFeedbackRefused) return;
+    turnFeedbackRefused = true;
+    logger?.warn?.(
+      `[agent-flywheel] the control plane did not take per-turn feedback ` +
+      `(${reason}); it may predate it. What was waiting is dropped and no ` +
+      `more is sent by this process.`);
   }
 
   /** The files with this prefix waiting in the capture root, in name order. */
@@ -1170,11 +1237,52 @@ export function createTurnUploader({
    * with `episodesOnly`, which sends just the outcomes that name an episode
    * and nothing else (`namesOnlyAnEpisode`), the ones consent is not the
    * question for; a 403 then stops those alone (`refuseEpisodeOutcomes`). THE
-   * PYTHON SDK'S `Attachment._flush_outcomes`, rule for rule. THE TURNS'
-   * RULES: an acknowledged batch is deleted; a 403 is the control plane's
-   * decision, so sending stops and the outcomes stay; a blip leaves the batch
-   * for the next flush. An outcome refused BY NAME inside an acknowledged
-   * batch would be refused again, so it is dropped and said out loud.
+   * PYTHON SDK'S `Attachment._flush_outcomes`, rule for rule; the rules are
+   * `sendReports`'s.
+   *
+   * `outcomesSent` counts the outcomes the control plane recorded;
+   * `outcomesFailed` each outcome still on disk once; `outcomesDropped` the
+   * records the control plane refused.
+   */
+  async function flushOutcomes(files, { episodesOnly = false } = {}) {
+    const waiting = [];
+    for (const path of files) {
+      try {
+        const wire = productionOutcome(JSON.parse(readFileSync(path, "utf8")));
+        if (!episodesOnly || namesOnlyAnEpisode(wire)) waiting.push({ path, wire });
+      } catch {
+        // Unreadable or not ours to send; one file costs that file.
+      }
+    }
+    if (!waiting.length) return {};
+    const result = await sendReports(waiting, OUTCOMES, {
+      onRefusal: episodesOnly ? refuseEpisodeOutcomes : refuseUpload,
+    });
+    return {
+      outcomesSent: result.sent, outcomesFailed: result.failed,
+      outcomesDropped: result.dropped,
+    };
+  }
+
+  /**
+   * Send the reports waiting on disk -- outcomes or per-turn feedback, `kind`
+   * says which -- and return `{sent, failed, dropped}`: the ones the control
+   * plane recorded, the ones still on disk for a later flush (each counted
+   * once), the ones it refused. Never throws. THE PYTHON SDK'S
+   * `Attachment._send_reports`, rule for rule.
+   *
+   * ONE SENDER FOR BOTH ROUTES. Feedback had its own, which read every final
+   * 4xx as "the route is not there" and deleted the queue for it.
+   *
+   * THE TURNS' RULES: an acknowledged batch is deleted; a 403 is the control
+   * plane's decision, so sending stops (`onRefusal` is told its words) and
+   * the reports stay; a blip leaves the batch for the next flush.
+   *
+   * A REPORT REFUSED BY NAME inside an acknowledged batch (`accepted: false`
+   * -- a conflicting replay, an unknown episode) would be refused again: it
+   * is not sent again, it counts as dropped and not as sent, and it is said
+   * BY ITS ID with the control plane's own word (`refusedByName`). An outcome
+   * recorded without its note is said the same way (`notesNotStored`).
    *
    * A 4xx ABOUT THE RECORDS IS FINAL FOR THEM (`outcomeBatchRefused`). A
    * refused batch is split in halves, and BOTH halves are tried before either
@@ -1184,7 +1292,7 @@ export function createTurnUploader({
    * Unless both halves are refused with the same status and the same words:
    * then the refusal was about THE BATCH, not a record in it -- a 422 from a
    * control plane on another contract minor, a proxy's 400 -- and splitting
-   * further would drop every outcome at two requests each. Sending stops for
+   * further would drop every report at two requests each. Sending stops for
    * this flush, they stay on disk (the week's expiry still applies), and the
    * cause is said once.
    *
@@ -1199,28 +1307,17 @@ export function createTurnUploader({
    *
    * A 4xx about the ROUTE or the KEY (`outcomeRouteRefused`: 401, 404, 405,
    * 410) is not the records' fault either: sending stops for this flush and
-   * they stay, said out loud.
-   *
-   * `outcomesFailed` counts each outcome still on disk once;
-   * `outcomesDropped` the records the control plane refused.
+   * they stay, said out loud. Unless the caller passes `onAbsent` and the
+   * route is ABSENT (`routeAbsent`): then everything waiting is dropped,
+   * counted as dropped, and `onAbsent` is told the words.
    */
-  async function flushOutcomes(files, { episodesOnly = false } = {}) {
-    const waiting = [];
-    for (const path of files) {
-      try {
-        const wire = productionOutcome(JSON.parse(readFileSync(path, "utf8")));
-        if (!episodesOnly || namesOnlyAnEpisode(wire)) waiting.push({ path, wire });
-      } catch {
-        // Unreadable or not ours to send; one file costs that file.
-      }
-    }
-    if (!waiting.length) return {};
+  async function sendReports(waiting, kind, { onRefusal, onAbsent = null }) {
     // Every GROUP still to send, in order: a batch on its own, or the two
     // halves of one refused batch, which are tried together. A refused half's
     // own halves go back to the front.
     const queue = [];
-    for (let i = 0; i < waiting.length; i += PRODUCTION_OUTCOME_BATCH_MAX_ITEMS) {
-      queue.push([waiting.slice(i, i + PRODUCTION_OUTCOME_BATCH_MAX_ITEMS)]);
+    for (let i = 0; i < waiting.length; i += kind.batchMax) {
+      queue.push([waiting.slice(i, i + kind.batchMax)]);
     }
     const count = (group) => group.reduce((n, b) => n + b.length, 0);
     const left = () => queue.reduce((n, group) => n + count(group), 0);
@@ -1231,8 +1328,11 @@ export function createTurnUploader({
     };
     let sent = 0;
     let failed = 0;
+    let absent = 0;
     let splitRequests = 0;
     const dropped = [];
+    const byName = [];
+    const noteless = [];
     flushing: while (queue.length) {
       const group = queue.shift();
       const halves = group.length === 2;
@@ -1240,7 +1340,7 @@ export function createTurnUploader({
         failed += count(group) + left();
         queue.length = 0;
         logger?.warn?.(
-          `[agent-flywheel] the control plane refused reported outcomes, ` +
+          `[agent-flywheel] the control plane refused ${kind.many}, ` +
           `and finding which ones reached ${OUTCOME_SPLIT_MAX_REQUESTS} ` +
           `requests in this flush; the rest stay on disk for a later flush.`);
         break;
@@ -1251,21 +1351,31 @@ export function createTurnUploader({
         if (halves) splitRequests += 1;
         let reply;
         try {
-          reply = await transport.reportOutcomes(agentId, batch.map((o) => o.wire));
+          reply = await transport[kind.send](agentId, batch.map((o) => o.wire));
         } catch (err) {
           // Kept by a stop: this half, the half not tried yet, a half
           // already refused beside it, the queue.
-          const untried = count(group.slice(index + 1))
-            + refused.reduce((n, r) => n + r.batch.length, 0);
+          const beside = [
+            ...group.slice(index + 1).flat(),
+            ...refused.flatMap((r) => r.batch),
+          ];
+          const untried = beside.length;
           const consent = captureRefusal(err);
           if (consent !== null) {
-            if (episodesOnly) refuseEpisodeOutcomes(consent);
-            else refuseUpload(consent);
+            onRefusal(consent);
             failed += batch.length + untried + left();
             queue.length = 0;
             break flushing;
           }
           const status = err?.statusCode ?? null;
+          if (onAbsent !== null && routeAbsent(status)) {
+            const gone = [...batch, ...beside, ...queue.flat(2)];
+            forget(gone);
+            absent += gone.length;
+            queue.length = 0;
+            onAbsent(String(err?.message ?? err));
+            break flushing;
+          }
           if (outcomeBatchRefused(status)) {
             refused.push({ batch, status, cause: String(err?.message ?? err) });
             continue;
@@ -1278,8 +1388,8 @@ export function createTurnUploader({
             let said = String(err?.message ?? err);
             if (!said.includes(`HTTP ${status}`)) said = `HTTP ${status}: ${said}`;
             logger?.warn?.(
-              `[agent-flywheel] the control plane did not take reported ` +
-              `outcomes (${said}); they stay on disk and are sent again on a ` +
+              `[agent-flywheel] the control plane did not take ${kind.many} ` +
+              `(${said}); they stay on disk and are sent again on a ` +
               `later flush.`);
             break flushing;
           }
@@ -1287,17 +1397,10 @@ export function createTurnUploader({
           continue;
         }
         forget(batch);
-        sent += batch.length;
-        const refusedByName = [...new Set(
-          (Array.isArray(reply?.outcomes) ? reply.outcomes : [])
-            .filter((r) => r?.accepted === false)
-            .map((r) => String(r.error || "refused")),
-        )].sort();
-        if (refusedByName.length) {
-          logger?.warn?.(
-            `[agent-flywheel] the control plane did not record some reported ` +
-            `outcomes (${refusedByName.join(", ")}); they will not be sent again.`);
-        }
+        const named = refusedByName(reply, kind).slice(0, batch.length);
+        byName.push(...named);
+        noteless.push(...notesNotStored(reply, kind));
+        sent += batch.length - named.length;
       }
       if (halves && refused.length === 2
           && refused[0].status === refused[1].status
@@ -1305,7 +1408,7 @@ export function createTurnUploader({
           && !outcomeRefusedForSize(refused[0].status)) {
         failed += refused[0].batch.length + refused[1].batch.length + left();
         queue.length = 0;
-        warnWholeBatchRefusal(refused[0].cause);
+        warnWholeBatchRefusal(kind, refused[0].cause);
         break;
       }
       const split = [];
@@ -1313,7 +1416,7 @@ export function createTurnUploader({
         if (batch.length === 1) {
           forget(batch);
           dropped.push(outcomeRefusedForSize(status)
-            ? `${cause} (an outcome of ${outcomeWireBytes(batch[0].wire)} ` +
+            ? `${cause} (${kind.one} of ${outcomeWireBytes(batch[0].wire)} ` +
               `bytes, too large to send even alone)`
             : cause);
         } else {
@@ -1326,27 +1429,34 @@ export function createTurnUploader({
     if (dropped.length) {
       logger?.warn?.(
         `[agent-flywheel] the control plane refused ${dropped.length} ` +
-        `reported outcome(s), so they were dropped and the rest of their ` +
+        `${kind.counted}, so they were dropped and the rest of their ` +
         `batch was sent: ${[...new Set(dropped)].sort().join("; ")}`);
     }
-    return {
-      outcomesSent: sent, outcomesFailed: failed,
-      outcomesDropped: dropped.length,
-    };
+    if (byName.length) {
+      logger?.warn?.(
+        `[agent-flywheel] the control plane did not record ${byName.length} ` +
+        `${kind.counted}; they will not be sent again: ${byName.join(", ")}`);
+    }
+    if (noteless.length) {
+      logger?.warn?.(
+        `[agent-flywheel] the control plane recorded ${noteless.length} ` +
+        `${kind.counted} without the note: ${noteless.join(", ")}`);
+    }
+    return { sent, failed, dropped: dropped.length + byName.length + absent };
   }
 
   /**
-   * Say ONCE per cause that the control plane refuses whole outcome batches:
+   * Say ONCE per kind and cause that the control plane refuses whole batches:
    * it holds for every flush until one side is upgraded, and a warning per
    * flush would be a week of the same line. The Python SDK's
    * `_warn_whole_batch_refusal`.
    */
-  function warnWholeBatchRefusal(cause) {
-    if (cause === outcomeBatchRefusalSaid) return;
-    outcomeBatchRefusalSaid = cause;
+  function warnWholeBatchRefusal(kind, cause) {
+    if (batchRefusalSaid.get(kind.many) === cause) return;
+    batchRefusalSaid.set(kind.many, cause);
     logger?.warn?.(
-      `[agent-flywheel] the control plane refused whole batches of reported ` +
-      `outcomes (${cause}), which is about the batch, not a record in it; ` +
+      `[agent-flywheel] the control plane refused whole batches of ` +
+      `${kind.many} (${cause}), which is about the batch, not a record in it; ` +
       `they stay on disk, are sent again on a later flush, and are dropped ` +
       `only after a week undelivered.`);
   }
@@ -1708,8 +1818,9 @@ export function registerTurnCapture(api, {
    * stored apart from reported outcomes. Throws `InvalidFeedback` for what
    * the wire cannot carry (the message names the allowed words); otherwise
    * returns the feedback's id once queued, or `null` -- a no-op -- with no
-   * key, or once the control plane has refused feedback (one that predates
-   * it answers 404; said once). No answer of the control plane ever reaches
+   * key, or once the control plane has refused this key feedback (a 403;
+   * what is waiting stays on disk) or shown it has no route for it (a 404 or
+   * 405; what was waiting is dropped) -- each said once. No answer of the control plane ever reaches
    * the caller.
    */
   function reportTurnFeedback(signal, options = {}) {

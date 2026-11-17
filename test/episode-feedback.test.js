@@ -98,7 +98,9 @@ function overHttp(routes) {
   const fetchImpl = async (url, init) => {
     const key = `${init.method} ${new URL(url).pathname}`;
     seen.push(key);
-    const [status, body] = routes[key] ?? [200, {}];
+    const route = routes[key] ?? [200, {}];
+    const [status, body] = typeof route === "function"
+      ? route(JSON.parse(init.body)) : route;
     return new Response(JSON.stringify(body), {
       status, headers: { "content-type": "application/json" } });
   };
@@ -386,8 +388,8 @@ describe("reportTurnFeedback", () => {
     });
   }
 
-  for (const status of [401, 403, 404, 405, 410, 422]) {
-    it(`a control plane answering ${status} never reaches the caller`, async () => {
+  for (const status of [404, 405]) {
+    it(`a control plane with no feedback route (${status}) never reaches the caller`, async () => {
       // THROUGH THE REAL HTTP CLIENT: one that predates the route answers 404.
       const root = tmp();
       const warnings = [];
@@ -414,6 +416,128 @@ describe("reportTurnFeedback", () => {
       assert.equal(u.mayUpload, true, "not a consent refusal");
     });
   }
+
+  /** Queue `total` reports with the route down, so no kicked flush sends any. */
+  async function queued(root, routes, total, warnings) {
+    const { transport, seen } = overHttp(routes);
+    const down = new TransportError("down");
+    const real = transport.reportTurnFeedback.bind(transport);
+    let up = false;
+    transport.reportTurnFeedback = async (...args) => {
+      if (!up) throw down;
+      return real(...args);
+    };
+    const u = uploaderFor(root, transport, { warnings });
+    for (let turnIndex = 0; turnIndex < total; turnIndex += 1) {
+      u.reportTurnFeedback("accepted", {
+        episodeId: EPISODE, turnIndex, feedbackId: `fb${turnIndex}` });
+    }
+    await settle(u);
+    up = true;
+    const tries = () => seen.filter((k) => k === "POST /turn-feedback").length;
+    return { u, tries };
+  }
+
+  it("a 403 keeps the feedback and stops sending", async () => {
+    // The control plane's decision about THIS KEY, not a missing route. It
+    // was read as "the route is not there" and the queue was deleted for it.
+    const root = tmp();
+    const warnings = [];
+    const total = TURN_FEEDBACK_BATCH_MAX_ITEMS + 3;
+    const { u, tries } = await queued(root, { "POST /turn-feedback": [
+      403, { detail: "this key lacks the turn.report scope" }] }, total, warnings);
+    const counts = await settle(u);
+    assert.deepEqual(
+      [counts.feedbackSent, counts.feedbackFailed, counts.feedbackDropped],
+      [0, total, 0]);
+    assert.equal(waiting(root).length, total, "a 403 deletes nothing");
+    assert.equal(tries(), 1, "one try, then it stops");
+    assert.equal(u.reportTurnFeedback(
+      "accepted", { episodeId: EPISODE, turnIndex: 0 }), null);
+    await settle(u);
+    assert.equal(tries(), 1);
+    assert.equal(waiting(root).length, total);
+    const refusal = said(warnings, "refused per-turn feedback");
+    assert.equal(refusal.length, 1);
+    assert.ok(refusal[0].includes("turn.report scope"));
+    assert.deepEqual(said(warnings, "predate"), [], "not the absent route's words");
+    assert.equal(u.mayUpload, true, "feedback is not the consent question");
+  });
+
+  for (const status of [401, 410]) {
+    it(`a ${status} keeps the feedback for a later flush`, async () => {
+      const root = tmp();
+      const warnings = [];
+      const total = TURN_FEEDBACK_BATCH_MAX_ITEMS + 3;
+      const { u, tries } = await queued(
+        root, { "POST /turn-feedback": [status, { detail: "no" }] },
+        total, warnings);
+      const counts = await settle(u);
+      assert.deepEqual(
+        [counts.feedbackSent, counts.feedbackFailed, counts.feedbackDropped],
+        [0, total, 0]);
+      assert.equal(waiting(root).length, total);
+      assert.equal(tries(), 1, "not batch after batch");
+      assert.equal(said(warnings, `HTTP ${status}`, "did not take").length, 1);
+      await settle(u);
+      assert.equal(tries(), 2, "asked again later");
+    });
+  }
+
+  for (const status of [400, 409, 413, 422]) {
+    it(`one report refused with a ${status} never holds back the rest`, async () => {
+      // It used to delete every report waiting and switch feedback off.
+      const root = tmp();
+      const warnings = [];
+      const sent = [];
+      const route = (body) => {
+        const got = body.feedback.map((f) => f.feedback_id);
+        if (got.includes("fb5")) return [status, { detail: "turn_index: not this one" }];
+        sent.push(...got);
+        return [200, { agent_id: "a1", feedback: got.map((id) => (
+          { feedback_id: id, accepted: true, duplicate: false })) }];
+      };
+      const { u } = await queued(root, { "POST /turn-feedback": route }, 9, warnings);
+      const counts = await settle(u);
+      assert.deepEqual(
+        [counts.feedbackSent, counts.feedbackFailed, counts.feedbackDropped],
+        [8, 0, 1]);
+      assert.deepEqual(waiting(root), []);
+      assert.equal(said(
+        warnings, `HTTP ${status}`, "per-turn feedback report(s)").length, 1);
+      assert.deepEqual(
+        [...sent].sort(), [0, 1, 2, 3, 4, 6, 7, 8].map((n) => `fb${n}`));
+      assert.notEqual(u.reportTurnFeedback(
+        "accepted", { episodeId: EPISODE, turnIndex: 0 }), null,
+      "one bad report does not switch feedback off");
+      await settle(u);
+    });
+  }
+
+  it("says a report refused by name by its id and does not resend it", async () => {
+    // A 200 can still refuse a report (`accepted: false` and why). The reply
+    // was never read: the report counted as sent and nothing said otherwise.
+    const root = tmp();
+    const warnings = [];
+    const route = (body) => [200, { agent_id: "a1", feedback: body.feedback.map(
+      (f) => (f.feedback_id === "fb1"
+        ? { feedback_id: "fb1", accepted: false, duplicate: false,
+          error: "episode_not_found", detail: "no such episode" }
+        : { feedback_id: f.feedback_id, accepted: true, duplicate: false })) }];
+    const { u, tries } = await queued(
+      root, { "POST /turn-feedback": route }, 2, warnings);
+    const counts = await settle(u);
+    assert.deepEqual(
+      [counts.feedbackSent, counts.feedbackFailed, counts.feedbackDropped],
+      [1, 0, 1]);
+    const refusal = said(warnings, "did not record");
+    assert.equal(refusal.length, 1, "said once");
+    assert.ok(refusal[0].includes("fb1 (episode_not_found)"));
+    assert.ok(!refusal[0].includes("fb0"));
+    assert.deepEqual(waiting(root), []);
+    await settle(u);
+    assert.equal(tries(), 1, "not sent again");
+  });
 
   it("drops feedback undelivered for a week", async () => {
     const root = tmp();

@@ -522,10 +522,43 @@ describe("reportOutcome: the turns' retry and offline behaviour", () => {
     const u = uploaderFor(root, tr, { warnings });
     u.reportOutcome("resolved", { turnId: "t1", outcomeId: "dup" });
     await settle(u);
-    assert.ok(warnings.some((w) => w.includes("outcome_conflict")));
+    assert.ok(warnings.some((w) => w.includes("dup (outcome_conflict)")),
+      "said by its id, with the control plane's word");
     assert.deepEqual(pending(root), []);
     await settle(u);
     assert.equal(tr.batches.length, 1);
+  });
+
+  it("counts an outcome refused by name as dropped, not sent", async () => {
+    const root = tmp();
+    const tr = fakeTransport({ refuse: ["dup"], outcomesRaise: new TransportError("down") });
+    const u = uploaderFor(root, tr);
+    u.reportOutcome("resolved", { turnId: "t1", outcomeId: "dup" });
+    u.reportOutcome("resolved", { turnId: "t2", outcomeId: "kept" });
+    await settle(u);
+    tr.outcomesRaise = null;
+    const counts = await settle(u);
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [1, 0, 1]);
+  });
+
+  it("says an outcome recorded without its note by its id", async () => {
+    const root = tmp();
+    const warnings = [];
+    const tr = fakeTransport();
+    tr.reportOutcomes = async (agentId, outcomes) => ({
+      agent_id: agentId, outcomes: outcomes.map((o) => ({
+        outcome_id: o.outcome_id, accepted: true, duplicate: false,
+        note: { stored: false, error: "note_looks_like_a_secret" } })) });
+    const u = uploaderFor(root, tr, { warnings });
+    u.reportOutcome("resolved", { turnId: "t1", outcomeId: "o1", note: "n" });
+    const counts = await settle(u);
+    const noteless = warnings.filter((w) => w.includes("without the note"));
+    assert.equal(noteless.length, 1);
+    assert.ok(noteless[0].includes("o1 (note_looks_like_a_secret)"));
+    assert.deepEqual(pending(root), [], "it was recorded; not sent again");
+    assert.equal(counts.outcomesDropped ?? 0, 0);
   });
 
   it("sends more than a batch in batches", async () => {
