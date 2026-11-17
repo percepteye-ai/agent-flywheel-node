@@ -148,6 +148,32 @@ describe("the mode split is structural", () => {
     assert.notEqual(out.rollouts, null);
   });
 
+  it("tells application code which episode a host session is running", () => {
+    // The Python SDK's `current_rollout_id()`. Without it the README's
+    // `reportOutcome("resolved", { episodeId })` could not be written: the id
+    // reached nothing but the task text the agent reads.
+    const api = fakeApi();
+    const out = register(api, {}, ENV("training", { key: "pefw_test" }));
+    assert.equal(out.currentRolloutId({ sessionKey: "s1" }), null);
+    out.rollouts.track("s1", { rolloutId: "rl_mc_41" });
+    try {
+      assert.equal(out.currentRolloutId({ sessionKey: "s1" }), "rl_mc_41");
+      // The host names a session either way; both are one session here.
+      assert.equal(out.currentRolloutId({ sessionId: "s1" }), "rl_mc_41");
+      // Another session of the same install runs no rollout.
+      assert.equal(out.currentRolloutId({ sessionKey: "s2" }), null);
+      assert.equal(out.currentRolloutId(undefined), null);
+    } finally {
+      out.rollouts.inFlight.delete("s1");
+    }
+    assert.equal(out.currentRolloutId({ sessionKey: "s1" }), null);
+  });
+
+  it("has no episode to name in production mode", () => {
+    const out = register(fakeApi(), {}, ENV("production"));
+    assert.equal(out.currentRolloutId({ sessionKey: "s1" }), null);
+  });
+
   it("degrades an UNREADABLE mode to production, never to training", () => {
     // A typo is somebody trying to stop contributing. Defaulting to training
     // would resume claiming rollouts on their credentials.

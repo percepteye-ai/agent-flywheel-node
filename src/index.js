@@ -512,6 +512,18 @@ export function register(api, pluginConfig = {}, env = process.env) {
   return {
     recorder, writer, describer, rollouts, capture, serving, executionIdentity,
     mode: config.mode,
+    // The Python SDK's `current_rollout_id()`: the id of the episode this
+    // host session is running, for application code to report its outcome
+    // against later (`reportOutcome(..., { episodeId })`). A host session,
+    // not an async context, is what a rollout belongs to here -- the host
+    // calls every hook and tool outside this plugin's call stack -- so it is
+    // asked with the same host context every hook is keyed by, through the
+    // driver's own `rolloutFor`. Null outside a rollout, in production mode,
+    // and once the rollout's run has ended.
+    currentRolloutId: (ctx) => {
+      const id = rollouts?.rolloutFor?.(ctx)?.rolloutId;
+      return typeof id === "string" && id ? id : null;
+    },
   };
 }
 
