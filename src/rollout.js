@@ -107,7 +107,10 @@
  *             which is why `unattended.js` has no transport of its own.
  */
 import { GET_A_KEY } from "./config.js";
-import { applyDeclaration } from "./declaration.js";
+import {
+  applyDeclaration,
+  declarationRegistrationFields,
+} from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
@@ -939,6 +942,10 @@ export function registerRolloutDriver(api, {
       // With nothing observed, the host is still known: this is OpenClaw.
       framework: FRAMEWORK,
     }) ?? null;
+    // Where the agent's API spec is published, when `describe` says
+    // (declaration.js): a reference beside the description, never the
+    // document. Absent otherwise: an undeclared registration is unchanged.
+    Object.assign(registrationSpec, declarationRegistrationFields(declaration));
   }
   // The digest is derived from the description, so the same refusal covers it.
   if (consented && isLowerSha256(registrationFingerprint?.execution_sha256)) {

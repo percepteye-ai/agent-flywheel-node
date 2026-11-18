@@ -17,7 +17,8 @@ import { describe, it } from "node:test";
 
 import { CONFIG_SCHEMA, resolveConfig } from "../src/config.js";
 import {
-  applyDeclaration, MAX_PROMPT_CHARS, resolveDeclaration, SOURCE_TYPE,
+  applyDeclaration, declarationDescribes, declarationRegistrationFields,
+  MAX_PROMPT_CHARS, resolveDeclaration, SOURCE_TYPE,
 } from "../src/declaration.js";
 import { ConfigurationError } from "../src/errors.js";
 import { register } from "../src/index.js";
@@ -135,7 +136,7 @@ describe("a bad declaration is refused, naming the cause", () => {
   const fn = (extra) => ({ type: "function", function: { name: "x", ...extra } });
   const WHOLE = `describe['model']['max_tokens'] must be a whole number from 1 to ${Number.MAX_SAFE_INTEGER}`;
   const CASES = [
-    [{ prompt: "typo" }, 'describe= got unknown key(s) ["prompt"]; it accepts ["model", "system_prompt", "tools"]'],
+    [{ prompt: "typo" }, 'describe= got unknown key(s) ["prompt"]; it accepts ["api_spec", "model", "system_prompt", "tools"]'],
     // Key lists are JSON, sorted by code point, as Python renders and sorts
     // them: a quote, a non-BMP key and U+FFFF each rendered or sorted
     // differently before.
@@ -282,6 +283,41 @@ describe("a declaration anchors no execution identity", () => {
     // The control: no declaration, no such line.
     assert.equal(plugin({ executionSnapshot: SNAPSHOT }).warnings.some(
       (w) => w.includes("withheld")), false);
+  });
+});
+
+describe("api_spec is a reference beside the description", () => {
+  it("is an absolute http(s) URL, stripped, and describes nothing", () => {
+    const d = resolveDeclaration({ api_spec: "  https://api.acme.example/v1/openapi.json\n" });
+    assert.deepEqual(declarationRegistrationFields(d),
+      { api_spec: "https://api.acme.example/v1/openapi.json" });
+    assert.equal(declarationDescribes(d), false);
+    assert.equal(applyDeclaration(d, { reflected: null, agentName: "a" }), null);
+    const observed = { agent_name: "a", framework: "openclaw" };
+    assert.equal(applyDeclaration(d, { reflected: observed, agentName: "a" }), observed);
+  });
+
+  it("rides beside a description without changing it", () => {
+    const both = resolveDeclaration({ tools: [], api_spec: "http://h/s" });
+    assert.equal(declarationDescribes(both), true);
+    assert.deepEqual(declared({ tools: [], api_spec: "http://h/s" }), declared({ tools: [] }));
+    assert.deepEqual(declarationRegistrationFields(resolveDeclaration({ tools: [] })), {});
+  });
+
+  for (const bad of ["./openapi.yaml", "/srv/spec.json", "file:///spec.json",
+    "ftp://h/spec", "https://", 5]) {
+    it(`refuses ${JSON.stringify(bad)} by name`, () => {
+      assert.throws(() => resolveDeclaration({ api_spec: bad }),
+        (err) => err instanceof ConfigurationError
+          && err.message.startsWith("describe['api_spec'] must be"));
+    });
+  }
+
+  it("alone withholds no execution identity", () => {
+    const p = plugin({ executionSnapshot: SNAPSHOT,
+      describe: { api_spec: "https://api.acme.example/openapi.json" } });
+    assert.match(p.serveOneTurn().agent_fingerprint.execution_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(p.warnings.some((w) => w.includes("withheld")), false);
   });
 });
 

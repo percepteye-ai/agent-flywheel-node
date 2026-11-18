@@ -37,6 +37,14 @@
  * observation of what ran, so a declared description anchors no execution
  * identity: `index.js` withholds the fingerprint whenever this module
  * contributed.
+ *
+ * `api_spec` IS NOT A DESCRIPTION. It says where the agent's API spec is
+ * published -- an absolute http(s) URL, a REFERENCE the control plane fetches
+ * and parses in whatever format it is, never the document -- and is sent
+ * beside the registration as `api_spec`, recorded on the agent's Product. It
+ * changes nothing about the description, so a declaration of `api_spec` alone
+ * withholds no execution identity (`declarationDescribes`). The Python SDK's
+ * `declaration.py` reads it rule for rule.
  */
 import { ConfigurationError } from "./errors.js";
 import { compareStrings } from "./execution-identity.js";
@@ -50,7 +58,9 @@ export const SOURCE_TYPE = "sdk_declared";
  */
 export const MAX_PROMPT_CHARS = 20_000;
 
-const KEYS = ["model", "system_prompt", "tools"];
+const KEYS = ["api_spec", "model", "system_prompt", "tools"];
+/** The longest `api_spec` URL the control plane stores. */
+const MAX_SPEC_URL_CHARS = 2048;
 const MODEL_KEYS = ["max_tokens", "model_name", "provider", "temperature"];
 
 /**
@@ -141,7 +151,7 @@ function render(v) {
  * `null` when nothing was declared -- including an object whose every value
  * is null. A function that throws is refused the same way, naming `describe`.
  *
- * @returns {{system_prompt: string|null, tools: object[]|null, model: object|null}|null}
+ * @returns {{system_prompt: string|null, tools: object[]|null, model: object|null, api_spec: string|null}|null}
  * @throws {ConfigurationError}
  */
 export function resolveDeclaration(describe) {
@@ -182,6 +192,7 @@ export function resolveDeclaration(describe) {
   const prompt = spec.system_prompt ?? null;
   const tools = spec.tools ?? null;
   const model = spec.model ?? null;
+  const apiSpec = declaredApiSpec(spec.api_spec ?? null);
   if (prompt !== null && typeof prompt !== "string") {
     throw new ConfigurationError("describe['system_prompt'] must be a string");
   }
@@ -194,12 +205,63 @@ export function resolveDeclaration(describe) {
       "describe['model'] must be a model name or a mapping of " +
       "provider / model_name / temperature / max_tokens");
   }
-  if (prompt === null && tools === null && model === null) return null;
+  if (prompt === null && tools === null && model === null && apiSpec === null) {
+    return null;
+  }
   return {
     system_prompt: prompt === null ? null : codePoints(prompt, MAX_PROMPT_CHARS),
     tools: tools === null ? null : declaredTools(tools),
     model: model === null ? null : declaredModel(model),
+    api_spec: apiSpec,
   };
+}
+
+/**
+ * Whether any part of the agent's DESCRIPTION is declared -- what replaces
+ * observation and withholds the execution identity. `api_spec` alone does
+ * neither. Python's `Declaration.describes`.
+ */
+export function declarationDescribes(declared) {
+  return declared !== null && declared !== undefined && (
+    declared.system_prompt !== null || declared.tools !== null ||
+    declared.model !== null);
+}
+
+/**
+ * What a declaration adds to the registration beside the description:
+ * `{api_spec: url}`, or nothing. Python's `Declaration.registration_fields`.
+ */
+export function declarationRegistrationFields(declared) {
+  return declared?.api_spec ? { api_spec: declared.api_spec } : {};
+}
+
+/**
+ * An absolute http(s) URL with a host, stripped, or null. A path on this
+ * machine is refused by name: the control plane fetches the spec, and the SDK
+ * never sends the document. Python's `_api_spec`, rule for rule.
+ */
+function declaredApiSpec(value) {
+  if (value === null) return null;
+  if (typeof value !== "string") {
+    throw new ConfigurationError(
+      `describe['api_spec'] must be a URL string, got ${jsonType(value)}`);
+  }
+  const text = strip(value);
+  const sep = text.indexOf("://");
+  const scheme = sep < 0 ? "" : text.slice(0, sep).toLowerCase();
+  const host = sep < 0 ? "" : text.slice(sep + 3).split("/")[0]
+    .split("?")[0].split("#")[0];
+  if (sep < 0 || (scheme !== "http" && scheme !== "https") || !host) {
+    throw new ConfigurationError(
+      "describe['api_spec'] must be an absolute http(s) URL where the spec " +
+      `is published, got ${render(value)}: Mission Control fetches the spec ` +
+      "from it and is never sent the document");
+  }
+  if (Array.from(text).length > MAX_SPEC_URL_CHARS) {
+    throw new ConfigurationError(
+      `describe['api_spec'] must be at most ${MAX_SPEC_URL_CHARS} characters`);
+  }
+  return text;
 }
 
 /** `text` cut to `max` code points, as a Python slice cuts it. */
@@ -363,7 +425,7 @@ function declaredMaxTokens(value) {
 export function applyDeclaration(
   declared, { reflected = null, agentName, framework = "custom" },
 ) {
-  if (declared === null || declared === undefined) return reflected;
+  if (!declarationDescribes(declared)) return reflected;
   const base = reflected ?? {
     agent_name: agentName,
     framework,

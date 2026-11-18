@@ -67,7 +67,10 @@ import {
 import { join } from "node:path";
 
 import { GET_A_KEY } from "./config.js";
-import { applyDeclaration } from "./declaration.js";
+import {
+  applyDeclaration,
+  declarationRegistrationFields,
+} from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { nowUnixNano } from "./genai-otlp.js";
 import {
@@ -2018,6 +2021,11 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
           reflected: null, agentName: config.agentId, framework: FRAMEWORK,
         }) ?? null,
       }),
+      // Where the agent's API spec is published, when `describe` says
+      // (declaration.js): a reference beside the description, never the
+      // document. Absent otherwise, so an undeclared registration is the
+      // same bytes as before.
+      ...declarationRegistrationFields(declaration),
     }))
     .then(() => true)
     .catch((err) => {

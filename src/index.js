@@ -87,7 +87,7 @@ import {
 import {
   createExecutionIdentityTracker, withholdFingerprints,
 } from "./execution-identity.js";
-import { resolveDeclaration } from "./declaration.js";
+import { declarationDescribes, resolveDeclaration } from "./declaration.js";
 import {
   CredentialsError, credentialsPath, loadStored, loginHint,
 } from "./credentials.js";
@@ -304,11 +304,13 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
   // A DECLARED description is the customer's word, not an observation: it
-  // merges over what was observed and anchors no fingerprint, anywhere.
-  const executionIdentity = declaration === null
-    ? tracker
-    : withholdFingerprints(tracker);
-  if (declaration !== null && tracker.enabled) {
+  // merges over what was observed and anchors no fingerprint, anywhere. An
+  // `api_spec` alone describes nothing and withholds nothing.
+  const described = declarationDescribes(declaration);
+  const executionIdentity = described
+    ? withholdFingerprints(tracker)
+    : tracker;
+  if (described && tracker.enabled) {
     // Said, because an operator who configured an execution snapshot and then
     // added `describe` otherwise loses exact identity with no line anywhere.
     logger?.warn?.(

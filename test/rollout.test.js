@@ -310,6 +310,20 @@ describe("training worker registration gates every claim", () => {
     assert.equal("agent_execution_sha256" in spec, false);
   });
 
+  it("sends a declared api_spec and keeps the observed digest", async () => {
+    // A spec alone is no description: it withholds no identity, and the
+    // observed description registers as observed.
+    const h = registrationHarness({
+      executionIdentity: STARTUP(),
+      declaration: resolveDeclaration({ api_spec: "https://x.example/spec" }),
+    });
+    await h.driver.onSessionStart({ sessionKey: "spec" });
+    const spec = h.registrations[0];
+    assert.equal(spec.api_spec, "https://x.example/spec");
+    assert.equal(spec.discovered_agent.source_type, "sdk_runtime");
+    assert.equal(spec.agent_execution_sha256, "a".repeat(64));
+  });
+
   it("registers the rollout worker before its first attended claim", async () => {
     const h = registrationHarness();
     assert.deepEqual(h.order, ["health"], "startup begins without a session");

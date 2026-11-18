@@ -802,6 +802,18 @@ describe("the agent is registered, so an operator has something to enable", () =
     });
   });
 
+  it("sends the declared api_spec beside the description, never in it", async () => {
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr, {
+      declaration: resolveDeclaration({
+        api_spec: " https://api.acme.example/openapi.json " }),
+    });
+    const wire = tr.registered[0];
+    assert.equal(wire.api_spec, "https://api.acme.example/openapi.json");
+    // A spec alone describes nothing: the description is the undeclared null.
+    assert.equal(wire.discovered_agent, null);
+  });
+
   it("keeps discovered_agent LAST, so an undeclared registration is the old bytes", async () => {
     const tr = fakeTransport();
     await wireCapture(tmp(), hostApi(), tr);

@@ -176,7 +176,11 @@ export const CONFIG_SCHEMA = {
         "list the agent sends its model -- OpenAI function specs, Anthropic " +
         "tools, or {name, description, input_schema, read_only}) and model " +
         "(a name, or {model_name, provider, temperature, max_tokens}). What " +
-        "you declare wins where given; it anchors no execution identity.",
+        "you declare wins where given; it anchors no execution identity. " +
+        "Optionally api_spec: the absolute http(s) URL where the agent's " +
+        "API spec is published, sent as a reference (never the document) " +
+        "and recorded as its Product's spec; it is not part of the " +
+        "description.",
     },
     // NO `type`, for `describe`'s reason: a wrong one would fail the plugin
     // load, and local capture with it. A value that is not a whole number of
