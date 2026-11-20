@@ -506,6 +506,32 @@ export function outcomeRefusedForSize(status) {
 }
 
 /**
+ * A refusal's detail that NAMES A RECORD: a 422's `loc` carrying an item
+ * index (`["body","outcomes",3,"note"]`, as the control plane's validation
+ * answers every batch route), or a handler's `"index"`. Read off the detail
+ * as both SDKs render it -- compact JSON, `http.js`'s `detail` and the Python
+ * client's `_detail` -- so this is the Python SDK's
+ * `_REFUSAL_NAMES_A_RECORD`, byte for byte.
+ */
+export const REFUSAL_NAMES_A_RECORD =
+  /"loc":\[(?:"(?:[^"\\]|\\.)*",)*\d+[,\]]|"index":\d/;
+
+/**
+ * Whether a refusal CAN be about the batch rather than a record in it. Never
+ * one about the body's size (`outcomeRefusedForSize`), and never one whose
+ * detail names a record (`REFUSAL_NAMES_A_RECORD`). That location is the
+ * index WITHIN the half that was sent, so two bad records at the same offset
+ * of each half answered in identical words, and reading those as a refusal
+ * of the batch held every healthy record beside them, flush after flush --
+ * turns for good, since turns never expire. The Python SDK's
+ * `_refusal_may_be_of_the_batch`.
+ */
+export function refusalMayBeOfTheBatch(status, cause) {
+  return !outcomeRefusedForSize(status)
+    && !REFUSAL_NAMES_A_RECORD.test(String(cause ?? ""));
+}
+
+/**
  * A record's size as the wire spells it: compact JSON, UTF-8 -- the Python
  * SDK's `_outcome_wire_bytes`.
  */
@@ -1713,7 +1739,10 @@ export function createTurnUploader({
    * control plane on another contract minor, a proxy's 400 -- and splitting
    * further would drop every report at two requests each. Sending stops for
    * this flush, they stay on disk (the week's expiry still applies), and the
-   * cause is said once.
+   * cause is said once. Never when the words NAME A RECORD
+   * (`refusalMayBeOfTheBatch`): a 422's location is the index within the
+   * half, so two bad records at one offset of each half say the same words,
+   * and the split goes on to isolate them.
    *
    * Except a 413 (`outcomeRefusedForSize`): it is about the body's SIZE, so
    * both halves of a batch too large for a proxy answer it alike, and smaller
@@ -1839,7 +1868,7 @@ export function createTurnUploader({
       if (halves && refused.length === 2
           && refused[0].status === refused[1].status
           && refused[0].cause === refused[1].cause
-          && !outcomeRefusedForSize(refused[0].status)) {
+          && refusalMayBeOfTheBatch(refused[0].status, refused[0].cause)) {
         failed += refused[0].batch.length + refused[1].batch.length + left();
         queue.length = 0;
         warnWholeBatchRefusal(kind, refused[0].cause);
@@ -1850,9 +1879,10 @@ export function createTurnUploader({
       // contract minor refuses every batch alike, the last record of a flush
       // included. So it is KEPT, said once as such, and the batches after it
       // still go (the Python SDK's rule). Only a record isolated by the
-      // split, whose other half was taken, is known to be refused for itself.
+      // split, whose other half was taken, is known to be refused for itself
+      // -- or one whose refusal names it (`refusalMayBeOfTheBatch`).
       if (!halves && refused.length === 1 && refused[0].batch.length === 1
-          && !outcomeRefusedForSize(refused[0].status)) {
+          && refusalMayBeOfTheBatch(refused[0].status, refused[0].cause)) {
         failed += 1;
         warnWholeBatchRefusal(kind, refused[0].cause, { alone: true });
         continue;

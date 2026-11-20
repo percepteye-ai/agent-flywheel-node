@@ -827,6 +827,49 @@ describe("reportOutcome: one refused outcome never holds back the good ones", ()
     assert.deepEqual(tr.outcomes, []);
   });
 
+  it("isolates two bad records at one offset of each half instead of holding the batch", async () => {
+    // The control plane's 422 names each refused record by its index WITHIN
+    // the batch it was sent (`loc`), so two bad records at the same offset of
+    // each half answer in identical words. Read as a refusal of the whole
+    // batch, that held every healthy outcome beside them, flush after flush.
+    // The Python SDK's
+    // test_two_bad_outcomes_at_one_offset_of_each_half_are_isolated_not_held.
+    // Mutation: drop the record-location rule -> held whole, red.
+    const root = tmp();
+    const warnings = [];
+    const ids = Array.from({ length: 8 }, (_, n) => `o${n}`);
+    const bad = new Set();
+    const tr = refusing((batch) => {
+      if (bad.size === 0) { bad.add(batch[1]); bad.add(batch[5]); }
+      const locs = batch.flatMap((id, n) => (bad.has(id) ? [n] : []));
+      return locs.length === 0 ? null : [422, JSON.stringify(locs.map((n) => ({
+        type: "finite_number", loc: ["body", "outcomes", n, "value"],
+        msg: "Input should be a finite number" })))];
+    });
+    seed(root, ids);
+    const counts = await settle(uploaderFor(root, tr, { warnings }));
+    assert.deepEqual(
+      [counts.outcomesSent, counts.outcomesFailed, counts.outcomesDropped],
+      [6, 0, 2]);
+    assert.deepEqual(pending(root), []);
+    assert.ok(!warnings.some((w) => w.includes("whole batches")));
+    assert.deepEqual(tr.outcomes.map((o) => o.outcome_id).sort(),
+                     ids.filter((id) => !bad.has(id)).sort());
+  });
+
+  it("drops a batch of one whose refusal names the record", async () => {
+    // A batch of one has nothing beside it, so a refusal of it is kept --
+    // unless the refusal names the record, which makes it the record's. The
+    // Python SDK's test_a_batch_of_one_refused_by_its_location_is_the_records_refusal.
+    const root = tmp();
+    const tr = refusing(() => [422,
+      '[{"type":"missing","loc":["body","outcomes",0,"turn_id"],"msg":"x"}]']);
+    seed(root, ["o1"]);
+    const counts = await settle(uploaderFor(root, tr));
+    assert.equal(counts.outcomesDropped, 1);
+    assert.deepEqual(pending(root), []);
+  });
+
   it("the same words at two statuses are no refusal of the batch", async () => {
     // Whole-batch means the same STATUS and the same words, in unison with
     // the Python SDK: halves refused in the same words at 400 and 422 are two
