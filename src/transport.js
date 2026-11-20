@@ -542,10 +542,15 @@ export class AttachTransport {
    */
   async captureCurrent(agentId) {
     if (productionAgentIdentifier(agentId) === null) return {};
+    let agent;
+    try {
+      agent = urlSegment(agentId, "agent_id");
+    } catch {
+      return {};
+    }
     let body;
     try {
-      body = await this._c.request(
-        "GET", `/agents/${urlSegment(agentId, "agent_id")}/capture`);
+      body = await this._c.request("GET", `/agents/${agent}/capture`);
     } catch (err) {
       if (err instanceof TransportError
           && CAPTURE_READ_REFUSALS.has(err.statusCode)) {
