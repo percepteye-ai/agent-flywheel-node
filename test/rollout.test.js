@@ -999,6 +999,88 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-2" }), undefined);
   });
 
+  it("hands back a rollout claimed past its deadline, in both lanes' one claim seam", async () => {
+    const tx = fakeTransport({
+      claim: async () => ({ rollouts: [{
+        rolloutId: "r-late", turnInput: "x", leaseToken: "lt", deadlineTs: 99,
+      }] }),
+    });
+    const sent = [];
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, now: () => 100_000,
+      enqueue: async (i) => { sent.push(i); return { enqueued: true }; },
+    });
+    assert.equal(await d.onSessionStart({ sessionKey: "s1" }), null);
+    assert.deepEqual(sent, [], "work the server gave up on is not run");
+    assert.equal(tx.calls.abandon[0][1].reason, "deadline_exceeded");
+    assert.deepEqual((await d.claim(1)).rollouts, [], "the unattended lane's claim too");
+  });
+
+  it("stops a rollout at its deadline and reports it deadline_exceeded", async () => {
+    let t = 1_000_000;
+    const timers = [];
+    const cancelled = [];
+    const tx = fakeTransport({
+      claim: async () => ({ rollouts: [{
+        rolloutId: "r-slow", turnInput: "x", deadlineTs: (t + 60_000) / 1000,
+      }] }),
+    });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, now: () => t,
+      enqueue: async () => ({ enqueued: true }),
+      cancel: async (request) => { cancelled.push(request); return true; },
+      heartbeatScheduler: (callback, delayMs) => {
+        timers.push({ callback, delayMs });
+        return timers.at(-1);
+      },
+      heartbeatCanceller(timer) { timer.cancelled = true; },
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-1" });
+    const deadline = timers.at(-1);
+    assert.equal(deadline.delayMs, 60_000 - 10_000, "stopped short, leaving time to report");
+    t += 50_000;
+    await deadline.callback();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(tx.calls.report.length, 1);
+    const output = tx.calls.report[0][1];
+    assert.equal(output.finalText, "");
+    assert.equal(output.exclusion.reason, "deadline_exceeded");
+    assert.equal(d.inFlight.has("s1"), false);
+    assert.equal(cancelled[0]?.runId, "run-1", "the run is stopped");
+    assert.ok(d.onBeforeToolCall({}, { sessionKey: "s1", runId: "run-1" })?.block,
+      "and fenced, as a lost lease's run is");
+    // The run's own late answer reports nothing a second time.
+    await d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "late" }] },
+      { sessionKey: "s1", runId: "run-1" },
+    );
+    assert.equal(tx.calls.report.length, 1);
+  });
+
+  it("clears the deadline timer of a rollout that answered in time", async () => {
+    const timers = [];
+    const tx = fakeTransport({
+      claim: async () => ({ rollouts: [{
+        rolloutId: "r-quick", turnInput: "x", deadlineTs: Date.now() / 1000 + 600,
+      }] }),
+    });
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+      heartbeatScheduler: (callback, delayMs) => {
+        timers.push({ callback, delayMs, cancelled: false });
+        return timers.at(-1);
+      },
+      heartbeatCanceller(timer) { timer.cancelled = true; },
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    await d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(timers.at(-1).cancelled, true);
+  });
+
   it("paces a long initial grant against the ten-minute renewal ceiling", async () => {
     const scheduled = [];
     const d = createRolloutDriver({

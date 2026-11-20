@@ -152,6 +152,14 @@ export const MAX_INJECTION_BYTES = 32 * 1024;
  */
 export const ROLLOUT_MODEL = "policy";
 
+/**
+ * How long before a rollout's deadline it is stopped and reported: the
+ * Python runner's `REPORT_MARGIN_S` floor. A rollout run up to its deadline
+ * exactly has no time left to report into a lease the server has not yet
+ * swept.
+ */
+export const REPORT_MARGIN_MS = 10_000;
+
 /** Where a rollout's credential comes from, said one way. */
 export const ROLLOUT_KEY_ORIGIN =
   "the rollout's own key for its per-rollout gateway (the claim's api_key)";
@@ -307,7 +315,20 @@ export function createRolloutDriver({
    * first left to lapse.
    */
   const claiming = new Set();
+  /** sessionKey -> the timer that stops its rollout at `deadlineTs`. */
+  const deadlines = new Map();
   let warnedMissingModelCallCount = false;
+
+  /** Whether the server's deadline for `rollout` has already passed. */
+  const pastDeadline = (rollout) => Number.isFinite(rollout?.deadlineTs)
+    && rollout.deadlineTs > 0 && rollout.deadlineTs * 1000 <= now();
+
+  function clearDeadline(sessionKey) {
+    const timer = deadlines.get(sessionKey);
+    if (timer === undefined) return;
+    deadlines.delete(sessionKey);
+    try { heartbeatCanceller(timer); } catch { /* a timer that is gone */ }
+  }
 
   // ── WHERE A ROLLOUT SAMPLES ────────────────────────────────────────────
   //
@@ -455,7 +476,10 @@ export function createRolloutDriver({
         // already over, so there is nothing to cancel or fence.
         return;
       }
-      if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
+      if (inFlight.get(sessionKey) === rollout) {
+        inFlight.delete(sessionKey);
+        clearDeadline(sessionKey);
+      }
       dropTrajectory(rollout);
       try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
       const runStarted = activeRuns.has(sessionKey);
@@ -559,6 +583,7 @@ export function createRolloutDriver({
    */
   async function giveBack(sessionKey, rollout, reason, detail) {
     stopHeartbeat(sessionKey);
+    clearDeadline(sessionKey);
     inFlight.delete(sessionKey);
     dropTrajectory(rollout);
     try {
@@ -600,6 +625,23 @@ export function createRolloutDriver({
     }
     inFlight.set(sessionKey, rollout);
     startHeartbeat(sessionKey, rollout);
+    // THE SERVER'S DEADLINE, honoured: the run is stopped and reported
+    // `deadline_exceeded` REPORT_MARGIN_MS before it, while the lease is
+    // still good, as the Python runner stops its child short of it. It used
+    // to be parsed and read nowhere, so a rollout ran past its budget and
+    // its report chased a row the reaper had already swept.
+    clearDeadline(sessionKey);
+    if (Number.isFinite(rollout?.deadlineTs) && rollout.deadlineTs > 0) {
+      const delay = Math.max(0, rollout.deadlineTs * 1000 - REPORT_MARGIN_MS - now());
+      try {
+        deadlines.set(sessionKey, heartbeatScheduler(() => {
+          deadlines.delete(sessionKey);
+          expire(sessionKey, rollout).catch(() => {});
+        }, delay));
+      } catch {
+        /* no timer: the lease and the reaper still bound it */
+      }
+    }
     try {
       modelCalls?.begin?.(sessionKey);
     } catch {
@@ -715,7 +757,30 @@ export function createRolloutDriver({
         `held results stay on disk and are retried before the next claim.`,
       );
     }
-    return transport.claim(maxRollouts);
+    const answer = await transport.claim(maxRollouts);
+    // PAST ITS DEADLINE WHEN IT ARRIVED -- a backlog, a slow claim, a clock
+    // that moved -- is handed straight back, in this one seam both lanes
+    // claim through, rather than run on work the server has given up on.
+    const rollouts = Array.isArray(answer?.rollouts) ? answer.rollouts : [];
+    const runnable = [];
+    for (const rollout of rollouts) {
+      if (!pastDeadline(rollout)) {
+        runnable.push(rollout);
+        continue;
+      }
+      try {
+        await transport.abandon(rollout, {
+          reason: "deadline_exceeded",
+          detail: "deadline had already passed when claimed",
+        });
+      } catch (err) {
+        logger?.warn?.(
+          `[agent-flywheel] could not hand back rollout ${rollout.rolloutId}, ` +
+          `claimed past its deadline; its lease will lapse on its own: ` +
+          `${err?.message ?? err}`);
+      }
+    }
+    return runnable.length === rollouts.length ? answer : { ...answer, rollouts: runnable };
   }
 
   async function claimAndDeliver(sessionKey) {
@@ -787,6 +852,54 @@ export function createRolloutDriver({
   }
 
   /**
+   * The rollout's deadline (less the report margin) arrived before its
+   * answer. Stop it and report it `deadline_exceeded` -- the Python runner's
+   * timed-out result: no answer, an exclusion naming the budget, and the
+   * tool calls it made -- through the same durable delivery as any result.
+   * The run is fenced and cancelled exactly as a lost lease's is, because
+   * whatever it does next is no longer this rollout.
+   */
+  async function expire(sessionKey, rollout) {
+    if (inFlight.get(sessionKey) !== rollout || reporting.get(sessionKey) === rollout) {
+      return null;
+    }
+    inFlight.delete(sessionKey);
+    reporting.set(sessionKey, rollout);
+    try {
+      const runStarted = activeRuns.has(sessionKey);
+      const runId = activeRuns.get(sessionKey) ?? undefined;
+      activeRuns.delete(sessionKey);
+      if (!runStarted) blockNextRun.add(sessionKey);
+      else revokedRuns.set(sessionKey, runId ?? null);
+      try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
+      if (cancel) {
+        try { await cancel({ sessionKey, runId, rollout }); } catch { /* fenced anyway */ }
+      }
+      const trajectory = readTrajectory(trajectoryOf(rollout));
+      try {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId} reached its deadline ` +
+          `without an answer; reporting it deadline_exceeded.`);
+      } catch { /* telemetry */ }
+      const delivered = await spool.deliver(rollout, {
+        finalText: "",
+        exclusion: {
+          reason: "deadline_exceeded",
+          detail: `no answer ${REPORT_MARGIN_MS / 1000}s before the rollout's deadline`,
+        },
+        toolCalls: trajectory.calls ?? undefined,
+        toolCallsOmittedCount: trajectory.calls === null
+          ? undefined : trajectory.malformed,
+      });
+      return delivered ? rollout : null;
+    } finally {
+      if (reporting.get(sessionKey) === rollout) reporting.delete(sessionKey);
+      stopHeartbeat(sessionKey);
+      dropTrajectory(rollout);
+    }
+  }
+
+  /**
    * The agent finished. Report the answer.
    *
    * `PluginHookAgentEndEvent` carries no session key -- it is
@@ -812,6 +925,7 @@ export function createRolloutDriver({
     }
     if (!rollout) return null;
     inFlight.delete(sessionKey);
+    clearDeadline(sessionKey);
 
     if (event?.success === false) {
       // The agent RAN and failed. That is a real attempt and exactly what
