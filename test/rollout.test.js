@@ -185,6 +185,21 @@ describe("the mode split is structural", () => {
     // ...and the recorder survives the bad setting.
     assert.ok(names.includes("after_tool_call"));
   });
+
+  it("does not blame the mode, or fail the load, over an invalid agentId", () => {
+    // The fallback used to assume every ConfigurationError was the mode's
+    // and retry unguarded: an invalid agentId threw again out of register()
+    // -- a failed plugin load -- having been about to say "not a mode".
+    for (const env of [ENV("training"), ENV("prodction")]) {
+      const api = fakeApi();
+      const out = register(api, { agentId: "../escape" }, env);
+      assert.equal(out, null);
+      assert.equal(api.hooks.length, 0, "nothing is registered under a name nobody gave");
+      const said = api.logs.join("\n");
+      assert.match(said, /agentId must be a non-empty, control-free identifier/);
+      assert.doesNotMatch(said, /Running in production mode/);
+    }
+  });
 });
 
 describe("driveVerdict names ONE cause", () => {

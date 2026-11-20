@@ -76,7 +76,7 @@ import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
 import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
 import { ControlPlaneClient } from "./http.js";
 import { AttachTransport, rulesNeverSent, sentence } from "./transport.js";
-import { PRODUCTION, TRAINING } from "./mode.js";
+import { PRODUCTION, resolveModeSource, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
 import { PENDING_ANSWER_REASON, registerServingPolicy } from "./policy.js";
@@ -212,10 +212,37 @@ export function register(api, pluginConfig = {}, env = process.env) {
     : (api.pluginConfig ?? {});
   let config;
   let degraded = null;
+  // ANY OTHER UNREADABLE SETTING -- an agentId that is not one -- has no
+  // safe value to degrade to: capturing or uploading under a name the
+  // operator did not give would file their turns under somebody else's
+  // agent. So nothing is registered, the plugin load still succeeds, and
+  // the line names the setting that has to change.
+  const refuse = (err) => {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] ${err.message}. Nothing is recorded or sent until this ` +
+      `is corrected in plugins.entries.${PLUGIN_ID}.config or the ` +
+      `environment; this install registers no hook.`,
+    );
+    return null;
+  };
+  const modeIsUnreadable = () => {
+    try {
+      resolveModeSource(supplied.mode, env);
+      return false;
+    } catch (err) {
+      if (err instanceof ConfigurationError) return true;
+      throw err;
+    }
+  };
   try {
     config = resolveConfig(supplied, env);
   } catch (err) {
     if (!(err instanceof ConfigurationError)) throw err;
+    // DEGRADED ONLY WHEN IT IS THE MODE THAT CANNOT BE READ. This used to
+    // assume every ConfigurationError was the mode's, retry unguarded, and
+    // fail the plugin load on an invalid agentId -- with a warning, had it
+    // got that far, blaming the mode.
+    if (!modeIsUnreadable()) return refuse(err);
     // AN UNREADABLE MODE DEGRADES TO PRODUCTION, LOUDLY. It does not throw
     // and it does not fall back to `training`, and both of those matter.
     //
@@ -232,12 +259,19 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // side of a mode we could not read: the worst case is that this install
     // does less than intended, and says so.
     degraded = { ...supplied, mode: PRODUCTION };
-    config = resolveConfig(degraded, env);
+    try {
+      config = resolveConfig(degraded, env);
+    } catch (again) {
+      // The mode AND another setting are unreadable; the other one decides.
+      if (!(again instanceof ConfigurationError)) throw again;
+      return refuse(again);
+    }
     logger?.warn?.(
       `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode until ` +
       `this is corrected; no rollouts will be claimed. Note that production ` +
       `mode is not inert: it captures served turns and applies the approved ` +
-      `system prompt (PERCEPTEYE_CAPTURE=0 / PERCEPTEYE_APPLY_PROMPT=0).`,
+      `system prompt and model (PERCEPTEYE_CAPTURE=0 / ` +
+      `PERCEPTEYE_APPLY_PROMPT=0 / PERCEPTEYE_APPLY_MODEL=0).`,
     );
   }
   // THE KEY `npx @percepteye/agent-flywheel login` STORED, consulted only
