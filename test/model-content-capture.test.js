@@ -666,3 +666,25 @@ describe("the wire", () => {
     assert.ok(!("genai_trace" in granted));
   });
 });
+
+describe("model input held until its run ends (ND-M16)", () => {
+  it("is bounded by bytes: the oldest run's input goes first", () => {
+    // Mutation: bound by count alone -> both inputs are held and both runs
+    // record a boundary, red.
+    const root = tmp();
+    const big = "x".repeat(4000);
+    const turns = createTurnCapture({ root, maxPendingInputBytes: 6000 });
+    turns.gateModelContent(() => true);
+    for (const runId of ["old", "new"]) {
+      turns.onLlmInput(llmInput(runId, { systemPrompt: big }),
+        { runId, sessionKey: CONVERSATION });
+    }
+    for (const runId of ["old", "new"]) {
+      turns.onAgentEnd({ runId, messages: transcript() }, { runId, sessionKey: CONVERSATION });
+    }
+    assert.ok(!existsSync(join(root, "old", OBSERVATION_FILENAME)),
+      "the oldest input should have been let go");
+    assert.ok(existsSync(join(root, "new", OBSERVATION_FILENAME)),
+      "the newest input is held and recorded");
+  });
+});

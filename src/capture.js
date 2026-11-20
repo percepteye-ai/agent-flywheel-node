@@ -139,6 +139,13 @@ const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
 /** Turns between automatic upload attempts. The Python SDK's `_FLUSH_EVERY`. */
 export const FLUSH_EVERY = 32;
 
+/**
+ * The most bytes of model input the turn store holds for runs whose
+ * `agent_end` has not arrived: the oldest go first. One input larger than
+ * this alone is not held, and its run records no model boundary.
+ */
+export const PENDING_INPUT_MAX_BYTES = 64 * 1024 * 1024;
+
 /** Turns per request. The intake's `TURN_BATCH_MAX`. */
 export const BATCH_SIZE = 64;
 
@@ -169,8 +176,27 @@ export function retentionTurnsFrom(value) {
   return {
     retentionTurns: null,
     refusal: "retentionTurns must be a whole number of turns, 0 or more, " +
-      `not ${JSON.stringify(value) ?? String(value)}`,
+      `not ${describeValue(value)}`,
   };
+}
+
+/**
+ * A configured value, said in a refusal. NEVER THROWS: `JSON.stringify`
+ * throws on a BigInt and on a cyclic object, and `String` on an object with
+ * no prototype -- and a throw here, inside `register()`, failed the plugin
+ * load and took local capture with it.
+ */
+function describeValue(value) {
+  if (typeof value === "bigint") return `${value}n`;
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch { /* cyclic, or holds a BigInt */ }
+  try {
+    return String(value);
+  } catch {
+    return `a value of type ${typeof value}`;
+  }
 }
 
 /** Whether a turn directory holds anything an upload could carry; Python's
@@ -608,7 +634,10 @@ export function captureRefusal(err) {
  * the one predicate the serving policy's two halves ask: a run it refuses is
  * not recorded at all, and each distinct reason is said once.
  */
-export function createTurnCapture({ root, logger = null, servedAgent = null }) {
+export function createTurnCapture({
+  root, logger = null, servedAgent = null,
+  maxPendingInputBytes = PENDING_INPUT_MAX_BYTES,
+}) {
   let warned = false;
   const served = servedAgent ?? resolveServedAgent({});
   // Once per DISTINCT reason, not per run: this sits in front of every turn.
@@ -637,6 +666,15 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
   // `agent_end`. Keyed by turn id; bounded like `generatedTurnIds`, so a run
   // whose `agent_end` never arrives is forgotten rather than held forever.
   const pendingInputs = new Map();
+  // ...and bounded by BYTES as well as by count: one run's input is its whole
+  // history, and 4,096 of them held at once is unbounded heap.
+  const pendingSizes = new Map();
+  let pendingBytes = 0;
+  const forgetInput = (turnId) => {
+    pendingBytes -= pendingSizes.get(turnId) ?? 0;
+    pendingSizes.delete(turnId);
+    pendingInputs.delete(turnId);
+  };
   // Invalid host ids are never cleaned into a different caller id. They get a
   // fresh safe id, retained only long enough to keep this run's hooks joined.
   const generatedTurnIds = new Map();
@@ -721,12 +759,26 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
       // A SECOND llm_input in one run means the model saw a second prefix
       // (a retry, a re-assembly after compaction). Which one each answer
       // followed is not observable, so the run records no model boundary.
-      pendingInputs.set(turnId, prior
+      let entry = prior
         ? { refused: "the run assembled more than one model input" }
         : inputFromLlmInput(event, nowUnixNano())
-          ?? { refused: "the model input cannot be rendered faithfully" });
-      while (pendingInputs.size > 4096) {
-        pendingInputs.delete(pendingInputs.keys().next().value);
+          ?? { refused: "the model input cannot be rendered faithfully" };
+      let size = 0;
+      try {
+        size = Buffer.byteLength(JSON.stringify(entry) ?? "", "utf8");
+      } catch {
+        entry = { refused: "the model input cannot be rendered faithfully" };
+      }
+      if (size > maxPendingInputBytes) {
+        entry = { refused: "the model input is too large to hold until its run ends" };
+        size = 0;
+      }
+      forgetInput(turnId);
+      pendingInputs.set(turnId, entry);
+      pendingSizes.set(turnId, size);
+      pendingBytes += size;
+      while (pendingInputs.size > 4096 || pendingBytes > maxPendingInputBytes) {
+        forgetInput(pendingInputs.keys().next().value);
       }
       return true;
     } catch {
@@ -737,7 +789,7 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
   /** The run's model calls, from its first input and its final transcript. */
   function recordRunBoundary(turnId, dir, messages) {
     const first = pendingInputs.get(turnId);
-    pendingInputs.delete(turnId);
+    forgetInput(turnId);
     if (!first || first.refused || !mayRecordModelContent()) return false;
     try {
       return recordModelBoundary(dir, operationsFromRun(first, messages, nowUnixNano()));
