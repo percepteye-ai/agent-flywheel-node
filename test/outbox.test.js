@@ -724,9 +724,13 @@ describe("a drain is bounded (ND-H16)", () => {
   it("skips a directory named *.json without leaving a file per pass", async () => {
     const dir = tmp();
     mkdirSync(join(dir, "odd.json"));
-    const outbox = createOutbox({ dir, send: async () => {} });
+    const warns = [];
+    const outbox = createOutbox({
+      dir, send: async () => {}, logger: { warn: (m) => warns.push(m) },
+    });
     for (let i = 0; i < 3; i += 1) await outbox.drain();
     assert.deepEqual(listing(dir), ["odd.json"]);
+    assert.deepEqual(warns, [], "a directory was treated as a spooled result on every pass");
   });
 
   it("never leaves an empty file when a retirement cannot be moved", async () => {
