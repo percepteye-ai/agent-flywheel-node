@@ -135,6 +135,25 @@ describe("an unknown outcome asserts nothing", () => {
     assert.equal("body" in wire.tool_calls[0], false);
   });
 
+  it("scrubs a status out of an unknown call's output, as contract.py _scrub_status does", () => {
+    const wire = rolloutOutputToWire({
+      finalText: "x",
+      toolCalls: [
+        { name: "a", outcome: "unknown", status_code: null,
+          output: { status: 200, statusCode: 201, ok: "HTTP 200 OK", nested: [{ code: 7, note: "n" }] } },
+        { name: "b", outcome: "unknown", status_code: null, output: "got HTTP 404 back" },
+        { name: "c", outcome: "unknown", status_code: null,
+          output: JSON.stringify({ http_status: 500, msg: "fine" }) },
+        { name: "d", outcome: "ok", status_code: null, output: { status: 200 } },
+      ],
+    });
+    assert.deepEqual(wire.tool_calls[0].output, { ok: "OK", nested: [{ note: "n" }] });
+    assert.equal(wire.tool_calls[1].output, "got  back");
+    assert.deepEqual(JSON.parse(wire.tool_calls[2].output), { msg: "fine" });
+    // An OBSERVED outcome's output is evidence and is left exactly as it was.
+    assert.deepEqual(wire.tool_calls[3].output, { status: 200 });
+  });
+
   it("leaves a known outcome's status_code alone", () => {
     const wire = rolloutOutputToWire({
       finalText: "x",
@@ -179,14 +198,18 @@ describe("the closed key set", () => {
 });
 
 describe("reading a claimed rollout", () => {
+  /** Every field `RolloutRequest.from_wire` requires, plus `extra`. */
+  const claimed = (extra = {}) => ({
+    rollout_id: "r1", turn_input: "do it", llm_url: "https://gw/v1",
+    api_key: "rk", artifacts_dir: "rollouts/r1", deadline_ts: 123.5, ...extra,
+  });
+
   it("keeps the server's field names", () => {
-    const r = rolloutRequestFromWire({
-      rollout_id: "r1", turn_input: "do it", llm_url: "https://gw/v1",
-      deadline_ts: 123.5, lease_token: "lt",
-    });
+    const r = rolloutRequestFromWire(claimed({ lease_token: "lt" }));
     assert.equal(r.rolloutId, "r1");
     assert.equal(r.turnInput, "do it");
     assert.equal(r.llmUrl, "https://gw/v1");
+    assert.equal(r.apiKey, "rk");
     assert.equal(r.deadlineTs, 123.5);
     assert.equal(r.leaseToken, "lt");
   });
@@ -195,27 +218,69 @@ describe("reading a claimed rollout", () => {
     assert.throws(() => rolloutRequestFromWire({ turn_input: "x" }), ContractError);
   });
 
+  it("refuses a payload missing any field the Python SDK requires, naming it", () => {
+    // A rollout with no llm_url/api_key has no gateway to sample through, so
+    // it could only ever run on the host's own model -- not the checkpoint
+    // being trained. contract.py RolloutRequest.from_wire refuses it too.
+    for (const key of [
+      "rollout_id", "turn_input", "llm_url", "api_key", "artifacts_dir", "deadline_ts",
+    ]) {
+      const raw = claimed();
+      delete raw[key];
+      assert.throws(
+        () => rolloutRequestFromWire(raw),
+        new RegExp(`missing required field\\(s\\): \\['${key}'\\]`),
+      );
+    }
+  });
+
+  it("refuses an 'environment' key, as contract.py does", () => {
+    assert.throws(
+      () => rolloutRequestFromWire(claimed({ environment: { A: "1" } })),
+      /carries an 'environment' key/,
+    );
+  });
+
+  it("refuses a rollout id that is not one path segment, by its cause", () => {
+    for (const [id, cause] of [
+      ["", /must not be empty/], [".", /dot segment/], ["..", /dot segment/],
+      ["a/b", /path separator/], ["a\\b", /path separator/],
+      ["a\nb", /control character/], ["a\u0085b", /control character/],
+      ["\ud800", /well-formed/], ["x".repeat(257), /at most 256 characters, got 257/],
+      [7, /must be a string, got number/],
+    ]) {
+      assert.throws(() => rolloutRequestFromWire(claimed({ rollout_id: id })), cause);
+    }
+    assert.equal(
+      rolloutRequestFromWire(claimed({ rollout_id: "😀".repeat(256) })).rolloutId,
+      "😀".repeat(256),
+    );
+  });
+
   it("keeps the granted lease clock and metadata for the worker", () => {
-    const request = rolloutRequestFromWire({
-      rollout_id: "r1",
-      turn_input: "do it",
+    const request = rolloutRequestFromWire(claimed({
       deadline_ts: 999,
       lease_token: "lease-1",
       lease_expires_ts: 123.5,
       metadata: { suite: "held-out" },
-    });
+    }));
     assert.equal(request.leaseExpiresTs, 123.5);
     assert.deepEqual(request.metadata, { suite: "held-out" });
   });
 
   it("names the task the rollout was claimed for (Python: current_task_id)", () => {
-    const named = rolloutRequestFromWire({
-      rollout_id: "r1", metadata: { task_id: "banking_knowledge:task_017" },
-    });
+    const named = rolloutRequestFromWire(
+      claimed({ metadata: { task_id: "banking_knowledge:task_017" } }),
+    );
     assert.equal(named.taskId, "banking_knowledge:task_017");
-    assert.equal(rolloutRequestFromWire({ rollout_id: "r1" }).taskId, null);
+    assert.equal(rolloutRequestFromWire(claimed()).taskId, null);
     assert.equal(
-      rolloutRequestFromWire({ rollout_id: "r1", metadata: { task_id: "a\nb" } }).taskId,
+      rolloutRequestFromWire(claimed({ metadata: { task_id: "a\nb" } })).taskId,
+      null,
+    );
+    // The control plane's printable rule, not only the shared grammar.
+    assert.equal(
+      rolloutRequestFromWire(claimed({ metadata: { task_id: "case\u200b1" } })).taskId,
       null,
     );
   });

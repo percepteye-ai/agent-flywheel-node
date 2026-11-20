@@ -22,7 +22,8 @@ import {
   ContractError, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
   PRODUCTION_TURN_BATCH_MAX_ITEMS, TURN_FEEDBACK_BATCH_MAX_ITEMS,
   productionAgentIdentifier,
-  productionIdentifier, productionOutcome, productionTurnIdentifier,
+  productionIdentifier, productionOutcome, productionTaskIdentifier,
+  productionTurnIdentifier,
   rolloutOutputToWire, turnFeedback,
   rolloutRequestFromWire, rulebookReceiptFromWire, rulebookRequestToWire,
 } from "./wire.js";
@@ -557,7 +558,7 @@ export class AttachTransport {
       }
       if (
         Object.hasOwn(turn, "task_id")
-        && productionIdentifier(turn.task_id) === null
+        && productionTaskIdentifier(turn.task_id) === null
       ) {
         throw new ContractError(`production turn ${index} has an invalid task_id`);
       }

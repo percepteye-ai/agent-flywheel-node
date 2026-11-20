@@ -119,7 +119,10 @@ describe("claiming is not replayable", () => {
   it("parses rollouts through the wire contract", async () => {
     const { tx } = t({
       "/rollouts/claim": {
-        rollouts: [{ rollout_id: "r9", turn_input: "go", deadline_ts: 5 }],
+        rollouts: [{
+          rollout_id: "r9", turn_input: "go", llm_url: "https://gw/r9",
+          api_key: "k", artifacts_dir: "rollouts/r9", deadline_ts: 5,
+        }],
         poll_after_ms: 2500,
       },
     });

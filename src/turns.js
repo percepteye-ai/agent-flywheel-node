@@ -51,7 +51,8 @@ import {
 } from "./genai-otlp.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
-  ContractError, productionIdentifier, productionTurnIdentifier,
+  ContractError, productionIdentifier, productionTaskIdentifier,
+  productionTurnIdentifier,
 } from "./wire.js";
 
 export const TURNS_FILENAME = "turns.jsonl";
@@ -201,7 +202,7 @@ export function recordConversationId(dir, conversationId) {
  * mixed turn. This is neutral evidence only; it grants no training meaning.
  */
 export function recordTaskId(dir, taskId) {
-  const exact = productionIdentifier(taskId);
+  const exact = productionTaskIdentifier(taskId);
   if (exact === null) return false;
   const sidecar = join(dir, TASK_ID_FILENAME);
   const conflict = join(dir, TASK_ID_CONFLICT_FILENAME);
@@ -372,7 +373,7 @@ export function readTaskId(dir) {
   } catch {
     return null;
   }
-  return productionIdentifier(raw) === raw && !existsSync(conflict) ? raw : null;
+  return productionTaskIdentifier(raw) === raw && !existsSync(conflict) ? raw : null;
 }
 
 /**
