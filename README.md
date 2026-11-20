@@ -532,7 +532,7 @@ That line is real output from a live OpenClaw run, and it is the same format the
 
 ## 📋 Runs, eligibility and evaluation sets
 
-`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.51.0; every read works against a server from 1.30.0 on) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
+`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.54.0; every read works against a server from 1.30.0 on) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
 
 ```js
 import { CustomerApiClient } from "@percepteye/agent-flywheel/customer-api";
@@ -545,7 +545,7 @@ const sets = await mc.listEvalSets({ productId: "prod_123", limit: 20 });
 const security = (await mc.getHillclimbSecurity("run_123")).measurement.state;
 ```
 
-A refused request throws `CustomerRefusal` with the body's `code`, `refusalMessage`, `customerMessage`, `customerWords`, `remediation`, `faultOwner`, `retryable` and `detail` (the refusal's own evidence, such as a diverged train's `learning_rate`). `plainWords` is what to show a person. The codes this SDK knows are exported in groups (`RUN_LIST_`, `PROMPT_RUN_`, `ATTACK_`, `CYBER_`, `TRAINING_` and `AGENT_REFUSAL_CODES`). `trainingLocation` (`platform_pool` or `platform_gpu`) needs Mission Control 1.50.0: an older server ignores it and answers for the organization's own setting, so that answer throws `CustomerContractTooOld` instead of being returned. The Python SDK has the same client in `agent_flywheel.customer_api`.
+A refused request throws `CustomerRefusal` with the body's `code`, `refusalMessage`, `customerMessage`, `customerWords`, `remediation`, `faultOwner`, `retryable` and `detail` (the refusal's own evidence, such as a diverged train's `learning_rate`). `plainWords` is what to show a person. The codes this SDK knows are exported in groups (`RUN_LIST_`, `PROMPT_RUN_`, `ATTACK_`, `CYBER_`, `TRAINING_` and `AGENT_REFUSAL_CODES`). Each run in `listRuns` carries, from Mission Control 1.53.0, `latest_activity_at`, `latest_status`, `attempts`, `best_measured` and `measured` (null where they do not apply). A read is retried on a connection failure, 408, 429 or a recoverable 5xx (three attempts, honouring `Retry-After`) and is bounded by a 30-second deadline that covers the body (`timeoutMs`); a redirect or a 2xx body that is not JSON throws `TransportError` rather than being returned, a 422 validation list is kept readable in the message, and a run id that is not one path segment (`..`, a separator, empty) is refused with `ContractError` before anything is sent. `trainingLocation` (`platform_pool` or `platform_gpu`) needs Mission Control 1.50.0: an older server ignores it and answers for the organization's own setting, so that answer throws `CustomerContractTooOld` instead of being returned. The Python SDK has the same client in `agent_flywheel.customer_api`.
 
 ## ⚙️ Configuration
 

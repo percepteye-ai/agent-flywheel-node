@@ -98,7 +98,7 @@ import {
 } from "./execution-identity.js";
 import { declarationDescribes, resolveDeclaration } from "./declaration.js";
 import {
-  CredentialsError, credentialsPath, loadStored, loginHint,
+  CredentialsError, credentialsPath, loadStored, loginHint, shellQuote,
 } from "./credentials.js";
 
 export const PLUGIN_ID = "agent-flywheel";
@@ -300,7 +300,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
       `[${PLUGIN_ID}] using the key stored for agent ` +
       `${JSON.stringify(config.agentId)} in ${credentialsPath(env)} (control ` +
       `plane ${config.controlPlaneUrl}). Run \`npx @percepteye/agent-flywheel ` +
-      `logout --agent-id ${config.agentId}\` to stop.`,
+      `logout --agent-id ${shellQuote(config.agentId)}\` to stop.`,
     );
   } else if (config.apiKey === null && config.storedKeyRefusal) {
     logger?.warn?.(

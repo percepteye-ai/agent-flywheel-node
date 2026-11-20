@@ -19,7 +19,7 @@ import { CONTRACT_VERSION } from "./wire.js";
 import { LeaseLost, TransportError } from "./errors.js";
 
 /** Transient. Retry these, honouring Retry-After when present. */
-const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+export const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
 /**
  * Node's fetch rejects with a TypeError whose `cause.code` names the syscall
@@ -30,9 +30,15 @@ const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
  * distinction: a read timeout may have been fully processed by the server, so
  * resending it performs the operation twice. Python names the same split with
  * `_NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout)`.
+ *
+ * NOR IS `ECONNRESET`. A reset arrives on a connection that WAS established --
+ * an idle keep-alive socket the server closed, or one it dropped after the
+ * request was written and possibly processed -- and the code alone cannot tell
+ * the two apart. Listing it here reported "provably never sent" for a request
+ * the control plane may have performed.
  */
 const NEVER_SENT_CODES = new Set([
-  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ECONNRESET",
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN",
   "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL",
 ]);
 
@@ -89,13 +95,13 @@ export const MAX_BACKOFF_MS = 8000;
  * agents that all retry on the same schedule reconverges into exactly the
  * spike that caused the backoff.
  */
-function backoffMs(attempt) {
+export function backoffMs(attempt) {
   return Math.random() * Math.min(MAX_BACKOFF_MS, 500 * 2 ** (attempt - 1));
 }
 
 /** The server's own backoff, capped at the same ceiling as our jitter. */
-function retryAfterMs(response) {
-  const raw = response.headers.get("retry-after");
+export function retryAfterMs(response) {
+  const raw = response.headers?.get?.("retry-after");
   if (!raw) return null;
   const seconds = Number(raw);
   return Number.isFinite(seconds)
@@ -109,10 +115,11 @@ function retryAfterMs(response) {
  * came first -- so the same answer read shorter here -- and could cut one in
  * half.
  *
- * READS NO FURTHER THAN IT KEEPS. Every refused and retried attempt passes
- * its body through here, and an error body can be an HTML page or a dump of
- * megabytes: spreading all of it into one string per character to keep 300
- * cost the gateway process heap in proportion to the body, on every attempt.
+ * ITERATES NO FURTHER THAN IT KEEPS: spreading a whole string into one array
+ * entry per character to keep 300 cost heap in proportion to the string. What
+ * bounds how much of an error BODY is read off the wire at all is not this
+ * function -- it is handed a string already in memory -- but `detail`'s
+ * `MAX_ERROR_BODY_BYTES`.
  */
 export function cut(text) {
   let out = "";
@@ -125,10 +132,39 @@ export function cut(text) {
   return out;
 }
 
+/**
+ * How much of a REFUSAL's body is read: enough for any refusal the control
+ * plane writes, and a hard stop for an HTML error page or a proxy's dump of
+ * megabytes, which every refused or retried attempt would otherwise buffer
+ * whole into the gateway's heap to keep 300 characters of it.
+ */
+export const MAX_ERROR_BODY_BYTES = 64 * 1024;
+
+/** At most `limit` bytes of `response`'s body, decoded; the rest is never
+ * downloaded. A response with no stream (a test double) is read whole. */
+export async function readCapped(response, limit) {
+  const stream = response.body;
+  if (!stream || typeof stream.getReader !== "function") return response.text();
+  const reader = stream.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (size < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.byteLength;
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks).subarray(0, limit));
+}
+
 async function detail(response) {
   let text = "";
   try {
-    text = await response.text();
+    text = await readCapped(response, MAX_ERROR_BODY_BYTES);
   } catch {
     return "";
   }
@@ -208,7 +244,15 @@ export class ControlPlaneClient {
     // Kept so `redactKeys` can find this exact value in a body.
     this._secret = apiKey;
     this._timeoutMs = opts.timeoutMs ?? 30_000;
-    this._maxAttempts = Math.max(1, opts.maxAttempts ?? 4);
+    const maxAttempts = opts.maxAttempts ?? 4;
+    // A NaN made the retry loop run zero times and report "failed after NaN
+    // attempts" for a request never made; Infinity never stopped retrying.
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+      throw new TransportError(
+        `maxAttempts must be a positive integer, not ${String(maxAttempts)}`,
+      );
+    }
+    this._maxAttempts = maxAttempts;
     this._fetch = opts.fetchImpl ?? globalThis.fetch;
     this._headers = {
       Authorization: `Bearer ${apiKey}`,
@@ -267,91 +311,152 @@ export class ControlPlaneClient {
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
     if (jsonBody !== undefined) headers["Content-Type"] = "application/json";
 
+    // SERIALISED ONCE, before any attempt. A body JSON cannot carry (a
+    // BigInt, a cycle) fails identically every time; inside the loop it was
+    // read as a failed send -- "may have been performed" -- and retried.
+    let body;
+    if (jsonBody !== undefined) {
+      let serialised;
+      try {
+        serialised = JSON.stringify(jsonBody);
+      } catch (err) {
+        throw new TransportError(
+          `${method} ${path}: the request body cannot be serialised as JSON ` +
+          `(${err?.name ?? "Error"}: ${err?.message ?? err}); nothing was sent`,
+          { cause: err },
+        );
+      }
+      if (typeof serialised !== "string") {
+        throw new TransportError(
+          `${method} ${path}: the request body serialises to no JSON; nothing was sent`,
+        );
+      }
+      body = redactKeys(serialised, this._secret);
+    }
+
     let lastErr = null;
+    // The status of the LAST attempt, so a request that ran out of attempts on
+    // a 503 still says 503 on the error and not only inside its message.
+    let lastStatus = null;
     // Whether ANY attempt so far may have been performed -- see
     // `TransportError.ambiguous`. Over every attempt, not the last: a retry
     // that was never sent says nothing about the one before it.
     let ambiguous = false;
+    let wait = null;
 
     for (let attempt = 1; attempt <= this._maxAttempts; attempt += 1) {
+      if (wait !== null) {
+        await sleep(wait);
+        wait = null;
+      }
+      const last = attempt === this._maxAttempts;
       const controller = new AbortController();
+      // The deadline covers the WHOLE attempt, the body read included. It
+      // used to be cleared as soon as the headers arrived, so a server that
+      // sent headers and then stalled held the call open forever.
       const timer = setTimeout(
         () => controller.abort(),
         timeoutMs ?? this._timeoutMs,
       );
-      let response;
       try {
-        response = await this._fetch(url, {
-          method,
-          headers,
-          body: jsonBody === undefined
-            ? undefined
-            : redactKeys(JSON.stringify(jsonBody), this._secret),
-          signal: controller.signal,
-        });
-      } catch (err) {
-        lastErr = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
-        ambiguous = ambiguous || !neverSent(err);
-        if (attempt === this._maxAttempts || !(retryIfAmbiguous || neverSent(err))) break;
-        await sleep(backoffMs(attempt));
-        continue;
+        let response;
+        try {
+          response = await this._fetch(url, {
+            method,
+            headers,
+            body,
+            signal: controller.signal,
+            // A redirect is answered, never followed: fetch would replay the
+            // request -- the bearer key with it -- at wherever the Location
+            // points, and a 3xx that was not followed would otherwise fall
+            // through as a success with an empty body.
+            redirect: "manual",
+          });
+        } catch (err) {
+          lastErr = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+          lastStatus = null;
+          ambiguous = ambiguous || !neverSent(err);
+          if (last || !(retryIfAmbiguous || neverSent(err))) break;
+          wait = backoffMs(attempt);
+          continue;
+        }
+        const status = response.status;
+
+        if (status === 410) {
+          throw new LeaseLost((await detail(response)) || "lease lost",
+                              { statusCode: status, ambiguous });
+        }
+        ambiguous = ambiguous || mayHavePerformed(status);
+
+        if (status >= 300 && status < 400) {
+          const location = response.headers?.get?.("location");
+          throw new TransportError(
+            `${method} ${path} -> HTTP ${status}: the control plane does not ` +
+            "redirect, so this URL is not answering as the control plane" +
+            (location ? ` (it redirects to ${cut(location)})` : ""),
+            { statusCode: status, ambiguous },
+          );
+        }
+
+        // 429 retries EVEN WHEN ambiguous retries are off: it is the server
+        // explicitly telling us it did not do the work. Python has the same
+        // asymmetry (`status == 429 or (status in RETRY and retry_if_ambiguous)`).
+        if (status === 429 || (RETRY_STATUS.has(status) && retryIfAmbiguous)) {
+          lastErr = `HTTP ${status}: ${await detail(response)}`;
+          lastStatus = status;
+          if (last) break;
+          wait = retryAfterMs(response) ?? backoffMs(attempt);
+          continue;
+        }
+
+        if (status >= 400) {
+          // Terminal. A 4xx that is not 408/429 will not become a 2xx by being
+          // sent again; retrying only delays the error.
+          //
+          // The STATUS travels with the error, not only inside its message: a
+          // caller holding a rollout's only copy of its result has to tell a
+          // 422 (these bytes are refused forever) from a 401 (a reissued key
+          // delivers them), and the difference decides whether the file stays
+          // in the retry set. See `outbox.js:REDELIVERY_CANNOT_FIX`.
+          throw new TransportError(
+            `${method} ${path} -> HTTP ${status}: ${await detail(response)}`,
+            { statusCode: status, ambiguous },
+          );
+        }
+
+        // PERFORMED from here on: the control plane answered 2xx. What it did
+        // may be unreadable; it is not undone.
+        let text;
+        try {
+          text = await response.text();
+        } catch (err) {
+          throw new TransportError(
+            `${method} ${path} -> HTTP ${status} with a body that could not be ` +
+            `read: ${err?.name ?? "Error"}: ${err?.message ?? err}`,
+            { statusCode: status, ambiguous: true },
+          );
+        }
+        if (!text) return {};
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch (err) {
+          throw new TransportError(
+            `${method} ${path} -> HTTP ${status} with unparseable body: ${err.message}`,
+            { statusCode: status, ambiguous: true },
+          );
+        }
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed
+          : { data: parsed };
       } finally {
         clearTimeout(timer);
       }
-
-      if (response.status === 410) {
-        throw new LeaseLost((await detail(response)) || "lease lost",
-                            { statusCode: response.status, ambiguous });
-      }
-      ambiguous = ambiguous || mayHavePerformed(response.status);
-
-      // 429 retries EVEN WHEN ambiguous retries are off: it is the server
-      // explicitly telling us it did not do the work. Python has the same
-      // asymmetry (`status == 429 or (status in RETRY and retry_if_ambiguous)`).
-      if (response.status === 429
-          || (RETRY_STATUS.has(response.status) && retryIfAmbiguous)) {
-        lastErr = `HTTP ${response.status}: ${await detail(response)}`;
-        if (attempt === this._maxAttempts) break;
-        await sleep(retryAfterMs(response) ?? backoffMs(attempt));
-        continue;
-      }
-
-      if (response.status >= 400) {
-        // Terminal. A 4xx that is not 408/429 will not become a 2xx by being
-        // sent again; retrying only delays the error.
-        //
-        // The STATUS travels with the error, not only inside its message: a
-        // caller holding a rollout's only copy of its result has to tell a 422
-        // (these bytes are refused forever) from a 401 (a reissued key
-        // delivers them), and the difference decides whether the file stays in
-        // the retry set. See `outbox.js:REDELIVERY_CANNOT_FIX`.
-        throw new TransportError(
-          `${method} ${path} -> HTTP ${response.status}: ${await detail(response)}`,
-          { statusCode: response.status, ambiguous },
-        );
-      }
-
-      const text = await response.text();
-      if (!text) return {};
-      let body;
-      try {
-        body = JSON.parse(text);
-      } catch (err) {
-        // PERFORMED: the control plane answered 2xx. What it did is
-        // unreadable, not undone.
-        throw new TransportError(
-          `${method} ${path} -> HTTP ${response.status} with unparseable body: ${err.message}`,
-          { ambiguous: true },
-        );
-      }
-      return body && typeof body === "object" && !Array.isArray(body)
-        ? body
-        : { data: body };
     }
 
     throw new TransportError(
       `${method} ${path} failed after ${this._maxAttempts} attempts: ${lastErr}`,
-      { ambiguous },
+      { statusCode: lastStatus, ambiguous },
     );
   }
 }

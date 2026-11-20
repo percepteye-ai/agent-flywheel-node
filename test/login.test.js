@@ -29,7 +29,11 @@ import {
   storedKeyFor,
 } from "../src/credentials.js";
 import { ControlPlaneClient, REDACTED_KEY } from "../src/http.js";
-import { deviceEndpoint, deviceLogin, LoginError } from "../src/login.js";
+import {
+  SIGN_UP_URL as LOGIN_SIGN_UP_URL, deviceEndpoint, deviceLogin, linkRefusal,
+  LoginError, openBrowser, printable,
+} from "../src/login.js";
+import { SIGN_UP_URL } from "../src/config.js";
 import { main } from "../src/cli.js";
 import { register } from "../src/index.js";
 
@@ -44,7 +48,9 @@ function sink() {
 }
 
 /** A scripted device-login half of a control plane. */
-function controlPlane(polls, { codeStatus = 200, codeBody = null, interval = 5 } = {}) {
+function controlPlane(polls, {
+  codeStatus = 200, codeBody = null, interval = 5, code = {},
+} = {}) {
   const requests = [];
   const fetchImpl = async (url, init) => {
     const form = Object.fromEntries(new URLSearchParams(init.body));
@@ -57,12 +63,13 @@ function controlPlane(polls, { codeStatus = 200, codeBody = null, interval = 5 }
         device_code: "dev-123", user_code: "BCDF-GHJK",
         verification_uri: "https://cp.test/device",
         verification_uri_complete: "https://cp.test/device#user_code=BCDF-GHJK",
-        expires_in: 600, interval,
+        expires_in: 600, interval, ...code,
       });
     }
     assert.ok(url.endsWith("/token"));
     const step = polls.shift();
     if (step instanceof Error) throw step;
+    if (typeof step === "function") return step();
     return Response.json(step[1], { status: step[0] });
   };
   return { fetchImpl, requests };
@@ -76,14 +83,17 @@ const granted = (over = {}) => [200, {
 const pending = () => [400, { error: "authorization_pending" }];
 
 async function run(cp, opts = {}) {
-  const out = sink();
-  const sleeps = [];
-  const opened = [];
+  const out = opts.out ?? sink();
+  const sleeps = opts.sleeps ?? [];
+  const opened = opts.opened ?? [];
   const env = opts.env ?? testEnv();
+  let clock = 0;
   const cred = await deviceLogin({
-    agentId: opts.agentId ?? AGENT, controlPlaneUrl: CP, env, out,
-    fetchImpl: cp.fetchImpl, sleep: async (ms) => { sleeps.push(ms / 1000); },
-    now: () => 0, open: (url) => { opened.push(url); return true; },
+    agentId: opts.agentId ?? AGENT, controlPlaneUrl: opts.controlPlaneUrl ?? CP, env, out,
+    fetchImpl: cp.fetchImpl,
+    sleep: async (ms) => { sleeps.push(ms / 1000); if (opts.advance) clock += ms; },
+    now: () => clock, open: (url) => { opened.push(url); return true; },
+    ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
   });
   return { cred, out: out.text(), sleeps, opened, env };
 }
@@ -113,7 +123,8 @@ describe("the device flow", () => {
 
     const path = credentialsPath(env);
     assert.match(out, new RegExp(`saved to ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-    assert.equal(statSync(path).mode & 0o777, 0o600);
+    // Windows has no POSIX modes; the file is still the owner's there.
+    if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
     const doc = JSON.parse(readFileSync(path, "utf8"));
     assert.equal(doc.version, 1);
     assert.equal(doc.credentials.length, 1);
@@ -321,8 +332,162 @@ describe("the bin", () => {
     assert.match(err.text(), /denied in the browser/);
   });
 
+  it("answers --help on stdout with exit 0, with or without a command (ND-M3)", async () => {
+    for (const argv of [["--help"], ["-h"], ["login", "--help"], ["logout", "-h"]]) {
+      const out = sink();
+      const err = sink();
+      assert.equal(await main(argv, { env: testEnv(), stdout: out, stderr: err }), 0, argv.join(" "));
+      assert.match(out.text(), /^usage:/);
+      assert.equal(err.text(), "");
+    }
+    const err = sink();
+    assert.equal(await main([], { env: testEnv(), stdout: sink(), stderr: err }), 2);
+    assert.match(err.text(), /^usage:/);
+  });
+
+  it("refuses an extra argument and an empty --agent-id, never falling back (ND-M3)", async () => {
+    for (const argv of [["login", "my-agent"], ["logout", "x", "y"], ["login", "--agent-id", ""],
+      ["login", "--agent-id", "  "], ["logout", "--control-plane-url", ""]]) {
+      const calls = [];
+      const err = sink();
+      const code = await main(argv, {
+        env: testEnv(), stdout: sink(), stderr: err,
+        login: async (opts) => { calls.push(opts); return {}; },
+      });
+      assert.equal(code, 2, argv.join(" "));
+      assert.deepEqual(calls, [], `${argv.join(" ")} ran a login`);
+      assert.match(err.text(), /unexpected argument|needs a value/);
+    }
+  });
+
   it("refuses an unknown command and an invalid agent id", async () => {
     assert.equal(await main(["frobnicate"], { env: testEnv(), stdout: sink(), stderr: sink() }), 2);
     assert.equal(await main(["login", "--agent-id", "a/b"], { env: testEnv(), stdout: sink(), stderr: sink() }), 2);
+  });
+});
+
+describe("the login link is opened only if it is a web page (ND-C1)", () => {
+  it("checks the scheme, not the origin", () => {
+    // Mission Control builds the link from its dashboard address
+    // (MC_APP_BASE_URL), which need not be the API's host.
+    assert.equal(linkRefusal("https://app.other.test/device#user_code=A-B", CP), null);
+    assert.equal(linkRefusal("https://cp.test/device?a=1&b=2", CP), null);
+    assert.equal(linkRefusal("http://localhost:3000/device", CP), null);
+    assert.equal(linkRefusal("http://127.0.0.1/device", CP), null);
+    assert.equal(linkRefusal("http://mc.lan/device", "http://mc.lan/api/flywheel/v1"), null);
+    for (const bad of ["file:///etc/passwd", "smb://host/share", "javascript:alert(1)",
+      "ssh://x", "-aCalculator", "http://evil.test/device", "https://x.test/a b",
+      "https://x.test/\nb", "https://x.test/\u001b[2J", "https:"]) {
+      assert.notEqual(linkRefusal(bad, CP), null, bad);
+    }
+  });
+
+  it("prints a refused link with the reason and does not open it", async () => {
+    const cp = controlPlane([granted()], { code: {
+      verification_uri_complete: "file:///Applications/Calculator.app" } });
+    const { out, opened } = await run(cp);
+    assert.deepEqual(opened, []);
+    assert.match(out, /will not open \(its scheme "file" is not a web page/);
+  });
+
+  it("opens a dashboard link on another origin than the API", async () => {
+    const cp = controlPlane([granted()], { code: {
+      verification_uri_complete: "https://app.cp.test/device#user_code=BCDF-GHJK" } });
+    const { opened } = await run(cp);
+    assert.deepEqual(opened, ["https://app.cp.test/device#user_code=BCDF-GHJK"]);
+  });
+
+  it("never runs a shell: rundll32 on Windows, open -- on macOS", () => {
+    const url = "https://cp.test/device?user_code=A&client_id=b|c^d%PATH%";
+    for (const [platform, cmd, args] of [
+      ["win32", "rundll32", ["url.dll,FileProtocolHandler", url]],
+      ["darwin", "open", ["--", url]],
+      ["linux", "xdg-open", [url]],
+    ]) {
+      const spawned = [];
+      const spawnImpl = (c, a, o) => {
+        spawned.push([c, a, o]);
+        return { on() {}, unref() {} };
+      };
+      assert.equal(openBrowser(url, platform, spawnImpl), true);
+      assert.equal(spawned.length, 1);
+      assert.equal(spawned[0][0], cmd, platform);
+      assert.deepEqual(spawned[0][1], args, platform);
+      assert.notEqual(spawned[0][2]?.shell, true);
+    }
+    for (const bad of ["-aCalculator", "file:///x", "https://x/a b", "ms-settings:"]) {
+      const spawned = [];
+      assert.equal(openBrowser(bad, "win32", (...a) => { spawned.push(a); }), false, bad);
+      assert.deepEqual(spawned, []);
+    }
+  });
+
+  it("strips terminal control from everything the server says", async () => {
+    assert.equal(printable("a\u001b[31mb\u001b]0;title\u0007c\u009bd\re"), "abcde");
+    const cp = controlPlane([[400, { error: "invalid_grant",
+      error_description: "no\u001b[2J longer" }]], { code: { user_code: "AB\u001b]8;;x\u0007CD" } });
+    const out = sink();
+    await assert.rejects(run(cp, { out }), (err) => {
+      assert.equal(err.message, "no key was issued: no longer");
+      return true;
+    });
+    assert.match(out.text(), / {4}ABCD\n/);
+    assert.equal(/\u001b/.test(out.text()), false);
+  });
+});
+
+describe("the device flow reads only what it can trust (ND-M4)", () => {
+  it("names the sign-up page every other message names", () => {
+    assert.equal(LOGIN_SIGN_UP_URL, SIGN_UP_URL);
+  });
+
+  it("puts a deadline on each request", async () => {
+    const signals = [];
+    const fetchImpl = (url, init) => {
+      signals.push(init.signal);
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason));
+      });
+    };
+    await assert.rejects(run({ fetchImpl }, { timeoutMs: 20 }),
+      (err) => err instanceof LoginError && /could not reach/.test(err.message));
+    assert.ok(signals[0] instanceof AbortSignal);
+  });
+
+  it("refuses a token answer that is not JSON instead of throwing raw", async () => {
+    const cp = controlPlane([() => new Response("<html>ok</html>", { status: 200 })]);
+    await assert.rejects(run(cp), (err) => err instanceof LoginError && /not JSON/.test(err.message));
+  });
+
+  it("refuses a device answer missing what the flow needs", async () => {
+    for (const code of [{ device_code: null }, { user_code: 7 }, { interval: "soon" },
+      { expires_in: -1 }, { verification_uri: null, verification_uri_complete: null }]) {
+      await assert.rejects(run(controlPlane([granted()], { code })),
+        (err) => err instanceof LoginError && /device code answer/.test(err.message),
+        JSON.stringify(code));
+    }
+  });
+
+  it("never polls faster than once a second", async () => {
+    const cp = controlPlane([[400, { error: "slow_down", interval: 0 }], granted()]);
+    const { sleeps } = await run(cp);
+    assert.deepEqual(sleeps, [5, 10], "an interval of 0 from slow_down spun the loop");
+    const told = controlPlane([[400, { error: "slow_down", interval: 0.2 }], granted()]);
+    assert.ok((await run(told)).sleeps.every((s) => s >= 1));
+  });
+
+  it("never sleeps past the code's expiry", async () => {
+    const cp = controlPlane([[400, { error: "slow_down", interval: 500 }], pending()],
+      { code: { expires_in: 60 } });
+    const sleeps = [];
+    await assert.rejects(run(cp, { advance: true, sleeps }), /expired/);
+    assert.deepEqual(sleeps, [5, 55]);
+  });
+
+  it("refuses a key issued for another agent and stores nothing", async () => {
+    const env = testEnv();
+    await assert.rejects(run(controlPlane([granted({ agent_id: "someone-else" })]), { env }),
+      (err) => err instanceof LoginError && /someone-else/.test(err.message));
+    assert.deepEqual(loadStored(env), []);
   });
 });

@@ -1,13 +1,14 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.51.0), case for case with the Python
+ * The customer API reads (contract 1.54.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { ConfigurationError } from "../src/errors.js";
+import { ConfigurationError, TransportError } from "../src/errors.js";
+import { ContractError } from "../src/wire.js";
 import {
   AGENT_REFUSAL_CODES, ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CYBER_REFUSAL_CODES, CustomerApiClient,
   CustomerContractTooOld, CustomerRefusal, PROMPT_RUN_REFUSAL_CODES, RUN_LIST_REFUSAL_CODES,
@@ -26,8 +27,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.51.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.51.0");
+  it("pins contract 1.54.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.54.0");
     assert.deepEqual([...ATTACK_REFUSAL_CODES], [
       "attack_set_is_sealed",
       "attack_resistance_measuring",
@@ -53,7 +54,8 @@ describe("customer api", () => {
       "training_unhealthy", "training_pool_cannot_train_objective",
       "opsd_chosen_model_not_trainable", "hillclimb_base_model_invalid",
       "base_model_unresolvable", "destination_algorithm_unsupported",
-      "provider_checkpoint_not_owned",
+      "provider_checkpoint_not_owned", "hillclimb_start_invalid",
+      "base_merge_failed", "authority_ruling_requires_org_admin",
     ]);
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], [
       "launch_uri_outside_org", "run_page_too_deep",
@@ -108,8 +110,8 @@ describe("customer api", () => {
   it("reads a run's attack resistance, and a refusal by its code", async () => {
     const ok = fake(200, { measurement: { state: "not_measured" } });
     const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: ok.fetchImpl });
-    assert.equal((await c.getHillclimbSecurity("r/1")).measurement.state, "not_measured");
-    assert.equal(ok.calls[0].url, "https://x.test/api/v2/hillclimbs/r%2F1/security");
+    assert.equal((await c.getHillclimbSecurity("r 1?")).measurement.state, "not_measured");
+    assert.equal(ok.calls[0].url, "https://x.test/api/v2/hillclimbs/r%201%3F/security");
     const no = fake(404, { detail: { code: "hillclimb_not_found", message: "no" } });
     const c2 = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: no.fetchImpl });
     await assert.rejects(c2.getHillclimbSecurity("r2"), (e) => e instanceof CustomerRefusal && e.code === "hillclimb_not_found");
@@ -269,6 +271,13 @@ describe("customer api", () => {
       // sandbox for its code, or one not answering.
       code_sandbox_not_configured: 503,
       code_sandbox_unreachable: 503,
+      // 1.52.0: a hill climb started from a model the organization already
+      // trained.
+      hillclimb_start_invalid: 422,
+      base_merge_failed: 502,
+      // 1.54.0: a ruling on the reward plan's Decision by anyone but an org
+      // admin.
+      authority_ruling_requires_org_admin: 403,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
       ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];
@@ -276,5 +285,111 @@ describe("customer api", () => {
     assert.deepEqual([...known].sort(), Object.keys(expected).sort());
     for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);
     assert.equal(doc["x-customer-contract-version"], CUSTOMER_CONTRACT_VERSION);
+  });
+});
+
+describe("the customer api's own source of truth", () => {
+  it("declares the contract version Mission Control's source declares (XR-2)", () => {
+    // Read from the control plane's customer_contract.py, not docs/openapi.json, which is
+    // generated and can lag it. A set PERCEPTEYE_CONTROL_PLANE_CHECKOUT is a
+    // promise (a release, docs/RELEASING.md), so a missing file fails; unset
+    // (every CI run, which cannot name a private checkout) only the shape is
+    // checked. The Python SDK's test_the_declared_contract_is_the_control_planes.
+    assert.match(CUSTOMER_CONTRACT_VERSION, /^1\.[0-9]+\.[0-9]+$/);
+    const checkout = process.env.PERCEPTEYE_CONTROL_PLANE_CHECKOUT;
+    if (!checkout) return;
+    // The control plane's package directory is found, not named: this file
+    // is published, and the open-source boundary forbids its internal paths.
+    const pkg = readdirSync(checkout, { withFileTypes: true }).find((e) => e.isDirectory()
+      && existsSync(join(checkout, e.name, "api", "customer_contract.py")));
+    assert.ok(pkg, `no */api/customer_contract.py under ${checkout}`);
+    const source = readFileSync(join(checkout, pkg.name, "api", "customer_contract.py"), "utf8");
+    const declared = /^CUSTOMER_CONTRACT_VERSION(?:: *Final)? *= *"([^"]+)"/m.exec(source);
+    assert.ok(declared, "the control plane declares no version");
+    assert.equal(declared[1], CUSTOMER_CONTRACT_VERSION);
+  });
+});
+
+describe("a read is bounded, retried and only ever JSON (ND-M8)", () => {
+  /** A fetch replaying `script` (status/body/headers, or an Error to throw). */
+  function scripted(script) {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      const next = script[Math.min(calls.length - 1, script.length - 1)];
+      if (next instanceof Error) throw next;
+      if (typeof next === "function") return next(init);
+      return new Response(next.body ?? null, { status: next.status, headers: next.headers ?? {} });
+    };
+    return { calls, fetchImpl };
+  }
+  const make = (fetchImpl, opts = {}) => new CustomerApiClient({
+    apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl, ...opts });
+
+  it("retries a transient failure and returns the answer", async () => {
+    const reset = Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+    const f = scripted([reset, { status: 503, headers: { "retry-after": "0" } },
+      { status: 200, body: '{"runs": []}' }]);
+    assert.deepEqual(await make(f.fetchImpl).listRuns(), { runs: [] });
+    assert.equal(f.calls.length, 3);
+  });
+
+  it("does not retry the server's refusal", async () => {
+    const f = scripted([{ status: 404, body: '{"detail": {"code": "hillclimb_not_found"}}' }]);
+    await assert.rejects(make(f.fetchImpl).getHillclimbSecurity("r1"), CustomerRefusal);
+    assert.equal(f.calls.length, 1);
+  });
+
+  it("times out a read whose body stalls", async () => {
+    const stall = (init) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal.addEventListener("abort", () => controller.error(
+          Object.assign(new Error("aborted"), { name: "AbortError" })));
+      },
+    }), { status: 200 });
+    const f = scripted([stall]);
+    await assert.rejects(make(f.fetchImpl, { timeoutMs: 30 }).listRuns(), TransportError);
+  });
+
+  it("refuses an HTML 2xx and a redirect, and never follows one", async () => {
+    const html = scripted([{ status: 200, body: "<html>sign in</html>" }]);
+    await assert.rejects(make(html.fetchImpl).listRuns(),
+      (e) => e instanceof TransportError && /not JSON/.test(e.message) && e.statusCode === 200);
+    const moved = scripted([{ status: 302, headers: { location: "https://login.test/" } }]);
+    await assert.rejects(make(moved.fetchImpl).listRuns(),
+      (e) => e instanceof TransportError && e.statusCode === 302);
+    assert.equal(moved.calls.length, 1);
+    assert.equal(moved.calls[0].init.redirect, "manual");
+  });
+
+  it("refuses a run id that is not one path segment, before sending", async () => {
+    const f = scripted([{ status: 200, body: "{}" }]);
+    const c = make(f.fetchImpl);
+    for (const runId of ["..", ".", "", "a/b", undefined, null, "a\\b"]) {
+      await assert.rejects(c.getHillclimbSecurity(runId), ContractError, String(runId));
+    }
+    assert.equal(f.calls.length, 0);
+    await c.getHillclimbSecurity(42);
+    assert.equal(f.calls[0].url, "https://x.test/api/v2/hillclimbs/42/security");
+  });
+
+  it("refuses an empty or relative baseUrl", () => {
+    for (const baseUrl of ["", "  ", "/api/v2", "ftp://x.test/api/v2"]) {
+      assert.throws(() => new CustomerApiClient({ apiKey: KEY, baseUrl, env: {} }),
+        ConfigurationError, JSON.stringify(baseUrl));
+    }
+  });
+
+  it("keeps a 422 validation list readable", async () => {
+    const f = scripted([{ status: 422, body: JSON.stringify({ detail: [
+      { loc: ["query", "limit"], msg: "Input should be a valid integer", type: "int_parsing" },
+      { loc: ["query", "offset"], msg: "must be >= 0" },
+    ] }) }]);
+    await assert.rejects(make(f.fetchImpl).listRuns({ limit: "x" }), (e) => {
+      assert.ok(e instanceof CustomerRefusal);
+      assert.equal(e.message,
+        "HTTP 422: query.limit: Input should be a valid integer; query.offset: must be >= 0");
+      return true;
+    });
   });
 });
