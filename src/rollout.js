@@ -273,6 +273,9 @@ export function createRolloutDriver({
   // back and reported: a driver with no recorder behind it cannot claim to
   // have observed zero calls.
   recordsToolCalls = false,
+  // How many rollouts this worker runs at once, across BOTH lanes: what
+  // registration declares (`concurrency`). See `reserve`.
+  concurrency = 1,
 }) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
@@ -343,6 +346,24 @@ export function createRolloutDriver({
    * Kept only while that claim is, so it is bounded by `claiming`.
    */
   const endedWhileClaiming = new Set();
+  /** Claims in flight in either lane, counted against `concurrency`. */
+  let reserved = 0;
+
+  /**
+   * THE ONE CONCURRENCY GATE. Both lanes take a slot before they claim and
+   * give it back once the claim has settled -- by then a claimed rollout is
+   * in `inFlight`, which holds its place. Each lane used to check only its
+   * own work, so the attended lane and the unattended runner could hold two
+   * rollouts at once on a worker registered with `concurrency: 1`.
+   */
+  function reserve() {
+    if (inFlight.size + reserved >= concurrency) return false;
+    reserved += 1;
+    return true;
+  }
+  function release() {
+    if (reserved > 0) reserved -= 1;
+  }
   /** sessionKey -> the timer that stops its rollout at `deadlineTs`. */
   const deadlines = new Map();
   let warnedMissingModelCallCount = false;
@@ -751,12 +772,14 @@ export function createRolloutDriver({
     }
     // Reserved SYNCHRONOUSLY, before the first await, so a second event for
     // this session cannot slip past the guard while the claim is in flight.
+    if (!reserve()) return null;
     claiming.add(sessionKey);
     try {
       return await claimAndDeliver(sessionKey);
     } finally {
       claiming.delete(sessionKey);
       endedWhileClaiming.delete(sessionKey);
+      release();
     }
   }
 
@@ -1133,13 +1156,25 @@ export function createRolloutDriver({
     return trajectoryOf(rolloutFor(ctx));
   }
 
+  /**
+   * The gateway is stopping: stop every lease renewal and deadline timer.
+   * A rollout still in flight is not reported -- its run is going down with
+   * the gateway -- and its lease lapses for the control plane to requeue.
+   * Renewing it from a process that is shutting down would hold it instead.
+   */
+  function stopTimers() {
+    for (const sessionKey of [...heartbeats.keys()]) stopHeartbeat(sessionKey);
+    for (const sessionKey of [...deadlines.keys()]) clearDeadline(sessionKey);
+  }
+
   // `track` and `giveBack` are what the UNATTENDED runner needs: it does its
   // own claiming and turn-starting, but reporting and typed abandon must stay
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
   return {
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
-    onBeforeToolCall, rolloutFor, route, trajectoryDirFor,
+    onBeforeToolCall, rolloutFor, route, trajectoryDirFor, reserve, release,
+    stopTimers,
     onModelCallStarted, onModelCallEnded,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
@@ -1422,15 +1457,23 @@ export function registerRolloutDriver(api, {
     // back and sent. The caller routes its tool recorder through
     // `driver.trajectoryDirFor` (index.js does).
     recordsToolCalls: true,
+    // The number registration declared, so the gate holds what was promised.
+    concurrency: registrationSpec.concurrency,
   });
 
   // Failures are swallowed at the boundary: a telemetry plugin must never be
   // able to break the agent it is measuring.
+  // The catch itself cannot reject: a host logger that throws there would
+  // otherwise be an unhandled rejection, fatal to the gateway under Node's
+  // default policy.
   const safe = (fn) => (event, ctx) => {
     Promise.resolve()
       .then(() => fn(event, ctx))
-      .catch((err) => logger?.warn?.(
-        `[${pluginId}] rollout hook failed: ${err?.message ?? err}`));
+      .catch((err) => {
+        try {
+          logger?.warn?.(`[${pluginId}] rollout hook failed: ${err?.message ?? err}`);
+        } catch { /* telemetry */ }
+      });
   };
 
   // Routing returns its decision, so it is not behind `safe`, which discards
@@ -1506,13 +1549,24 @@ export function registerRolloutDriver(api, {
       startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
       logger,
     });
-    const capture = (_event, ctx) => {
+    const capture = (ctx) => {
       if (ctx?.getCron) gatewayCtx = ctx;
-      unattended.start();
     };
-    api.on(GATEWAY_START, safe(capture));
-    api.on("cron_changed", safe(capture));
-    api.on(GATEWAY_STOP, safe(() => unattended.stop()));
+    api.on(GATEWAY_START, safe((_event, ctx) => {
+      capture(ctx);
+      unattended.start();
+    }));
+    // A cron change re-arms the poller, but never after gateway_stop.
+    api.on("cron_changed", safe((_event, ctx) => {
+      capture(ctx);
+      unattended.resume();
+    }));
+    // The gateway is going down: no more claims, and no lease renewal or
+    // deadline timer left running behind it.
+    api.on(GATEWAY_STOP, safe(() => {
+      unattended.stop();
+      driver.stopTimers();
+    }));
     logger?.info?.(
       `[${pluginId}] training mode: this plugin claims rollouts and runs them, ` +
       `starting its own turns in dedicated 'percepteye-rollout-*' sessions, ` +

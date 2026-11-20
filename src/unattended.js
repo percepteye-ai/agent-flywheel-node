@@ -63,8 +63,8 @@
  *      attempts each, having run none of it, while reporting itself as having
  *      fallen back. A seam that is gone must make this lane QUIET, not busy.
  *
- *      `start()` is the one thing that undoes it, because its only callers
- *      are `gateway_start` and `cron_changed` and both mean the host has just
+ *      `start()` (gateway_start) and `resume()` (cron_changed) are the only
+ *      things that undo it, because both events mean the host has just
  *      handed over a cron context. That keeps a LATER-ARRIVING cron usable
  *      (see `cronTurnStarter` below) without reopening the churn: a host with
  *      no cron service emits neither event, so nothing restarts the loop.
@@ -77,9 +77,20 @@
  * attributable: the key the turn runs under is the key the report is looked up
  * by.
  *
- * Serial by construction -- the runner claims only when nothing is in flight.
- * A concurrency knob would be the second thing to get wrong here, and a
- * customer's gateway is not the place to discover that.
+ * Serial by construction, and ACROSS BOTH LANES: the runner claims only
+ * through the driver's one concurrency gate (`driver.reserve`), which the
+ * attended `session_start` lane takes too and which admits as many rollouts
+ * as registration declared (`concurrency: 1`). Each lane used to check only
+ * its own work, so an injected rollout and an unattended one could be held
+ * at once by a worker registered to run one.
+ *
+ * ── STOPPING ──────────────────────────────────────────────────────────────
+ *
+ * `stop()` (gateway_stop) is final until the next `start()` (gateway_start):
+ * a `cron_changed` after it does not restart the poller, a tick in flight
+ * when it lands hands back what it claimed rather than starting it, and no
+ * timer is left behind. The poller paces itself by the control plane's
+ * `pollAfterMs` when it gives one, by `pollMs` otherwise.
  */
 import { taskText } from "./rollout.js";
 
@@ -162,7 +173,16 @@ export function createUnattendedRunner({
   driver, startTurn, logger = null, pollMs = DEFAULT_POLL_MS,
 }) {
   let timer = null;
+  /** Whether the poller is armed: what `polling` reports. */
+  let armed = false;
   let running = false;
+  /** gateway_stop happened, and no gateway_start since. */
+  let stopped = false;
+  /** The control plane's `pollAfterMs` from the last claim, if it gave one. */
+  let pollAfterMs = null;
+  /** A host logger that throws must not reject a timer callback. */
+  const warn = (message) => { try { logger?.warn?.(message); } catch { /* telemetry */ } };
+  const info = (message) => { try { logger?.info?.(message); } catch { /* telemetry */ } };
   /**
    * The turn-starting seam is gone, so this lane claims nothing.
    *
@@ -174,37 +194,71 @@ export function createUnattendedRunner({
   let degraded = false;
 
   function stopTimer() {
-    if (timer) clearInterval(timer);
+    if (timer) clearTimeout(timer);
     timer = null;
+    armed = false;
+  }
+
+  /** Arm the next wake-up: `pollAfterMs` when the control plane gave one. */
+  function schedule() {
+    if (!armed || stopped || degraded) return;
+    const delay = Number.isFinite(pollAfterMs) && pollAfterMs > 0 ? pollAfterMs : pollMs;
+    timer = setTimeout(() => {
+      timer = null;
+      tick().catch(() => {}).finally(schedule);
+    }, delay);
+    // Never hold a customer's gateway open on our account.
+    timer.unref?.();
   }
 
   async function tick() {
     // Never claim once the seam is known dead: a claim we cannot start still
     // costs the rollout an attempt, and three of those retire it unrun.
     // Checked HERE rather than in `start()` alone, so a directly driven tick
-    // cannot walk around it either.
-    if (degraded || running || driver.inFlight.size > 0) return null;
+    // cannot walk around it either. Nor once the gateway has stopped.
+    if (stopped || degraded || running) return null;
+    // THE ONE CONCURRENCY GATE, shared with the attended lane.
+    if (!driver.reserve()) return null;
     running = true;
     try {
       let claimed;
       try {
         claimed = await driver.claim(1);
       } catch (err) {
-        logger?.warn?.(
-          `[agent-flywheel] could not claim a rollout: ${err?.message ?? err}`);
+        warn(`[agent-flywheel] could not claim a rollout: ${err?.message ?? err}`);
         return null;
       }
+      const hint = Number(claimed?.pollAfterMs);
+      pollAfterMs = Number.isFinite(hint) && hint > 0 ? hint : null;
       const rollout = claimed?.rollouts?.[0];
       if (!rollout) return null;
 
       const sessionKey = sessionKeyFor(rollout.rolloutId);
+      if (stopped) {
+        // The gateway stopped during the claim: nothing will run it here.
+        await driver.giveBack(
+          sessionKey, rollout, "entrypoint_error",
+          "the gateway stopped while the rollout was being claimed");
+        return null;
+      }
       driver.track(sessionKey, rollout);
 
-      const result = await startTurn({
-        sessionKey, rolloutId: rollout.rolloutId, message: taskText(rollout),
-      });
-      if (result.started) {
-        logger?.info?.(
+      let result;
+      try {
+        result = await startTurn({
+          sessionKey, rolloutId: rollout.rolloutId, message: taskText(rollout),
+        });
+      } catch (err) {
+        // A starter that throws instead of answering: the turn did not start,
+        // and the rollout must not stay tracked with a heartbeat renewing a
+        // lease nothing will ever report.
+        result = {
+          started: false, degraded: false,
+          reason: `starting the rollout's turn failed: ${err?.message ?? err}`,
+        };
+      }
+      if (result?.started) {
+        info(
           `[agent-flywheel] rollout ${rollout.rolloutId} started unattended in ` +
           `session ${sessionKey}.`);
         return rollout;
@@ -213,13 +267,13 @@ export function createUnattendedRunner({
       // The turn will never run, so the work goes back NOW rather than sitting
       // until its lease lapses.
       await driver.giveBack(
-        sessionKey, rollout, "entrypoint_error", result.reason);
-      if (result.degraded) {
+        sessionKey, rollout, "entrypoint_error", result?.reason ?? "no turn started");
+      if (result?.degraded) {
         degraded = true;
         // The fallback, actually taken: stop looking for work. Anything else
         // spends one rollout's attempt per poll on a turn that cannot start.
         stopTimer();
-        logger?.warn?.(
+        warn(
           `[agent-flywheel] unattended rollouts are configured but ${result.reason}. ` +
           `Falling back to the default lane: this plugin has stopped polling ` +
           `for rollouts and tasks are delivered into the next turn you start. ` +
@@ -228,6 +282,7 @@ export function createUnattendedRunner({
       return null;
     } finally {
       running = false;
+      driver.release();
     }
   }
 
@@ -242,17 +297,35 @@ export function createUnattendedRunner({
      * seconds forever to return immediately, in a customer's gateway, in a
      * lane the operator was told had gone quiet.
      */
-    get polling() { return timer !== null; },
+    get polling() { return armed; },
+    /**
+     * `gateway_start`: the host has just handed over a cron context -- the
+     * one event that can undo a degradation, and that ends a stop.
+     */
     start() {
-      // Only `gateway_start` and `cron_changed` call this, and both mean the
-      // host has just handed over a cron context -- the one event that can
-      // undo a degradation, and the only thing that restarts the loop.
+      stopped = false;
       degraded = false;
-      if (timer) return;
-      timer = setInterval(() => { tick().catch(() => {}); }, pollMs);
-      // Never hold a customer's gateway open on our account.
-      timer.unref?.();
+      if (armed) return;
+      armed = true;
+      schedule();
     },
-    stop: stopTimer,
+    /**
+     * `cron_changed`: a cron context too, so it undoes a degradation and
+     * arms the poller -- but NOT after `gateway_stop`, which only the next
+     * `gateway_start` ends. It used to restart the loop in a stopping
+     * gateway.
+     */
+    resume() {
+      if (stopped) return;
+      degraded = false;
+      if (armed) return;
+      armed = true;
+      schedule();
+    },
+    /** `gateway_stop`: no more claims, no timer left behind. */
+    stop() {
+      stopped = true;
+      stopTimer();
+    },
   };
 }

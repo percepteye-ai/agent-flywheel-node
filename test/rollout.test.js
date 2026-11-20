@@ -628,6 +628,60 @@ describe("a rollout reports the tool calls its session made (reports_tool_calls:
   });
 });
 
+describe("gateway_stop and a host logger that throws (ND-M10)", () => {
+  function stopHarness({ logger } = {}) {
+    const api = fakeApi();
+    if (logger) api.logger = logger;
+    const scheduled = [];
+    const transport = {
+      async health() { return { contract_versions_supported: ["flywheel/1"] }; },
+      async register() { return { accepted: true }; },
+      async claim() { return { rollouts: [] }; },
+      async report() {},
+      async abandon() { throw new Error("control plane down"); },
+      async heartbeat() {},
+    };
+    const driver = registerRolloutDriver(api, {
+      env: testEnv(), config: { mode: "training", apiKey: "key", agentId: "support" },
+      transport, pluginId: PLUGIN_ID, logger: api.logger,
+    });
+    return { api, driver, scheduled };
+  }
+
+  it("gateway_stop stops every lease renewal and deadline timer", async () => {
+    const { api, driver } = stopHarness();
+    driver.track("s1", {
+      rolloutId: "r1", turnInput: "x", leaseToken: "lt",
+      deadlineTs: Date.now() / 1000 + 3600,
+    });
+    driver.track("s2", { rolloutId: "r2", turnInput: "x", leaseToken: "lt2" });
+    assert.equal(driver.heartbeats.size, 2);
+    const states = [...driver.heartbeats.values()];
+    api.hook("gateway_stop")({}, {});
+    await new Promise((r) => setImmediate(r));
+    assert.equal(driver.heartbeats.size, 0, "a stopping gateway kept renewing leases");
+    for (const state of states) assert.equal(state.stopped, true);
+  });
+
+  it("a hook failure whose logger also throws is not an unhandled rejection", async () => {
+    const throwing = { info() {}, warn() { throw new Error("logger is gone"); } };
+    const { api, driver } = stopHarness({ logger: throwing });
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      driver.track("s1", { rolloutId: "r1", turnInput: "x" });
+      // session_end gives the rollout back; abandon fails, the driver logs,
+      // the logger throws, the hook's own catch logs, and that throws too.
+      api.hook("session_end")({ sessionKey: "s1", reason: "closed" }, {});
+      for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    assert.deepEqual(unhandled, []);
+  });
+});
+
 describe("the claim / deliver / report loop", () => {
   it("delivers the claimed task into the next turn", async () => {
     const enqueued = [];
