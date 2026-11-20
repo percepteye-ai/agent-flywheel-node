@@ -120,10 +120,12 @@ describe("the flush is off the hook's path (ND-C4)", () => {
     delay.disable();
     assert.equal(counts.sent, 2000);
     const worstMs = delay.max / 1e6;
-    // Seconds before the fix; ~10-30ms after on a quiet machine. The bound
-    // leaves room for a loaded CI host, whose own scheduling stalls reach
-    // ~90ms with nothing of ours running.
-    assert.ok(worstMs < 150, `the event loop was blocked for ${worstMs.toFixed(0)}ms`);
+    // Minutes before the fix (one synchronous listing per turn: 2,000 x
+    // 2,000); ~10-30ms after on a quiet machine. The bound is far from both
+    // on purpose: a host at load ~20 stalls this process 150-260ms with
+    // nothing of ours running, and a bound inside that range made the test
+    // red on scheduling rather than on the code.
+    assert.ok(worstMs < 2000, `the event loop was blocked for ${worstMs.toFixed(0)}ms`);
     // One listing gave every turn its place in its conversation.
     const byConversation = new Map();
     for (const t of tr.sent) {
