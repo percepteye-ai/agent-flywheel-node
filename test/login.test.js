@@ -331,6 +331,34 @@ describe("the bin", () => {
     assert.match(err.text(), /denied in the browser/);
   });
 
+  it("answers --help on stdout with exit 0, with or without a command (ND-M3)", async () => {
+    for (const argv of [["--help"], ["-h"], ["login", "--help"], ["logout", "-h"]]) {
+      const out = sink();
+      const err = sink();
+      assert.equal(await main(argv, { env: testEnv(), stdout: out, stderr: err }), 0, argv.join(" "));
+      assert.match(out.text(), /^usage:/);
+      assert.equal(err.text(), "");
+    }
+    const err = sink();
+    assert.equal(await main([], { env: testEnv(), stdout: sink(), stderr: err }), 2);
+    assert.match(err.text(), /^usage:/);
+  });
+
+  it("refuses an extra argument and an empty --agent-id, never falling back (ND-M3)", async () => {
+    for (const argv of [["login", "my-agent"], ["logout", "x", "y"], ["login", "--agent-id", ""],
+      ["login", "--agent-id", "  "], ["logout", "--control-plane-url", ""]]) {
+      const calls = [];
+      const err = sink();
+      const code = await main(argv, {
+        env: testEnv(), stdout: sink(), stderr: err,
+        login: async (opts) => { calls.push(opts); return {}; },
+      });
+      assert.equal(code, 2, argv.join(" "));
+      assert.deepEqual(calls, [], `${argv.join(" ")} ran a login`);
+      assert.match(err.text(), /unexpected argument|needs a value/);
+    }
+  });
+
   it("refuses an unknown command and an invalid agent id", async () => {
     assert.equal(await main(["frobnicate"], { env: testEnv(), stdout: sink(), stderr: sink() }), 2);
     assert.equal(await main(["login", "--agent-id", "a/b"], { env: testEnv(), stdout: sink(), stderr: sink() }), 2);
