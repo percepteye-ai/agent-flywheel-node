@@ -194,20 +194,6 @@ function setText(span, key, value, limit = MAX_ATTRIBUTE_CHARS) {
 }
 
 /**
- * Turn text as the OTel GenAI conventions spell a message list: a JSON array
- * of `{role, parts: [{type: "text", content}]}`, the output message with its
- * `finish_reason`. Mission Control's reader (`genai_traces.py`) reads this
- * shape as conformant; the bare string it replaced was read as legacy.
- */
-function messagesJson(role, text) {
-  const message = {
-    role, parts: [{ type: "text", content: cut(text, MAX_TURN_CHARS) }],
-  };
-  if (role === "assistant") message.finish_reason = "stop";
-  return JSON.stringify([message]);
-}
-
-/**
  * Project one recorded tool call into the customer's traces.
  *
  * A no-op when the API is absent, and it NEVER throws: this runs beside the
@@ -327,16 +313,29 @@ export function recordTurnSpan(opts = {}) {
         span.setAttribute("gen_ai.operation.name", "chat");
         setText(span, "gen_ai.request.model", model);
         setText(span, "gen_ai.agent.name", agentName);
-        // The convention's names for turn content, in the convention's shape
-        // (`messagesJson`). Carried as ATTRIBUTES rather than events because
-        // the ingest side normalises attributes into `raw_attributes`
-        // verbatim, and an event body does not survive that path.
+        // The convention's names for turn content. Carried as ATTRIBUTES
+        // rather than events because the ingest side normalises attributes
+        // into `raw_attributes` verbatim, and an event body does not survive
+        // that path.
+        //
+        // PLAIN TEXT, NOT THE CONVENTION'S MESSAGE ARRAYS, deliberately, as
+        // the Python SDK's `record_turn_span` writes it. Each turn is two
+        // HALF-spans -- the question when the turn opens, the answer when it
+        // arrives -- and the control plane's trace reader reads this SDK's
+        // plain text as exactly that: the answer's prompt is the transcript
+        // before it, so a conversation is rebuilt across its turns. The same
+        // half-spans as spec arrays are read as ordinary model calls instead:
+        // the answer half is refused for recording no prompt
+        // (`content_capture_off`), and each turn becomes its own conversation
+        // segment. Verified against that reader; the arrays wait for a reader
+        // that knows they are half-spans.
+        //
+        // `cut` redacts every Flywheel key first, then truncates by code point.
         if (given(inputText)) {
-          span.setAttribute("gen_ai.input.messages", messagesJson("user", inputText));
+          span.setAttribute("gen_ai.input.messages", cut(inputText, MAX_TURN_CHARS));
         }
         if (given(outputText)) {
-          span.setAttribute("gen_ai.output.messages",
-                            messagesJson("assistant", outputText));
+          span.setAttribute("gen_ai.output.messages", cut(outputText, MAX_TURN_CHARS));
         }
         setText(span, "percepteye.rollout.id", rolloutId);
         setText(span, "percepteye.turn.id", turnId);

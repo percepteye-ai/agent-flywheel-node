@@ -17,7 +17,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { InvalidFeedback, rfc3339UnixNanos } from "../src/wire.js";
-import { createTurnUploader, reportTurnFeedbackOnItsSpan } from "../src/capture.js";
+import {
+  createTurnCapture, createTurnUploader, reportTurnFeedbackOnItsSpan,
+} from "../src/capture.js";
 import { __resetTracerForTests, recordTurnSpan } from "../src/tracing.js";
 
 const TURN = "turn-7";
@@ -95,10 +97,18 @@ function otlpJson(spans) {
     { scope: { name: "agent-flywheel" }, spans: out }] }] };
 }
 
-/** The production turn the Python test serves: a question, then an answer. */
+/** The production turn the Python test serves -- a question, then an answer
+ * -- through the capture hooks a host calls, as the Python test goes through
+ * `turn()` and `record_answer`: the answer's span names its conversation
+ * because the answer path reads the turn's own (`onAgentEnd`). */
 function aTurn() {
-  recordTurnSpan({ inputText: "where is my order?", turnId: TURN, conversationId: "c1" });
-  recordTurnSpan({ outputText: "It ships tomorrow.", turnId: TURN });
+  const cap = createTurnCapture({
+    root: mkdtempSync(join(tmpdir(), "percepteye-span-turn-")) });
+  const host = { agentId: "main" };
+  cap.onMessageReceived(
+    { runId: TURN, content: "where is my order?", sessionKey: "c1" }, host);
+  cap.onAgentEnd(
+    { runId: TURN, messages: [{ role: "assistant", content: "It ships tomorrow." }] }, host);
 }
 
 describe("feedback on a production turn", () => {

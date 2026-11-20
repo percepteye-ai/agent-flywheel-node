@@ -15,9 +15,11 @@
 import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { pythonRoot } from "./support/python-sdk.js";
 
 import {
   MAX_ATTRIBUTE_CHARS,
@@ -127,13 +129,11 @@ describe("turn spans", () => {
       const s = t.spans[0];
       assert.equal(s.name, "chat");
       assert.equal(s.attributes["gen_ai.operation.name"], "chat");
-      // The OTel GenAI message list, not the bare text (ND-C9). Changed from
-      // the plain-string pin: Mission Control reads that only as legacy.
-      assert.deepEqual(JSON.parse(s.attributes["gen_ai.input.messages"]), [
-        { role: "user", parts: [{ type: "text", content: "book me tuesday" }] }]);
-      assert.deepEqual(JSON.parse(s.attributes["gen_ai.output.messages"]), [
-        { role: "assistant", parts: [{ type: "text", content: "booked" }],
-          finish_reason: "stop" }]);
+      // PLAIN TEXT, as the Python SDK writes it: the control plane's reader
+      // rebuilds a conversation from the two half-spans of a turn only in this
+      // form (spec arrays refuse every answer half content_capture_off).
+      assert.equal(s.attributes["gen_ai.input.messages"], "book me tuesday");
+      assert.equal(s.attributes["gen_ai.output.messages"], "booked");
       assert.equal(s.attributes["gen_ai.request.model"], "gpt-x");
     });
   });
@@ -150,8 +150,7 @@ describe("turn spans", () => {
   it("bounds turn content", () => {
     withTracer((t) => {
       recordTurnSpan({ outputText: "y".repeat(MAX_TURN_CHARS + 5000) });
-      const [message] = JSON.parse(t.spans[0].attributes["gen_ai.output.messages"]);
-      assert.equal(message.parts[0].content.length, MAX_TURN_CHARS);
+      assert.equal(t.spans[0].attributes["gen_ai.output.messages"].length, MAX_TURN_CHARS);
     });
   });
 
@@ -159,8 +158,7 @@ describe("turn spans", () => {
     // Mutation: slice on UTF-16 units -> a lone surrogate / half the text, red.
     withTracer((t) => {
       recordTurnSpan({ inputText: "😀".repeat(MAX_TURN_CHARS + 3) });
-      const [message] = JSON.parse(t.spans[0].attributes["gen_ai.input.messages"]);
-      const content = message.parts[0].content;
+      const content = t.spans[0].attributes["gen_ai.input.messages"];
       assert.equal([...content].length, MAX_TURN_CHARS);
       assert.ok(content.isWellFormed());
       recordToolCallSpan("x", "😀".repeat(MAX_ATTRIBUTE_CHARS + 1) , { outcome: "ok" });
@@ -213,14 +211,16 @@ describe("absence of the optional dependency", () => {
 });
 
 describe("parity with the Python SDK", () => {
-  const PY = "../../percepteye-agent-flywheel/src/agent_flywheel/tracing.py";
-
   it("uses the same span names and attribute keys", (t) => {
-    if (!existsSync(new URL(PY, import.meta.url))) {
+    // The one locator (`support/python-sdk.js`), not a sibling path of its
+    // own: that path skipped in every worktree even with
+    // PERCEPTEYE_PYTHON_SDK set.
+    if (!pythonRoot) {
       t.skip("python sdk checkout not present");
       return;
     }
-    const py = readFileSync(new URL(PY, import.meta.url), "utf8");
+    const py = readFileSync(
+      new URL("src/agent_flywheel/tracing.py", pythonRoot), "utf8");
     // Every key this package emits must appear in the Python module. A
     // customer swapping packages must not see their attribute names change.
     for (const key of [
@@ -284,8 +284,7 @@ describe("the projection is actually WIRED, not merely present", () => {
       assert.equal(t.spans.length, 2);
       // The ASK and the ANSWER land on the convention's two different keys —
       // that ordering is what the ingest reads back as a conversation.
-      const content = (span, key) =>
-        JSON.parse(span.attributes[key])[0].parts[0].content;
+      const content = (span, key) => span.attributes[key];
       assert.equal(content(t.spans[0], "gen_ai.input.messages"), "book me tuesday");
       assert.equal(content(t.spans[1], "gen_ai.output.messages"), "booked");
       assert.equal(t.spans[0].attributes["percepteye.conversation.id"], "conv_1");
