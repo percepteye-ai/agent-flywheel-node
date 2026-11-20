@@ -153,6 +153,14 @@ export const MAX_INJECTION_BYTES = 32 * 1024;
 export const ROLLOUT_MODEL = "policy";
 
 /**
+ * A lease the control plane states within this many seconds of the rollout's
+ * deadline is AT the deadline, which caps it: the two are serialized
+ * separately, and a beat a second early buys nothing either way. The Python
+ * runner's `_LEASE_AT_DEADLINE_SLACK_S`.
+ */
+const LEASE_AT_DEADLINE_SLACK_S = 1;
+
+/**
  * How long before a rollout's deadline it is stopped and reported: the
  * Python runner's `REPORT_MARGIN_S` floor. A rollout run up to its deadline
  * exactly has no time left to report into a lease the server has not yet
@@ -584,13 +592,28 @@ export function createRolloutDriver({
      *
      * So: a beat that fails is treated exactly like a transient failure --
      * the next beat is already due, and a beat that raises is not evidence the
-     * lease is gone. Only a LeaseLost stops the chain.
+     * lease is gone. Only a LeaseLost stops the chain -- or a lease the
+     * control plane states at the rollout's deadline, which no beat can extend.
      */
     const beat = async () => {
       if (state.stopped) return;
       state.timer = null;
       try {
-        await transport.heartbeat(rollout);
+        const answer = await transport.heartbeat(rollout);
+        // THE LEASE IS AT THE DEADLINE: no beat can carry it further. The
+        // control plane caps a lease at the rollout's `deadline_at`, and the
+        // only other answer a beat gets, lease_lost, needs a lease that
+        // lapsed, which cannot happen before the deadline -- by which time
+        // the deadline timer has stopped the rollout. Beating on was a POST
+        // per interval for nothing, in every tenant. The chain ends here; the
+        // state stays until the rollout does. The Python runner's
+        // `_next_beat_at`.
+        const expires = Number(answer?.lease_expires_ts);
+        if (!state.stopped && Number.isFinite(expires)
+            && Number.isFinite(rollout.deadlineTs) && rollout.deadlineTs > 0
+            && expires >= rollout.deadlineTs - LEASE_AT_DEADLINE_SLACK_S) {
+          return;
+        }
       } catch (err) {
         // Stopped while the request was out (reported, given back, or
         // superseded): its answer is about a rollout this session no longer

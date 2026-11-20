@@ -1004,6 +1004,51 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(scheduled[1].cancelled, true);
   });
 
+  it("sends no beat once the control plane states the lease at the deadline", async () => {
+    // The control plane caps a lease at the rollout's deadline, so once a
+    // beat answers that cap no beat can extend it, and beating on at the
+    // fixed cadence until the rollout ended was a POST per interval for
+    // nothing, in every tenant. The Python SDK's
+    // test_no_beat_is_sent_once_the_lease_has_reached_the_deadline.
+    // Mutation: drop the deadline rule from `beat` -> a third beat is
+    // scheduled, red.
+    const beats = [];
+    const answers = [{ lease_expires_ts: 300 }, { lease_expires_ts: 400 }];
+    const timers = [];
+    const tx = {
+      leaseMs: 30_000,
+      async claim() {
+        return { rollouts: [{
+          rolloutId: "r-capped", turnInput: "work", leaseToken: "lease-1",
+          leaseExpiresTs: 109, deadlineTs: 400,
+        }] };
+      },
+      async heartbeat(rollout) { beats.push(rollout.rolloutId); return answers.shift(); },
+      async report() {},
+      async abandon() {},
+    };
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+      now: () => 100_000,
+      heartbeatScheduler: (callback, delayMs) => {
+        const token = { callback, delayMs, cancelled: false };
+        timers.push(token);
+        return token;
+      },
+      heartbeatCanceller: (token) => { token.cancelled = true; },
+    });
+    const pending = () => timers.filter((x) => x.delayMs === 3_000 && !x.done);
+    await d.onSessionStart({ sessionKey: "s1" });
+    const run = async () => { const [x] = pending(); x.done = true; await x.callback(); };
+    assert.equal(pending().length, 1);
+    await run(); // the lease short of the deadline: the next beat is due
+    assert.equal(pending().length, 1);
+    await run(); // the lease at the deadline: nothing more is due
+    assert.deepEqual(beats, ["r-capped", "r-capped"]);
+    assert.equal(pending().length, 0, "a beat was scheduled for a lease at its cap");
+    assert.equal(d.heartbeats.size, 1, "the rollout is still tracked until it ends");
+  });
+
   it("does not treat a heartbeat racing a terminal report as revocation", async () => {
     const scheduled = [];
     let finishReport;
