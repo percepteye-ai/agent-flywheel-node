@@ -47,7 +47,8 @@
  *                         `<file>.claim` created O_EXCL before a file is read
  *                         or sent, removed after; one older than
  *                         `CLAIM_STALE_MS` was left by a process that died
- *                         and is taken over). Without it two workers sent one
+ *                         and is taken over -- that claim only, never a
+ *                         fresh one made meanwhile). Without it two workers sent one
  *                         result twice, and one of them wrote back a record
  *                         the other had already delivered and deleted.
  *   WRITTEN WHOLE         a record goes to a temp file named by pid and nonce,
@@ -81,6 +82,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
 
+import { lockId, takeOverStale } from "./credentials.js";
 import { LeaseLost } from "./errors.js";
 import { percepteyeHome } from "./session.js";
 import { quoteIdentifier } from "./transport.js";
@@ -314,14 +316,15 @@ export function createOutbox({
       } catch (err) {
         if (err?.code !== "EEXIST") return "";
       }
-      // Held. Taken over only when it is stale, and only by whoever wins the
-      // rename of it: two processes cannot both take one claim over.
+      // Held. Taken over only when it is stale, and only the claim judged
+      // stale (`takeOverStale`, the credentials lock's rule): two processes
+      // cannot both take one claim over, and a fresh claim another process
+      // made meanwhile is put back rather than removed.
+      const judged = lockId(claim);
       let age;
       try { age = now() - statSync(claim).mtimeMs; } catch { continue; }
-      if (!(age > CLAIM_STALE_MS)) return null;
-      const aside = `${claim}.${process.pid}.${randomBytes(6).toString("hex")}`;
-      try { renameSync(claim, aside); } catch { return null; }
-      try { unlinkSync(aside); } catch { /* named, harmless */ }
+      if (judged === null || !(age > CLAIM_STALE_MS)) return null;
+      takeOverStale(claim, judged);
     }
     return null;
   }

@@ -31,8 +31,8 @@
  * never reported back in it (R2b).
  */
 import {
-  chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync,
-  renameSync, statSync, unlinkSync, writeSync,
+  chmodSync, closeSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync,
+  readFileSync, renameSync, statSync, unlinkSync, writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -42,9 +42,10 @@ export const CREDENTIALS_FILENAME = "credentials.json";
 /**
  * The lock every read-modify-write of the file holds, by ONE protocol both
  * SDKs implement (the Python SDK's `credentials._locked`): created
- * exclusively (O_EXCL), holding the writer's pid and the time it was taken,
- * removed when the write is done, and taken over once it is older than
- * `LOCK_STALE_MS` -- a process killed mid-write leaves one behind.
+ * exclusively (O_EXCL), holding `"<pid> <ms> <nonce>"`, removed when the
+ * write is done by the writer whose nonce it still holds, and taken over once
+ * it is older than `LOCK_STALE_MS` -- a process killed mid-write leaves one
+ * behind -- by removing only the lock judged stale (`takeOverStale`).
  *
  * ONE FILE FOR BOTH SDKs. Each used to hold a lock of its own (Python an
  * flock on this name, this package `credentials.json.node-lock`), so a Python
@@ -233,9 +234,59 @@ function write(path, entries) {
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
+ * What the lock at `path` holds and which file it is (its contents and
+ * inode), as one comparable string, or null when there is none to read.
+ * Never throws. The Python SDK's `credentials._lock_id`. Shared with the
+ * outbox's claims (`outbox.js`), which are taken over by the same rule.
+ */
+export function lockId(path) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    return `${fstatSync(fd).ino}\n${readFileSync(fd, "utf8")}`;
+  } catch {
+    return null;
+  } finally {
+    try { closeSync(fd); } catch { /* already closed */ }
+  }
+}
+
+/**
+ * Remove the stale lock `judged` (`lockId` as read when it was judged
+ * stale) -- and ONLY that one. The Python SDK's `credentials._take_over_stale`.
+ *
+ * Moved aside first: only one rename of a name succeeds, so two writers
+ * taking the same stale lock over cannot both win. But between the judging
+ * and the rename the stale lock may have been taken over and REPLACED by a
+ * fresh one another writer now holds, and a rename of the name moves THAT one
+ * aside. So what was moved is compared with what was judged; a fresh lock
+ * moved by mistake is put back (a link, which never replaces a lock created
+ * meanwhile -- that one is then the lock, and the moved writer finds its
+ * nonce gone when it releases) and this writer waits again. Never throws.
+ */
+export function takeOverStale(lock, judged) {
+  const aside = `${lock}.stale-${randomBytes(16).toString("hex")}`;
+  try {
+    renameSync(lock, aside);
+  } catch {
+    return; // lost the race to another writer
+  }
+  if (lockId(aside) !== judged) {
+    try { linkSync(aside, lock); } catch { /* a lock was created meanwhile: it is the lock now */ }
+  }
+  try { unlinkSync(aside); } catch { /* already gone */ }
+}
+
+/**
  * Run `fn` holding the credentials lock; every filesystem failure on the way,
  * the write's own included, is a `CredentialsError` naming the file, never a
- * stack trace out of the CLI.
+ * stack trace out of the CLI. Released only while the lock still holds this
+ * writer's nonce, so a writer whose lock was taken over never removes the
+ * next holder's.
  */
 function locked(path, fn, { now = Date.now } = {}) {
   const lock = join(dirname(path), LOCK_FILENAME);
@@ -244,28 +295,24 @@ function locked(path, fn, { now = Date.now } = {}) {
   } catch (err) {
     throw new CredentialsError(`cannot create ${dirname(path)}: ${err?.message ?? err}`);
   }
+  const mine = `${process.pid} ${Date.now()} ${randomBytes(16).toString("hex")}\n`;
   const giveUp = now() + LOCK_WAIT_MS;
   for (;;) {
     try {
       const fd = openSync(lock, "wx", 0o600);
-      try { writeSync(fd, `${process.pid} ${Date.now()}\n`); } finally { closeSync(fd); }
+      try { writeSync(fd, mine); } finally { closeSync(fd); }
       break;
     } catch (err) {
       if (err?.code !== "EEXIST") {
         throw new CredentialsError(`cannot lock ${path} (${lock}): ${err?.message ?? err}`);
       }
     }
+    const judged = lockId(lock);
     let age = 0;
     try { age = now() - statSync(lock).mtimeMs; } catch { continue; /* just released */ }
-    if (age > LOCK_STALE_MS) {
-      // Left by a process that died mid-write. Moved aside rather than
-      // unlinked, so two writers taking it over at once cannot both win: only
-      // one rename of the same name succeeds. Then removed.
-      const aside = `${lock}.stale-${randomBytes(4).toString("hex")}`;
-      try {
-        renameSync(lock, aside);
-        unlinkSync(aside);
-      } catch { /* lost the race */ }
+    if (judged !== null && age > LOCK_STALE_MS) {
+      // Left by a process that died mid-write.
+      takeOverStale(lock, judged);
       continue;
     }
     if (now() >= giveUp) {
@@ -282,7 +329,10 @@ function locked(path, fn, { now = Date.now } = {}) {
     if (err instanceof CredentialsError) throw err;
     throw new CredentialsError(`cannot write ${path}: ${err?.message ?? err}`);
   } finally {
-    try { unlinkSync(lock); } catch { /* already gone */ }
+    const held = lockId(lock);
+    if (held !== null && held.slice(held.indexOf("\n") + 1) === mine) {
+      try { unlinkSync(lock); } catch { /* already gone */ }
+    }
   }
 }
 

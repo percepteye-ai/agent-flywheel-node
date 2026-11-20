@@ -6,9 +6,11 @@ import { testEnv } from "./support/home.js";
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import {
-  chmodSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync,
+import fs, {
+  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync,
+  writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -58,6 +60,76 @@ describe("the credentials store", () => {
     utimesSync(lock, old, old);
     saveStored(cred("a"), env);
     assert.deepEqual(loadStored(env).map((c) => c.agent_id), ["a"]);
+  });
+
+  it("never removes a fresh lock another writer took meanwhile", (t) => {
+    // Between judging a lock stale and renaming it aside, another writer
+    // takes the stale lock over and creates a FRESH one; the rename then
+    // moves the fresh lock. It must be put back, and this writer must wait
+    // for it, not take the lock while the other believes it holds it. The
+    // Python SDK's test_a_stale_takeover_never_removes_a_fresh_lock_taken_meanwhile.
+    // Mutation: remove whatever was moved aside unchecked -> this writer
+    // takes the lock at once and never sees the fresh one, red.
+    const env = testEnv();
+    const lock = join(env.PERCEPTEYE_HOME, LOCK_FILENAME);
+    writeFileSync(lock, "99999 0 deadbeef\n");
+    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000;
+    utimesSync(lock, old, old);
+    const fresh = "4242 1 c0ffee\n";
+    const { renameSync, statSync: realStat } = fs;
+    let raced = false;
+    let seen = null;
+    fs.renameSync = (src, dst) => {
+      if (src === lock && !raced) {
+        raced = true;
+        fs.unlinkSync(lock);
+        writeFileSync(lock, fresh);
+      }
+      return renameSync(src, dst);
+    };
+    fs.statSync = (path, ...rest) => {
+      if (raced && seen === null && path === lock) {
+        // The next look at the lock after the takeover: record what holds
+        // it, then let the other writer release it.
+        seen = readFileSync(lock, "utf8");
+        fs.unlinkSync(lock);
+      }
+      return realStat(path, ...rest);
+    };
+    syncBuiltinESMExports();
+    t.after(() => {
+      fs.renameSync = renameSync;
+      fs.statSync = realStat;
+      syncBuiltinESMExports();
+    });
+    saveStored(cred("a"), env);
+    assert.equal(seen, fresh, "the other writer's fresh lock was removed");
+    assert.deepEqual(loadStored(env).map((c) => c.agent_id), ["a"]);
+    assert.deepEqual(
+      readdirSync(env.PERCEPTEYE_HOME).filter((n) => n.includes(".stale-")), [],
+      "left aside");
+  });
+
+  it("releases only a lock that still holds its own nonce", (t) => {
+    // A writer whose lock was taken over (it outlived the stale age) must not
+    // remove the next holder's on its way out. The Python SDK's
+    // test_a_writer_releases_only_a_lock_that_still_holds_its_nonce.
+    // Mutation: unlink the lock unchecked at release -> it is gone, red.
+    const env = testEnv();
+    const lock = join(env.PERCEPTEYE_HOME, LOCK_FILENAME);
+    const theirs = "4242 1 c0ffee\n";
+    const { renameSync } = fs;
+    fs.renameSync = (src, dst) => {
+      if (String(src).endsWith(".tmp")) {
+        fs.unlinkSync(lock);
+        writeFileSync(lock, theirs);
+      }
+      return renameSync(src, dst);
+    };
+    syncBuiltinESMExports();
+    t.after(() => { fs.renameSync = renameSync; syncBuiltinESMExports(); });
+    saveStored(cred("a"), env);
+    assert.equal(readFileSync(lock, "utf8"), theirs);
   });
 
   it("keeps the directory that holds keys 0700", (t) => {

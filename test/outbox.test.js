@@ -17,10 +17,11 @@
 import "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import {
+import fs, {
   mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync,
   utimesSync, writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -643,6 +644,39 @@ describe("one sender per file (ND-C8)", () => {
     assert.equal(await outbox.drain(), 1);
     assert.deepEqual(sent, ["r-9"]);
     assert.deepEqual(listing(dir), [], "a claim or the record was left behind");
+  });
+
+  it("never removes a fresh claim another process made while it took a stale one over", async (t) => {
+    // Between judging a claim stale and renaming it aside, another process
+    // takes the stale claim over and makes a FRESH one; the rename then moves
+    // the fresh claim. It is put back and this drain leaves the file to that
+    // process -- the credentials lock's rule. Mutation: remove whatever was
+    // moved aside unchecked -> this drain sends it too (a second send), red.
+    const dir = tmp();
+    writeFileSync(join(dir, spoolName("r-9")), spooled("r-9"));
+    const claim = join(dir, `${spoolName("r-9")}.claim`);
+    writeFileSync(claim, "4242.abc");
+    const old = (Date.now() - CLAIM_STALE_MS - 60_000) / 1000;
+    utimesSync(claim, old, old);
+    const { renameSync } = fs;
+    let raced = false;
+    fs.renameSync = (src, dst) => {
+      if (src === claim && !raced) {
+        raced = true;
+        fs.unlinkSync(claim);
+        writeFileSync(claim, "5151.fresh");
+      }
+      return renameSync(src, dst);
+    };
+    syncBuiltinESMExports();
+    t.after(() => { fs.renameSync = renameSync; syncBuiltinESMExports(); });
+    const sent = [];
+    const outbox = createOutbox({ dir, send: async (r) => { sent.push(r.rolloutId); } });
+    assert.equal(await outbox.drain(), 0);
+    assert.ok(raced);
+    assert.deepEqual(sent, [], "a result another process holds was sent a second time");
+    assert.equal(readFileSync(claim, "utf8"), "5151.fresh");
+    assert.deepEqual(listing(dir).filter((n) => n.includes(".stale-")), [], "left aside");
   });
 
   it("spools beside a file another process is sending, never over it", async () => {
