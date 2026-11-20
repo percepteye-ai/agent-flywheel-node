@@ -682,7 +682,11 @@ export function createOutbox({
      * NO SINGLE FILE MAY STOP THE DRAIN, and that is a mechanism rather than
      * an argument: whatever one unexpected file does, the results behind it in
      * this directory still get their turn and the claim this runs in front of
-     * still happens.
+     * still happens. What DOES stop a pass is an outage -- the control plane
+     * not taking results at all (no connection, 429, 5xx) -- because then
+     * every file behind it would fail the same way; they wait for the next
+     * claim. A file another process has claimed is skipped, and a future
+     * SDK's file is left where it is.
      */
     async drain() {
       let names;
