@@ -60,7 +60,7 @@ An eval platform measures. This also improves: each round produces a new version
 ### Do I have to change my agent?
 
 <!-- lang -->
-No. The plugin loads beside your agent in its harness and records from the outside; your agent's code does not change. One setting in your OpenClaw config, `hooks.allowConversationAccess: true`, lets it read the conversation. → [Reference](reference.md)
+Barely. You wrap each turn in `fw.turn()`, and add the adapter for your framework (or a `recordToolCall` where your tools run); the agent itself is unchanged. As an OpenClaw or DeepSeek Harness plugin it loads beside your agent and nothing changes at all: one setting in your OpenClaw config, `hooks.allowConversationAccess: true`, lets it read the conversation. → [README](../README.md#-install), [OpenClaw and DeepSeek Harness](harnesses.md)
 <!-- /lang -->
 
 ### What if my agent is built some other way?
@@ -78,7 +78,7 @@ Nothing beyond itself: zero runtime dependencies, Node builtins only.
 ### How do I stop it?
 
 <!-- lang -->
-`PERCEPTEYE_CAPTURE=0` registers no hook and records nothing. `PERCEPTEYE_APPLY_PROMPT=0` and `PERCEPTEYE_APPLY_MODEL=0` stop applying the approved prompt and model. Switching the [permission](dashboard.md#allow-us-to-learn-from-its-conversations) off stops uploads without touching your config. `PERCEPTEYE_AGENT_MODE=production` claims no practice tasks. → [Reference](reference.md#configuration)
+`PERCEPTEYE_CAPTURE=0` registers no hook and records nothing. `PERCEPTEYE_APPLY_PROMPT=0` and `PERCEPTEYE_APPLY_MODEL=0` stop applying the approved prompt and model. Switching the [permission](dashboard.md#allow-us-to-learn-from-its-conversations) off stops uploads without touching your config. `PERCEPTEYE_AGENT_MODE=production` claims no practice tasks. → [Configuration](../README.md#%EF%B8%8F-configuration)
 <!-- /lang -->
 
 ### What does `unknown` mean?
@@ -87,7 +87,7 @@ A tool call nobody observed succeeding or failing. It is never rounded up to `ok
 
 ### Python or Node?
 
-Pick the one that matches where your agent runs: the Python SDK for a Python agent or a command-line agent you launch yourself, the Node plugin for an OpenClaw or DeepSeek Harness agent. Never both for one agent.
+Pick the one that matches where your agent runs: the Python SDK for a Python agent or a command-line agent you launch yourself, the Node SDK for a JavaScript or TypeScript agent, including an OpenClaw or DeepSeek Harness agent. Never both for one agent.
 
 ### What license is this under?
 

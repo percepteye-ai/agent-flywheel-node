@@ -1,7 +1,7 @@
 {
   "id": "agent-flywheel",
   "name": "Agent Flywheel",
-  "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for a serving install, which claims no rollouts and starts no turn but does capture the turns you serve and apply the system prompt and the model your control plane has approved.",
+  "description": "Agent Flywheel for JavaScript and TypeScript agents: capture the turns your agent serves, run the graded training rollouts your control plane sends, and apply the system prompt and model a person approved. Works with any framework (Vercel AI SDK, LangChain.js, LangGraph.js, Mastra, the OpenAI SDK or plain code) through one import, and loads as a plugin into OpenClaw and DeepSeek Harness. Never alters a tool result. Zero runtime dependencies.",
   "version": "0.5.0",
   "providers": [
     "percepteye-flywheel"

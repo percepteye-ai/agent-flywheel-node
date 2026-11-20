@@ -87,6 +87,12 @@ describe("flywheel().turn(): a production turn through the plugin's own lanes", 
     await assert.rejects(fw.serve(async () => "x"), /PERCEPTEYE_AGENT_MODE=training/);
   });
 
+  it("refuses to start without an agent name, and takes PERCEPTEYE_AGENT_ID", () => {
+    assert.throws(() => flywheel({ logger: quiet }, testEnv()), /PERCEPTEYE_AGENT_ID/);
+    assert.equal(flywheel({ logger: quiet }, testEnv({ PERCEPTEYE_AGENT_ID: "env-agent" })).mode,
+      "production");
+  });
+
   it("captures nothing with capture turned off, and still runs the turn", async () => {
     const env = testEnv({ PERCEPTEYE_CAPTURE: "0" });
     const fw = flywheel({ agentId: "a", logger: quiet }, env);
@@ -100,7 +106,7 @@ describe("flywheel().turn(): a production turn through the plugin's own lanes", 
  * transport calls, and `/llm/...` standing in for the gateway the rollout
  * samples through.
  */
-async function fakeControlPlane({ rollouts }) {
+async function fakeControlPlane({ rollouts = [], policy = {}, prompt = {}, revoked = [] } = {}) {
   const seen = { reports: [], abandons: [], llm: 0, hosted: 0, claims: 0, agents: [] };
   const queue = [...rollouts];
   const server = createServer(async (req, res) => {
@@ -123,6 +129,8 @@ async function fakeControlPlane({ rollouts }) {
       return send(200, { agent_id: json.agent_id, accepted: true });
     }
     if (/^\/agents\/[^/]+\/capture$/.test(route)) return send(200, { enabled: false });
+    if (route === "/policy/current") return send(200, typeof policy === "function" ? policy(base) : policy);
+    if (route === "/prompt/current") return send(200, prompt);
     if (route === "/rollouts/claim") {
       seen.claims += 1;
       const next = queue.shift();
@@ -130,6 +138,9 @@ async function fakeControlPlane({ rollouts }) {
     }
     const m = route.match(/^\/rollouts\/([^/]+)\/(result|abandon|heartbeat)$/);
     if (m) {
+      if (m[2] === "heartbeat" && revoked.includes(m[1])) {
+        return send(410, { detail: "lease revoked" });
+      }
       if (m[2] === "result") seen.reports.push({ id: m[1], ...json });
       if (m[2] === "abandon") seen.abandons.push({ id: m[1], ...json });
       return send(200, { ok: true, lease_expires_ts: Date.now() / 1000 + 600 });
@@ -160,6 +171,98 @@ const trainingEnv = (base) => testEnv({
   PERCEPTEYE_API_KEY: "pefw_test",
   PERCEPTEYE_CONTROL_PLANE_URL: `${base}/api/flywheel/v1`,
   PERCEPTEYE_TRAJECTORY_DIR: "",
+});
+
+describe("flywheel().turn(): the approved pair, handed to the agent", () => {
+  const APPROVED_PROMPT = {
+    name: "support-agent", version: 3, sha256: "a".repeat(64),
+    text: "You are a careful support agent.", candidate_kind: "replacement",
+    status: "approved", model_prompt_checksum: "a".repeat(64), stale_baseline: false,
+  };
+  const served = (endpoint) => (base) => ({
+    arm: "candidate", reason: "certified", candidate_available: true,
+    endpoint: typeof endpoint === "function" ? endpoint(base) : endpoint,
+    model: { uri: "gs://bucket/ckpt-7" },
+    prompt: { pins: { p1: {} }, digest: "d".repeat(16), captured_at: "now" },
+    bundle_digest: "b".repeat(64), resolved_at: "2026-11-20T00:00:00+00:00",
+    ttl_s: 60.0, serving_generation: "0123456789abcdef",
+  });
+  const productionEnv = (base, extra = {}) => testEnv({
+    PERCEPTEYE_API_KEY: "pefw_test",
+    PERCEPTEYE_CONTROL_PLANE_URL: `${base}/api/flywheel/v1`,
+    ...extra,
+  });
+  async function ready(fw, ms = 5_000) {
+    const until = performance.now() + ms;
+    while (!fw.plugin.serving.resolved && performance.now() < until) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.ok(fw.plugin.serving.resolved, "the serving policy was never read");
+  }
+
+  it("hands the approved prompt and the approved model, keyed by this agent's key at the control plane's own gateway", async () => {
+    const cp = await fakeControlPlane({
+      policy: served((base) => ({
+        base_url: `${base}/llm/v1/agents/support-agent/v1`, model: "ckpt-7",
+        api_key_env: "PERCEPTEYE_API_KEY",
+      })),
+      prompt: APPROVED_PROMPT,
+    });
+    try {
+      const fw = flywheel({ agentId: "support-agent", logger: quiet }, productionEnv(cp.base));
+      await ready(fw);
+      await fw.turn("hi", async (t) => {
+        assert.equal(t.systemPrompt("mine"), "You are a careful support agent.");
+        assert.deepEqual(t.model, {
+          baseURL: `${cp.base}/llm/v1/agents/support-agent/v1`, apiKey: "pefw_test", model: "ckpt-7",
+        });
+        return "ok";
+      });
+      await fw.close();
+    } finally {
+      await cp.close();
+    }
+  });
+
+  it("never sends this agent's key to an endpoint of yours: the credential is yours to give", async () => {
+    const policy = served({ base_url: "https://gpu.example/v1", model: "ckpt-7" });
+    const cp = await fakeControlPlane({ policy, prompt: APPROVED_PROMPT });
+    try {
+      const fw = flywheel({ agentId: "a", logger: quiet }, productionEnv(cp.base));
+      await ready(fw);
+      await fw.turn("hi", async (t) => {
+        assert.deepEqual(t.model, { baseURL: "https://gpu.example/v1", apiKey: null, model: "ckpt-7" });
+        return "ok";
+      });
+      const mine = flywheel({ agentId: "a", servedModelApiKey: "sk-mine", logger: quiet },
+        productionEnv(cp.base));
+      await ready(mine);
+      await mine.turn("hi", async (t) => {
+        assert.equal(t.model.apiKey, "sk-mine");
+        return "ok";
+      });
+    } finally {
+      await cp.close();
+    }
+  });
+
+  it("hands over nothing when switched off, and the agent keeps its own", async () => {
+    const policy = served({ base_url: "https://gpu.example/v1", model: "ckpt-7" });
+    const cp = await fakeControlPlane({ policy, prompt: APPROVED_PROMPT });
+    try {
+      const fw = flywheel({ agentId: "a", logger: quiet }, productionEnv(cp.base, {
+        PERCEPTEYE_APPLY_PROMPT: "0", PERCEPTEYE_APPLY_MODEL: "0",
+      }));
+      await ready(fw);
+      await fw.turn("hi", async (t) => {
+        assert.equal(t.systemPrompt("mine"), "mine");
+        assert.equal(t.model, null);
+        return "ok";
+      });
+    } finally {
+      await cp.close();
+    }
+  });
 });
 
 describe("flywheel().serve(): training rollouts through the one rollout lane", () => {
@@ -314,6 +417,27 @@ describe("flywheel().serve(): training rollouts through the one rollout lane", (
       assert.equal(byMode.b.entrypoint, "agent-flywheel-node:flywheel");
       assert.equal(byMode.a.discovered_agent, null);
       await production.close();
+    } finally {
+      await cp.close();
+    }
+  });
+
+  it("aborts t.signal when the control plane revokes the lease, and reports nothing for it", async () => {
+    const short = (base) => ({ ...rollout("r10", "a")(base), lease_expires_ts: Date.now() / 1000 + 3 });
+    const cp = await fakeControlPlane({ rollouts: [short], revoked: ["r10"] });
+    try {
+      const fw = flywheel({ agentId: "a", logger: quiet }, trainingEnv(cp.base));
+      let aborted = false;
+      await fw.serve(async (t) => {
+        aborted = await new Promise((resolve) => {
+          if (t.signal.aborted) { resolve(true); return; }
+          const timer = setTimeout(() => resolve(false), 8_000);
+          t.signal.addEventListener("abort", () => { clearTimeout(timer); resolve(true); });
+        });
+        return "too late";
+      }, { maxRollouts: 1 });
+      assert.equal(aborted, true, "the run was told to stop");
+      assert.equal(cp.seen.reports.length, 0, "a revoked rollout's result is not reported");
     } finally {
       await cp.close();
     }

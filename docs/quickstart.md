@@ -5,7 +5,7 @@ Connect your agent, let it send us its real conversations, and start improving i
 ## What you need
 
 <!-- lang -->
-- Node 22.22.3 or later, and an OpenClaw agent. OpenClaw is the harness whose model calls the plugin can record, and what the model saw and said is what we learn from. In DeepSeek Harness the plugin records tool outcomes only. Any other agent that already exports OpenTelemetry traces can [send us those](otlp.md) instead.
+- Node 22.22.3 or later, and an agent written in JavaScript or TypeScript: with the Vercel AI SDK, LangChain.js or LangGraph.js, Mastra, the OpenAI SDK, or your own code. An OpenClaw or DeepSeek Harness agent uses the same package as a plugin instead: see [OpenClaw and DeepSeek Harness](harnesses.md). An agent that already exports OpenTelemetry traces can [send us those](otlp.md) instead.
 <!-- /lang -->
 - A free sign-in at [launch.percepteye.ai](https://launch.percepteye.ai).
 
@@ -13,10 +13,10 @@ Connect your agent, let it send us its real conversations, and start improving i
 
 <!-- lang -->
 ```bash
-openclaw plugins install @percepteye/agent-flywheel
+npm install @percepteye/agent-flywheel
 ```
 
-Zero runtime dependencies.
+Zero runtime dependencies, with TypeScript declarations included.
 <!-- /lang -->
 
 ## Get your key
@@ -29,26 +29,23 @@ export PERCEPTEYE_API_KEY=pefw_...
 ```
 
 <!-- lang -->
-Set them where your OpenClaw gateway starts: it reads its environment once, at launch. The URL is also the plugin's default. Without a key the plugin records on your disk and sends nothing.
+Set them where your agent's process starts. The URL is also the SDK's default. Without a key the SDK records on your disk and sends nothing.
 <!-- /lang -->
 
 ## Record its conversations
 
 <!-- lang -->
-Run the plugin in production mode, name the agent, and let it read the conversation:
+Name the agent, and wrap each turn it serves:
 
-```bash
-export PERCEPTEYE_AGENT_MODE=production
-export PERCEPTEYE_AGENT_ID=support-agent      # the name you gave the agent in the dashboard
+```ts
+import { flywheel } from "@percepteye/agent-flywheel";
+
+const fw = flywheel({ agentId: "support-agent" });   // the name you gave the agent in the dashboard
+
+const answer = await fw.turn(userMessage, (t) => runAgent(t), { conversationId });
 ```
 
-```jsonc
-// your OpenClaw config
-{ "plugins": { "entries": { "agent-flywheel": {
-    "hooks": { "allowConversationAccess": true } } } } }
-```
-
-Start OpenClaw as you always do. The plugin registers the agent at startup, which is how the dashboard sees it connect. `allowConversationAccess` is what lets it read your agent's answers and what the model saw; without it, it records only the user's message and the tool calls. Each turn is written under `~/.percepteye/captured/<agentId>` first; that directory is yours.
+`fw.turn` runs your agent and returns its answer. It records the user's message, the tool calls and the answer, under `~/.percepteye/captured/<agentId>` first; that directory is yours. The tool calls come from the adapter for your framework (`@percepteye/agent-flywheel/ai-sdk` or `/langchain`) or from `recordToolCall` where your tools run. The [README](../README.md#-install) shows both. The SDK registers the agent at startup, which is how the dashboard sees it connect.
 <!-- /lang -->
 
 ## Allow us to learn from them
@@ -60,7 +57,7 @@ Once the dashboard has seen your agent connect, give it [permission](dashboard.m
 The SDK sends turns in batches, so a turn does not appear the moment it happens.
 
 <!-- lang -->
-It sends every 32 turns, and the rest when the gateway stops. The startup log says whether it may: `production capture is ENABLED for 'support-agent'`, or `capturing locally; turns will NOT be uploaded:` followed by why.
+It sends every 32 turns, and the rest when you call `fw.close()`. The startup log says whether it may: `production capture is ENABLED for 'support-agent'`, or `capturing locally; turns will NOT be uploaded:` followed by why.
 <!-- /lang -->
 
 Then open [your agent's page](dashboard.md#see-what-arrived) to see it counted. Nothing there? See [Troubleshooting](troubleshooting.md#nothing-arrives-in-the-dashboard).
@@ -79,7 +76,7 @@ If there is not yet enough to learn from, Start improving says so.
 ## Run the approved version
 
 <!-- lang -->
-Nothing to write. In production mode, with a key, the plugin applies the approved model and prompt to this agent's own turns. It reads them once, at startup, so restart the gateway to pick up a newly approved version. The startup log says when both are applied, and names the one that is not.
+In production mode, with a key, each turn hands your agent the approved version: `t.systemPrompt(yours)` returns the approved system prompt, and `t.model` is the approved model's endpoint (`null` until there is one, so your agent keeps its own). Use both, and the approved version runs. A newly approved prompt reaches the next turn; a new model is read once, at startup, so restart to pick it up. The startup log says when both are available, and names the one that is not.
 <!-- /lang -->
 
 Until you approve a new version, your agent keeps the one it has. The details are in [Production](production.md#run-the-approved-version).

@@ -182,6 +182,21 @@ function declarationFor(config, logger) {
 }
 
 
+/**
+ * Register the plugin's lanes on a host's plugin API: OpenClaw's, or the
+ * framework API's in-process host (`flywheel.js`).
+ *
+ * @param {object} api the host's plugin API (`on`, `config`, `logger`,
+ *   `registerProvider`, ...)
+ * @param {object} [pluginConfig] the plugin's settings; `api.pluginConfig`
+ *   when empty
+ * @param {object} [env] the environment the settings are read from
+ * @param {object} [host] what a host that is not OpenClaw supplies:
+ *   `startTurn`/`cancel`, how it starts and stops a rollout's turn (the
+ *   OpenClaw lane uses its cron seam), and `entrypoint`/`framework`, what it
+ *   registers as. Omitted, this is the OpenClaw plugin.
+ * @returns {object|null} the lanes' handle, or null when nothing registered
+ */
 export function register(api, pluginConfig = {}, env = process.env, host = {}) {
   if (typeof api?.on !== "function") return null;
 

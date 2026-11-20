@@ -100,12 +100,23 @@ export function flywheel(options = {}, env = process.env) {
     logger = QUIET_INFO, servedModelApiKey = null, framework = "custom",
     ...pluginConfig
   } = options ?? {};
+  // AN AGENT IS NAMED, ALWAYS. The plugin's default ("openclaw") names the
+  // OpenClaw install; a framework agent registered under it would be some
+  // other agent's row, key and consent. The Python SDK requires `agent_id`
+  // for the same reason.
+  const agentId = pluginConfig.agentId ?? env?.PERCEPTEYE_AGENT_ID;
+  if (typeof agentId !== "string" || !agentId.trim()) {
+    throw new ConfigurationError(
+      "flywheel() needs the agent's name: pass { agentId } or set " +
+      "PERCEPTEYE_AGENT_ID -- the name you gave the agent at " +
+      "launch.percepteye.ai, which its key is bound to");
+  }
   const handlers = new Map();
   let provider = null;
   // The one host agent this process serves, in the host's namespace -- the
   // join `resolveServedAgent` makes. A framework process serves one agent,
   // so there is nothing to disambiguate and nothing to guess.
-  const hostAgent = normalizeAgentId(pluginConfig.agentId) ?? "main";
+  const hostAgent = normalizeAgentId(agentId) ?? "main";
   const controllers = new Map();
 
   const api = {
@@ -253,6 +264,25 @@ export function flywheel(options = {}, env = process.env) {
     finished += 1;
     onFinished?.();
   }
+
+  // Outcomes and feedback travel with PRODUCTION capture, which a training
+  // process does not run: an episode's outcome is reported by the production
+  // process that saw what happened next, naming the episode by `t.rolloutId`.
+  // Said once, never a silent null.
+  let saidNoUploader = false;
+  const noUploader = (what) => {
+    if (!saidNoUploader) {
+      saidNoUploader = true;
+      try {
+        logger?.warn?.(
+          `[${PLUGIN_ID}] ${what}() sent nothing: outcomes and feedback are ` +
+          `reported by a production process (this one is ` +
+          `${handle?.mode ?? "not capturing"}). Report an episode's outcome from ` +
+          "production with { episodeId } set to the rollout's t.rolloutId.");
+      } catch { /* telemetry */ }
+    }
+    return null;
+  };
 
   const handle = registerPlugin(api, pluginConfig, env, {
     startTurn, cancel,
@@ -467,12 +497,14 @@ export function flywheel(options = {}, env = process.env) {
 
     /** How a production turn or conversation turned out. See the README. */
     reportOutcome(outcome, opts = {}) {
-      return handle?.capture?.reportOutcome?.(outcome, opts) ?? null;
+      if (!handle?.capture) return noUploader("reportOutcome");
+      return handle.capture.reportOutcome(outcome, opts);
     },
 
     /** What a user did with one turn. See the README. */
     reportTurnFeedback(signal, opts = {}) {
-      return handle?.capture?.reportTurnFeedback?.(signal, opts) ?? null;
+      if (!handle?.capture) return noUploader("reportTurnFeedback");
+      return handle.capture.reportTurnFeedback(signal, opts);
     },
 
     /**
@@ -497,7 +529,7 @@ export function flywheel(options = {}, env = process.env) {
  * without it every rollout is held out of training as `llm_calls_unobserved`.
  *
  * `globalThis.fetch` is wrapped only while `serve()` runs, and only matching
- * requests are touched; the OpenAI and Anthropic SDKs, the Vercel AI SDK and
+ * requests are touched; the OpenAI SDK, the Vercel AI SDK and
  * LangChain.js all reach the network through it. A client that does not is
  * not seen, and the rollout is reported with no count rather than a wrong one.
  * `<llm_url>/hosted/...` is the rollout's route to models that are NOT the
