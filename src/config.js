@@ -237,9 +237,24 @@ export const GET_A_KEY =
 /** The spellings that mean OFF. One list, because one typo rule applies. */
 const OFF = ["0", "false", "no", "off"];
 
-/** `pluginConfig.<key> ?? env.<ENV>`, ON unless DELIBERATELY switched off. */
+/**
+ * Whether a setting is UNSET: absent, null, or an empty or blank string. A
+ * config layer writes `""` for "not set" as often as it omits the key, and
+ * the host's validator hands it over as given.
+ */
+const unset = (value) => value === undefined || value === null
+  || (typeof value === "string" && value.trim() === "");
+
+/**
+ * `pluginConfig.<key>`, else `env.<ENV>`, ON unless DELIBERATELY switched
+ * off. An unset config value -- `""` included -- defers to the environment:
+ * `capture: ""` used to win over PERCEPTEYE_CAPTURE=0 as "on", so an operator
+ * who opted out in the environment kept being recorded.
+ */
 const enabledUnlessOff = (configured, fromEnv) =>
-  !OFF.includes(String(configured ?? fromEnv ?? "").trim().toLowerCase());
+  !OFF.includes(
+    String(unset(configured) ? (fromEnv ?? "") : configured).trim().toLowerCase(),
+  );
 
 const firstString = (...values) => {
   for (const v of values) {

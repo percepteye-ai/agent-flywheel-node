@@ -356,3 +356,24 @@ test("production is NOT inert without a trajectory dir, and the description no l
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("an empty config value is unset, so the environment's opt-out wins", () => {
+  for (const blank of ["", "  ", null, undefined]) {
+    const config = resolveConfig(
+      { capture: blank, applyPrompt: blank, applyModel: blank },
+      { PERCEPTEYE_CAPTURE: "0", PERCEPTEYE_APPLY_PROMPT: "0", PERCEPTEYE_APPLY_MODEL: "0" },
+    );
+    assert.equal(config.captureEnabled, false, `capture=${JSON.stringify(blank)}`);
+    assert.equal(config.applyPromptEnabled, false, `applyPrompt=${JSON.stringify(blank)}`);
+    assert.equal(config.applyModelEnabled, false, `applyModel=${JSON.stringify(blank)}`);
+  }
+  // And with nothing in the environment either, the default is still on.
+  assert.equal(resolveConfig({ capture: "" }, {}).captureEnabled, true);
+  // A value that IS set still outranks the environment.
+  assert.equal(
+    resolveConfig({ capture: "on" }, { PERCEPTEYE_CAPTURE: "0" }).captureEnabled, true,
+  );
+  const api = fakeApi();
+  assert.equal(register(api, { capture: "" }, { PERCEPTEYE_CAPTURE: "0" }), null);
+  assert.equal(api.hooks.length, 0);
+});
