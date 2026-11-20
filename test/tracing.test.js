@@ -127,8 +127,13 @@ describe("turn spans", () => {
       const s = t.spans[0];
       assert.equal(s.name, "chat");
       assert.equal(s.attributes["gen_ai.operation.name"], "chat");
-      assert.equal(s.attributes["gen_ai.input.messages"], "book me tuesday");
-      assert.equal(s.attributes["gen_ai.output.messages"], "booked");
+      // The OTel GenAI message list, not the bare text (ND-C9). Changed from
+      // the plain-string pin: Mission Control reads that only as legacy.
+      assert.deepEqual(JSON.parse(s.attributes["gen_ai.input.messages"]), [
+        { role: "user", parts: [{ type: "text", content: "book me tuesday" }] }]);
+      assert.deepEqual(JSON.parse(s.attributes["gen_ai.output.messages"]), [
+        { role: "assistant", parts: [{ type: "text", content: "booked" }],
+          finish_reason: "stop" }]);
       assert.equal(s.attributes["gen_ai.request.model"], "gpt-x");
     });
   });
@@ -145,8 +150,53 @@ describe("turn spans", () => {
   it("bounds turn content", () => {
     withTracer((t) => {
       recordTurnSpan({ outputText: "y".repeat(MAX_TURN_CHARS + 5000) });
-      assert.equal(
-        t.spans[0].attributes["gen_ai.output.messages"].length, MAX_TURN_CHARS);
+      const [message] = JSON.parse(t.spans[0].attributes["gen_ai.output.messages"]);
+      assert.equal(message.parts[0].content.length, MAX_TURN_CHARS);
+    });
+  });
+
+  it("bounds by code point and never splits a surrogate pair", () => {
+    // Mutation: slice on UTF-16 units -> a lone surrogate / half the text, red.
+    withTracer((t) => {
+      recordTurnSpan({ inputText: "😀".repeat(MAX_TURN_CHARS + 3) });
+      const [message] = JSON.parse(t.spans[0].attributes["gen_ai.input.messages"]);
+      const content = message.parts[0].content;
+      assert.equal([...content].length, MAX_TURN_CHARS);
+      assert.ok(content.isWellFormed());
+      recordToolCallSpan("x", "😀".repeat(MAX_ATTRIBUTE_CHARS + 1) , { outcome: "ok" });
+      const args = t.spans[1].attributes["gen_ai.tool.call.arguments"];
+      assert.ok(args.isWellFormed());
+      assert.equal([...args.replace("...[truncated]", "")].length, MAX_ATTRIBUTE_CHARS);
+    });
+  });
+
+  it("redacts every Flywheel key from the text it carries", () => {
+    // Mutation: drop redactKeys from cut -> the key reaches the exporter, red.
+    const key = `pefw_${"A".repeat(43)}`;
+    withTracer((t) => {
+      recordTurnSpan({ inputText: `my key is ${key}`, outputText: `ok ${key}` });
+      recordToolCallSpan("read", { token: key }, {
+        outcome: "failed", error: `bad ${key}` });
+      for (const span of t.spans) {
+        for (const value of Object.values(span.attributes)) {
+          assert.ok(!String(value).includes(key), String(value));
+        }
+        assert.ok(!String(span.status?.message ?? "").includes(key));
+      }
+      assert.match(t.spans[0].attributes["gen_ai.input.messages"], /pefw_\[REDACTED\]/);
+    });
+  });
+
+  it("keeps an id or a text of 0 rather than dropping it as falsy", () => {
+    // Mutation: back to `value && String(value)` -> the attributes vanish, red.
+    withTracer((t) => {
+      recordTurnSpan({ inputText: 0, turnId: 0, conversationId: 0 });
+      recordToolCallSpan("x", null, { outcome: "ok", toolCallId: 0, taskId: 0 });
+      assert.equal(t.spans.length, 2);
+      assert.equal(t.spans[0].attributes["percepteye.turn.id"], "0");
+      assert.equal(t.spans[0].attributes["percepteye.conversation.id"], "0");
+      assert.equal(t.spans[1].attributes["gen_ai.tool.call.id"], "0");
+      assert.equal(t.spans[1].attributes["percepteye.task.id"], "0");
     });
   });
 });
@@ -234,8 +284,10 @@ describe("the projection is actually WIRED, not merely present", () => {
       assert.equal(t.spans.length, 2);
       // The ASK and the ANSWER land on the convention's two different keys —
       // that ordering is what the ingest reads back as a conversation.
-      assert.equal(t.spans[0].attributes["gen_ai.input.messages"], "book me tuesday");
-      assert.equal(t.spans[1].attributes["gen_ai.output.messages"], "booked");
+      const content = (span, key) =>
+        JSON.parse(span.attributes[key])[0].parts[0].content;
+      assert.equal(content(t.spans[0], "gen_ai.input.messages"), "book me tuesday");
+      assert.equal(content(t.spans[1], "gen_ai.output.messages"), "booked");
       assert.equal(t.spans[0].attributes["percepteye.conversation.id"], "conv_1");
     } finally {
       __resetTracerForTests();

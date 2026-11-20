@@ -21,7 +21,7 @@
                 {
                   "key": "gen_ai.input.messages",
                   "value": {
-                    "stringValue": "where is my order?"
+                    "stringValue": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"where is my order?\"}]}]"
                   }
                 },
                 {
@@ -61,7 +61,7 @@
                 {
                   "key": "gen_ai.output.messages",
                   "value": {
-                    "stringValue": "It ships tomorrow."
+                    "stringValue": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"It ships tomorrow.\"}],\"finish_reason\":\"stop\"}]"
                   }
                 },
                 {
