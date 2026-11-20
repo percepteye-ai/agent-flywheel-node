@@ -82,3 +82,35 @@ describe("reading an exit status", () => {
     assert.equal(readExit({ meta: { exitCode: "not a number" } }), undefined);
   });
 });
+
+describe("an exit code outranks a status word", () => {
+  it("grades a command that exited 1 as failed, whatever meta.status says", () => {
+    for (const result of [
+      { meta: { status: "ok" }, exitCode: 1 },
+      { meta: { status: "success" }, exit_code: 1 },
+      { details: { status: "ok", exit_code: 2 } },
+    ]) {
+      assert.equal(classify("bash", undefined, result).outcome, "failed", JSON.stringify(result));
+      assert.notEqual(readExit(result), 0);
+    }
+    assert.equal(classify("exec", undefined, { meta: { status: "error" }, exitCode: 0 }).outcome, "ok");
+  });
+});
+
+describe("an Error object is a failure", () => {
+  it("in the result of a tool whose silence means success", () => {
+    const v = classify("read", undefined, new Error("ENOENT: no such file"));
+    assert.equal(v.outcome, "failed");
+    assert.equal(v.error, "ENOENT: no such file");
+    assert.equal(v.error_class, "Error");
+  });
+
+  it("in the host's error field, for any tool", () => {
+    const err = new TypeError("bad argument");
+    for (const tool of ["read", "bash", "mcp_tool"]) {
+      const v = classify(tool, err, { meta: { exitCode: 0 } });
+      assert.equal(v.outcome, "failed", tool);
+      assert.equal(v.error_class, "TypeError");
+    }
+  });
+});
