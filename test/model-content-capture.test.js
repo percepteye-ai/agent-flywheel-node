@@ -117,7 +117,7 @@ const attrs = (span) => Object.fromEntries(
 
 /** One served turn, through the plugin's real hooks. */
 function serveTurn(a, runId, history = []) {
-  const ctx = { runId, sessionKey: CONVERSATION, agentId: "acme-support" };
+  const ctx = { runId, sessionKey: CONVERSATION, agentId: "main" };
   a.fire("message_received", { runId, content: "Where is my order 4417?",
                                sessionKey: CONVERSATION }, ctx);
   a.fire("llm_input", llmInput(runId, { history }), ctx);
@@ -137,7 +137,7 @@ describe("the happy path, through register()", () => {
     });
     await wired.started;
     assert.equal(wired.uploader.mayCaptureModelContent, true);
-    const ctx = { runId: "run-1", sessionKey: CONVERSATION, agentId: "acme-support" };
+    const ctx = { runId: "run-1", sessionKey: CONVERSATION, agentId: "main" };
     a.fire("message_received", { runId: "run-1", content: "Where is my order 4417?",
                                  sessionKey: CONVERSATION }, ctx);
     // llm_input reaches the turn store through index.js's one subscription
@@ -270,8 +270,8 @@ describe("consent: model content is RECORDED only when granted", () => {
     assert.ok("genai_trace" in tr.sent[0]);
     assert.equal(u.mayCaptureModelContent, false);
     assert.equal(u.modelContentReason, "an operator withdrew model-content capture");
-    turns.onLlmInput(llmInput("r2"), { runId: "r2" });
-    turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2" });
+    turns.onLlmInput(llmInput("r2"), { runId: "r2", sessionKey: CONVERSATION });
+    turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2", sessionKey: CONVERSATION });
     assert.ok(!existsSync(join(root, "r2", OBSERVATION_FILENAME)),
       "model content was recorded after the intake refused it");
   });
@@ -308,14 +308,14 @@ describe("consent: model content is RECORDED only when granted", () => {
     assert.equal(u.mayCaptureModelContent, false,
       "model content is still recorded for turns the intake keeps no trace of");
     assert.equal(u.modelContentReason, detail);
-    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2" }), false);
+    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2", sessionKey: CONVERSATION }), false);
     await u.flush();
     assert.equal(u.mayCaptureModelContent, false);
     // COMPLETES: the operator retires the second Product.
     verdict = { turns: true, model_content: true };
     await u.flush();
     assert.equal(u.mayCaptureModelContent, true);
-    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3" }), true);
+    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3", sessionKey: CONVERSATION }), true);
   });
 
   it("stops recording model content when the intake refuses the turns", async () => {
@@ -350,8 +350,8 @@ describe("consent: model content is RECORDED only when granted", () => {
     assert.equal(u.mayCaptureModelContent, false,
       "model content is still being recorded after the intake refused the turns");
     assert.equal(u.modelContentReason, u.refusal);
-    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2" }), false);
-    turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2" });
+    assert.equal(turns.onLlmInput(llmInput("r2"), { runId: "r2", sessionKey: CONVERSATION }), false);
+    turns.onAgentEnd({ runId: "r2", messages: transcript() }, { runId: "r2", sessionKey: CONVERSATION });
     assert.ok(!existsSync(join(root, "r2", OBSERVATION_FILENAME)),
       "model content was recorded while consent was withdrawn");
     await u.flush();
@@ -367,7 +367,7 @@ describe("consent: model content is RECORDED only when granted", () => {
     assert.equal((await u.flush()).sent, 2);
     assert.equal(u.mayUpload, true);
     assert.equal(u.mayCaptureModelContent, true);
-    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3" }), true);
+    assert.equal(turns.onLlmInput(llmInput("r3"), { runId: "r3", sessionKey: CONVERSATION }), true);
   });
 
   it("keeps both tiers through a transport blip", async () => {
@@ -375,7 +375,7 @@ describe("consent: model content is RECORDED only when granted", () => {
     const turns = createTurnCapture({ root });
     turns.gateModelContent(() => true);
     turns.onLlmInput(llmInput("r"), { runId: "r", sessionKey: CONVERSATION });
-    turns.onAgentEnd({ runId: "r", messages: transcript() }, { runId: "r" });
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, { runId: "r", sessionKey: CONVERSATION });
     const tr = transport();
     let posts = 0;
     tr.reportTurns = async () => {
@@ -659,7 +659,7 @@ describe("the wire", () => {
     const root = tmp();
     const turns = createTurnCapture({ root });
     turns.onMessageReceived({ runId: "r", content: "hi", sessionKey: CONVERSATION },
-                            { runId: "r" });
+                            { runId: "r", sessionKey: CONVERSATION });
     const plain = turnWire(join(root, "r"));
     const granted = turnWire(join(root, "r"), { modelContentAgent: "a" });
     assert.deepEqual(granted, plain);

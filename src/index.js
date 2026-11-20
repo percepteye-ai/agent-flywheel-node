@@ -81,6 +81,7 @@ import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
 import { PENDING_ANSWER_REASON, registerServingPolicy } from "./policy.js";
 import { conversationAccessGranted } from "./host.js";
+import { resolveServedAgent } from "./scope.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
 } from "./capture.js";
@@ -328,8 +329,14 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // is not consulted there, because a single shared directory would merge
   // every end user's calls into one trajectory -- and `PERCEPTEYE_AGENT_MODE`
   // is the authority on which of the two this process is.
+  // Keyed by agent and scoped to its own runs (capture.js `captureRoot`,
+  // `createTurnCapture`), by the predicate the serving policy asks.
   const turns = config.mode === PRODUCTION
-    ? createTurnCapture({ root: captureRoot(env), logger })
+    ? createTurnCapture({
+      root: captureRoot(env, config.agentId), logger,
+      servedAgent: resolveServedAgent({
+        agentId: config.agentId, hostConfig: api?.config }),
+    })
     : null;
   const writer = createWriter({
     resolveDir: turns ? turns.resolveToolDir : null,

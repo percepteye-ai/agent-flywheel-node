@@ -34,13 +34,17 @@ import { register, PLUGIN_ID } from "../src/index.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "percepteye-cap-"));
 
+/** The context an OpenClaw agent hook carries for the host's default agent
+ * (`buildAgentHookContext`): what capture's scope gate reads. */
+const HOST = Object.freeze({ agentId: "main" });
+
 /** Build a turn on disk the way the hooks would. */
 function makeTurn(root, runId, { task, answer, calls, conversation, taskId } = {}) {
   const cap = createTurnCapture({ root });
   if (task !== undefined) {
     cap.onMessageReceived({
       runId, content: task, sessionKey: conversation, taskId,
-    });
+    }, HOST);
   }
   if (calls) {
     const dir = turnDir(root, runId);
@@ -52,7 +56,7 @@ function makeTurn(root, runId, { task, answer, calls, conversation, taskId } = {
   if (answer !== undefined) {
     cap.onAgentEnd({
       runId, taskId, messages: [{ role: "assistant", content: answer }],
-    });
+    }, HOST);
   }
   return turnDir(root, runId);
 }
@@ -85,8 +89,8 @@ describe("the on-disk format is the Python SDK's", () => {
     // that was actually returned.
     const root = tmp();
     const cap = createTurnCapture({ root });
-    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "first" }] });
-    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "final" }] });
+    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "first" }] }, HOST);
+    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "final" }] }, HOST);
     assert.equal(readTurnText(turnDir(root, "r")).answer, "final");
   });
 
@@ -95,14 +99,14 @@ describe("the on-disk format is the Python SDK's", () => {
     // claims, and only the second is true here.
     const root = tmp();
     const cap = createTurnCapture({ root });
-    assert.equal(cap.onMessageReceived({ runId: "r", content: "   " }), false);
+    assert.equal(cap.onMessageReceived({ runId: "r", content: "   " }, HOST), false);
     assert.equal(readTurnText(turnDir(root, "r")), null);
   });
 
   it("truncates at the same point as the other end", () => {
     const root = tmp();
     const cap = createTurnCapture({ root });
-    cap.onMessageReceived({ runId: "r", content: "x".repeat(MAX_TEXT_CHARS + 500) });
+    cap.onMessageReceived({ runId: "r", content: "x".repeat(MAX_TEXT_CHARS + 500) }, HOST);
     assert.equal(readTurnText(turnDir(root, "r")).task.length, MAX_TEXT_CHARS);
   });
 
@@ -117,18 +121,18 @@ describe("the on-disk format is the Python SDK's", () => {
       assert.throws(() => turnDir(root, hostile), /production identifier/);
     }
     const cap = createTurnCapture({ root });
-    cap.onMessageReceived({ runId: "../../escape", content: "hi" });
+    cap.onMessageReceived({ runId: "../../escape", content: "hi" }, HOST);
     cap.onAgentEnd({
       runId: "../../escape",
       messages: [{ role: "assistant", content: "done" }],
-    });
+    }, HOST);
     const names = readdirSync(root);
     assert.equal(names.length, 1, "one invalid host run split across two ids");
     assert.match(names[0], /^t_[0-9a-f]{16}$/);
     assert.equal(turnWire(join(root, names[0])).final_text, "done");
 
     const opaque = "顧客 run #1";
-    cap.onMessageReceived({ runId: opaque, content: "hello" });
+    cap.onMessageReceived({ runId: opaque, content: "hello" }, HOST);
     assert.equal(turnWire(turnDir(root, opaque)).turn_id, opaque);
   });
 
@@ -229,7 +233,7 @@ describe("the wire shape", () => {
     const cap = createTurnCapture({ root });
     assert.equal(cap.onMessageReceived({
       runId: "r-task-only", content: "", task_id: "CASE-9",
-    }), true);
+    }, HOST), true);
     assert.deepEqual(turnWire(turnDir(root, "r-task-only")), {
       turn_id: "r-task-only",
       input_text: null,
@@ -945,8 +949,8 @@ describe("the production lane is wired", () => {
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
     }));
     const tool = a.hooks.find((h) => h.name === "after_tool_call").fn;
-    tool({ toolName: "lookup", params: { id: 1 }, runId: "runA", result: "ok" }, {});
-    tool({ toolName: "lookup", params: { id: 2 }, runId: "runB", result: "ok" }, {});
+    tool({ toolName: "lookup", params: { id: 1 }, runId: "runA", result: "ok" }, HOST);
+    tool({ toolName: "lookup", params: { id: 2 }, runId: "runB", result: "ok" }, HOST);
     assert.ok(existsSync(join(root, "runA", "tool_calls.jsonl")));
     assert.ok(existsSync(join(root, "runB", "tool_calls.jsonl")));
   });
@@ -1047,7 +1051,11 @@ describe("reading the answer", () => {
 describe("where capture lands", () => {
   it("honours an explicit dir above the default", () => {
     assert.equal(captureRoot({ PERCEPTEYE_CAPTURE_DIR: "/x" }), "/x");
-    assert.match(captureRoot({ PERCEPTEYE_HOME: "/h" }), /^\/h\/captured$/);
+    // Keyed by agent (`pathSegment`, the outbox's rule): two agents sharing
+    // one home never share one root. Mutation: drop the agent segment -> red.
+    assert.equal(captureRoot({ PERCEPTEYE_HOME: "/h" }, "acme"), "/h/captured/acme");
+    assert.notEqual(captureRoot({ PERCEPTEYE_HOME: "/h" }, "a"),
+                    captureRoot({ PERCEPTEYE_HOME: "/h" }, "b"));
   });
 
 

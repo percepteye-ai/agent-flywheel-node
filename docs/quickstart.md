@@ -48,7 +48,7 @@ export PERCEPTEYE_AGENT_ID=support-agent      # the name you gave the agent in t
     "hooks": { "allowConversationAccess": true } } } } }
 ```
 
-Start OpenClaw as you always do. The plugin registers the agent at startup, which is how the dashboard sees it connect. `allowConversationAccess` is what lets it read your agent's answers and what the model saw; without it, it records only the user's message and the tool calls. Each turn is written under `~/.percepteye/captured` first; that directory is yours.
+Start OpenClaw as you always do. The plugin registers the agent at startup, which is how the dashboard sees it connect. `allowConversationAccess` is what lets it read your agent's answers and what the model saw; without it, it records only the user's message and the tool calls. Each turn is written under `~/.percepteye/captured/<agentId>` first; that directory is yours.
 <!-- /lang -->
 
 ## Allow us to learn from them

@@ -294,7 +294,7 @@ All three are also OpenClaw config settings (`capture`, `applyPrompt`, `applyMod
 In `production` mode the plugin records the turns your agent is already serving — one directory per turn, in the same on-disk format the Python SDK writes:
 
 ```
-$PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured
+$PERCEPTEYE_CAPTURE_DIR/<runId>/       # default ~/.percepteye/captured/<agentId>
     turns.jsonl        {"kind":"task"|"answer","text","turn_id","conversation_id","task_id"}
     conversation_id
     task_id            # optional caller-authored case/work-item correlation
@@ -600,7 +600,7 @@ It is the Python SDK's `describe=`, read by the same rules, and a cross-language
 - **The control plane decides what a rule may be**, and says which rule it refused and why; this plugin refuses only a value that is not a list of strings, before sending anything. The agent must be declared by exactly one Product, or nothing is written.
 - **A refused declaration does not stop the plugin**: it costs the rules and nothing else, and the warning names the cause — also readable as `rulebookRefusal` on the handle `register()` returns (`capture` in production, where it also names why rules were never sent; `rollouts` in a training install that drives — one that does not returns no handle, so its startup line is the record). The config schema accepts any `rules` value for the same reason it accepts any `describe`.
 
-Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
+Three more environment variables name directories rather than switching anything. `PERCEPTEYE_HOME` relocates everything this package writes (default `~/.percepteye`) — both the production turn capture under `$PERCEPTEYE_HOME/captured/<agentId>/` and the training rollout outbox under `$PERCEPTEYE_HOME/outbox/<agentId>/`. `PERCEPTEYE_CAPTURE_DIR` overrides just the capture directory. `PERCEPTEYE_TRAJECTORY_DIR` names where a training rollout's tool outcomes are appended; **whoever runs the rollout sets it** — this plugin only reads it. (It used to say the rollout driver set it per rollout. Nothing in `src/` ever has: with the variable unset, training-mode tool outcomes are not written at all.)
 
 One host setting is not ours and has no environment form: `plugins.entries.agent-flywheel.hooks.allowConversationAccess`, which OpenClaw itself requires before it will deliver conversation hooks to a non-bundled plugin. See [Install](#-install-in-one-call).
 

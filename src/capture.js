@@ -78,6 +78,8 @@ import {
 } from "./host.js";
 import { ControlPlaneClient, SDK_UA } from "./http.js";
 import { inputFromLlmInput, operationsFromRun } from "./model-boundary.js";
+import { pathSegment } from "./outbox.js";
+import { resolveServedAgent, scopeDecision } from "./scope.js";
 import { percepteyeHome } from "./session.js";
 import {
   AttachTransport, declareRulebook, rulesNeverSent, sentence,
@@ -89,7 +91,9 @@ import {
   turnFeedbackOnASpan,
 } from "./wire.js";
 import { recordTurnFeedbackSpan } from "./tracing.js";
+import { TOOL_CALLS_FILENAME } from "./trajectory.js";
 import {
+  CONVERSATION_ID_FILENAME, TURNS_FILENAME,
   listTurnDirs, readConversationId, readModelBoundary, readTaskId,
   recordConversationId,
   recordModelBoundary, recordTaskId, recordTurnText,
@@ -247,9 +251,43 @@ export const UNANSWERED_SETTLE_MS = 5 * 60_000;
  */
 export const UPLOADED_INDEX = ".uploaded";
 
-/** Where captured production turns live when nothing else says. */
-export function captureRoot(env = process.env) {
-  return env.PERCEPTEYE_CAPTURE_DIR || join(percepteyeHome(env), "captured");
+/**
+ * Where captured production turns live when nothing else says:
+ * `<home>/captured/<agent>`, keyed by AGENT with the rule the outbox is
+ * (`pathSegment`). Two installs sharing one home -- two agents on one host --
+ * used to share one root, and each uploaded the other's turns and outcomes
+ * under its own id and its own consent. `PERCEPTEYE_CAPTURE_DIR`, when set,
+ * is the operator's exact choice and is used as given.
+ */
+export function captureRoot(env = process.env, agentId = null) {
+  return env.PERCEPTEYE_CAPTURE_DIR
+    || join(legacyCaptureRoot(env), pathSegment(agentId ?? "agent"));
+}
+
+/**
+ * The unkeyed root releases before `captureRoot` was keyed by agent wrote
+ * into. LEFT WHERE IT IS: whatever it holds was captured for every agent the
+ * host ran under one id, so no one agent can upload it as its own -- moving
+ * it under the configured agent would do exactly what keying exists to stop.
+ * `registerTurnCapture` says once that it is there.
+ */
+export function legacyCaptureRoot(env = process.env) {
+  return join(percepteyeHome(env), "captured");
+}
+
+/** Whether `legacyCaptureRoot` still holds a turn an earlier release wrote:
+ * a directory with a turn's own files in it (an agent's keyed root holds
+ * turn DIRECTORIES, never these). Stops at the first. Never throws. */
+function legacyTurnsRemain(env) {
+  try {
+    for (const entry of readdirSync(legacyCaptureRoot(env), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = join(legacyCaptureRoot(env), entry.name);
+      if ([TURNS_FILENAME, TOOL_CALLS_FILENAME, CONVERSATION_ID_FILENAME]
+        .some((name) => existsSync(join(dir, name)))) return true;
+    }
+  } catch { /* no legacy root */ }
+  return false;
 }
 
 /**
@@ -494,9 +532,35 @@ export function captureRefusal(err) {
  * Exact host ids need no in-memory state. An invalid host id gets a fresh
  * storage-safe id instead of being rewritten; that one exceptional mapping is
  * bounded and exists only to keep the same run's observer hooks joined.
+ *
+ * ONLY THIS AGENT'S OWN TURNS. The host runs every hook for every agent,
+ * subagent and cron session a gateway serves, and capture used to record all
+ * of them -- uploaded under this agent's id and this agent's consent. Every
+ * hook now asks `scopeDecision` against `servedAgent` (`resolveServedAgent`),
+ * the one predicate the serving policy's two halves ask: a run it refuses is
+ * not recorded at all, and each distinct reason is said once.
  */
-export function createTurnCapture({ root, logger = null }) {
+export function createTurnCapture({ root, logger = null, servedAgent = null }) {
   let warned = false;
+  const served = servedAgent ?? resolveServedAgent({});
+  // Once per DISTINCT reason, not per run: this sits in front of every turn.
+  const saidScope = new Set();
+  const inScope = (event, ctx) => {
+    // `message_received` puts the session key on the EVENT; the agent hooks
+    // put it, and the agent id, on the context.
+    const scoped = {
+      ...(ctx && typeof ctx === "object" ? ctx : {}),
+      sessionKey: ctx?.sessionKey ?? event?.sessionKey,
+      agentId: ctx?.agentId ?? event?.agentId,
+    };
+    const decision = scopeDecision(scoped, served);
+    if (!decision.apply && !saidScope.has(decision.reason) && saidScope.size < 64) {
+      saidScope.add(decision.reason);
+      logger?.info?.(
+        `[agent-flywheel] a run was NOT captured -- ${decision.reason}.`);
+    }
+    return decision.apply;
+  };
   // THE SECOND CONSENT TIER, asked at the moment of recording. Until the
   // uploader is wired (`gateModelContent`), and whenever the control plane
   // has not said `model_content: true`, nothing a model call saw is written.
@@ -538,6 +602,7 @@ export function createTurnCapture({ root, logger = null }) {
 
   /** The end user's message. */
   function onMessageReceived(event, ctx = {}) {
+    if (!inScope(event, ctx)) return false;
     const runId = event?.runId ?? ctx?.runId;
     const text = event?.content;
     const turnId = turnIdFor(runId);
@@ -567,7 +632,7 @@ export function createTurnCapture({ root, logger = null }) {
    * of this hook, and it records nothing without model-content consent.
    */
   function onLlmInput(event, ctx = {}) {
-    if (!mayRecordModelContent()) return false;
+    if (!mayRecordModelContent() || !inScope(event, ctx)) return false;
     const turnId = turnIdFor(event?.runId ?? ctx?.runId);
     if (turnId === null) return false;
     try {
@@ -602,6 +667,7 @@ export function createTurnCapture({ root, logger = null }) {
 
   /** The agent's answer. */
   function onAgentEnd(event, ctx = {}) {
+    if (!inScope(event, ctx)) return false;
     const runId = event?.runId ?? ctx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
@@ -640,6 +706,7 @@ export function createTurnCapture({ root, logger = null }) {
    * with no `message_received` (a terminal session) has no other writer.
    */
   function resolveToolDir(callCtx) {
+    if (!inScope(null, callCtx)) return null;
     const runId = callCtx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return null;
@@ -653,6 +720,7 @@ export function createTurnCapture({ root, logger = null }) {
 
   /** Bind a reconciled identity to this exact host-declared turn. */
   function onExecutionIdentity(event, ctx = {}, observation) {
+    if (!inScope(event, ctx)) return false;
     const runId = event?.runId ?? ctx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null || !observation) return false;
@@ -668,7 +736,7 @@ export function createTurnCapture({ root, logger = null }) {
   }
 
   return {
-    onMessageReceived, onAgentEnd, onExecutionIdentity, onLlmInput,
+    root, onMessageReceived, onAgentEnd, onExecutionIdentity, onLlmInput,
     gateModelContent, resolveToolDir,
   };
 }
@@ -1683,7 +1751,17 @@ export function registerTurnCapture(api, {
   makeTransport = defaultTransport, declaration = null,
 }) {
   if (!turns || typeof api?.on !== "function") return null;
-  const root = captureRoot(env);
+  // The store's own root: one answer to where this agent's turns are, the
+  // one its hooks write to.
+  const root = turns.root ?? captureRoot(env, config.agentId);
+  if (!env.PERCEPTEYE_CAPTURE_DIR && root !== legacyCaptureRoot(env)
+      && legacyTurnsRemain(env)) {
+    logger?.info?.(
+      `[${pluginId}] turns an earlier release captured are in ` +
+      `${legacyCaptureRoot(env)}, unkeyed by agent; they are not uploaded, ` +
+      `because they cannot be attributed to one agent. This agent's turns ` +
+      `are now captured to ${root}.`);
+  }
 
   // RETENTION, only when the operator asked for it: the Python SDK's
   // `attach(retention_turns=...)`. A value that is not a whole number of turns
