@@ -419,7 +419,7 @@ export function createRolloutDriver({
         // one outcome that has to be SAID rather than discovered from a
         // requeued rollout twenty minutes later.
         state.stopped = true;
-        heartbeats.delete(sessionKey);
+        if (heartbeats.get(sessionKey) === state) heartbeats.delete(sessionKey);
         note(
           `[agent-flywheel] rollout ${rollout.rolloutId}'s lease can no longer ` +
           `be renewed because its heartbeat could not be scheduled ` +
@@ -428,10 +428,26 @@ export function createRolloutDriver({
         );
       }
     };
-    /** The lease is gone. Returns nothing; sets `state.stopped`. */
+    /**
+     * The lease is gone. Returns nothing; sets `state.stopped`.
+     *
+     * ONLY FOR THE STATE STILL IN FORCE. A heartbeat's answer can arrive
+     * after its rollout was reported and the session moved on -- to an
+     * ordinary turn, or to the NEXT rollout -- and a late 410 used to act on
+     * whatever the session held by then: it added the session to
+     * `blockNextRun` (the next ordinary turn was refused as
+     * `percepteye_lease_lost`), deleted the successor's heartbeat without
+     * clearing its timer, wiped its model-call count, fenced its tools and
+     * cancelled its run. A state that is no longer the session's touches
+     * nothing.
+     */
     const onLeaseLost = async () => {
+      const current = heartbeats.get(sessionKey) === state;
       state.stopped = true;
+      if (!current) return;
       heartbeats.delete(sessionKey);
+      if (state.timer !== null) heartbeatCanceller(state.timer);
+      state.timer = null;
       if (reporting.get(sessionKey) === rollout) {
         // The terminal result request races this heartbeat. It owns the
         // authoritative outcome now; a 410 here can simply mean that the
@@ -503,6 +519,10 @@ export function createRolloutDriver({
       try {
         await transport.heartbeat(rollout);
       } catch (err) {
+        // Stopped while the request was out (reported, given back, or
+        // superseded): its answer is about a rollout this session no longer
+        // runs, and acting on it is the incident `onLeaseLost` describes.
+        if (state.stopped) return;
         try {
           if (err instanceof LeaseLost || err?.name === "LeaseLost") {
             await onLeaseLost();

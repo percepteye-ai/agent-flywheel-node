@@ -945,6 +945,60 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(d.reporting.has("s1"), false);
   });
 
+  it("a 410 that lands after the rollout was reported touches nothing the session has since", async () => {
+    // ND-C2. The heartbeat is in flight when the report completes; its 410
+    // arrives after cleanup. It used to block the NEXT ordinary turn
+    // (percepteye_lease_lost) and tear down a successor rollout's state.
+    const scheduled = [];
+    const cancelled = [];
+    let answerHeartbeat;
+    let claims = 0;
+    const d = createRolloutDriver({
+      env: testEnv(),
+      transport: {
+        leaseMs: 3_000,
+        async claim() {
+          claims += 1;
+          return { rollouts: [{
+            rolloutId: `r-late-${claims}`, turnInput: "work", leaseToken: `lease-${claims}`,
+          }] };
+        },
+        heartbeat: () => new Promise((_, reject) => {
+          answerHeartbeat = () => reject(new LeaseLost("result already closed lease"));
+        }),
+        async report() {},
+        async abandon() {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+      cancel: async (request) => { cancelled.push(request); return true; },
+      heartbeatScheduler: (callback) => {
+        scheduled.push({ callback, cancelled: false });
+        return scheduled.at(-1);
+      },
+      heartbeatCanceller(token) { token.cancelled = true; },
+    });
+    await d.onSessionStart({ sessionKey: "s1" });
+    d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-1" });
+    const inFlightBeat = scheduled[0].callback();
+    await d.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1", runId: "run-1" },
+    );
+    // The session moves on to its next rollout before the 410 lands.
+    const second = await d.onSessionStart({ sessionKey: "s1" });
+    assert.equal(second.rolloutId, "r-late-2");
+    const successor = d.heartbeats.get("s1");
+    answerHeartbeat();
+    await inFlightBeat;
+    assert.equal(d.blockNextRun.has("s1"), false, "the next turn is not refused");
+    assert.equal(d.revokedRuns.has("s1"), false);
+    assert.equal(d.heartbeats.get("s1"), successor, "the successor's renewal is untouched");
+    assert.equal(successor.stopped, false);
+    assert.equal(d.inFlight.get("s1")?.rolloutId, "r-late-2");
+    assert.deepEqual(cancelled, []);
+    assert.equal(d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-2" }), undefined);
+  });
+
   it("paces a long initial grant against the ten-minute renewal ceiling", async () => {
     const scheduled = [];
     const d = createRolloutDriver({
