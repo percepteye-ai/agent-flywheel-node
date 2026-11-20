@@ -1231,11 +1231,8 @@ export function createTurnUploader({
    * on to upload. A read that answered nothing (a blip, `answered: false`)
    * changes nothing: it must never revoke what was granted.
    *
-   * THE NO THAT ENDS THE WAITING. Outcomes reported while the answer was
-   * unknown were kept for this answer; an answered no means nothing will ever
-   * send them, so they are deleted (`purgeUnansweredOutcomes`), exactly as
-   * `reportOutcome` keeps none after a no. Only when the answer WAS unknown:
-   * outcomes kept after an intake 403 or an earlier answered no stay.
+   * The answer lands at `takeAnsweredVerdict`, the seam the startup read
+   * (`setVerdict`) lands at too.
    */
   async function recheck() {
     if (typeof transport?.captureCurrent !== "function") return;
@@ -1248,23 +1245,47 @@ export function createTurnUploader({
     }
     // Overtaken while in flight (a 403 meanwhile): the fresher answer stands.
     if (asked !== epoch || !v.answered) return;
+    await takeAnsweredVerdict(v);
+  }
+
+  /**
+   * THE ONE SEAM an ANSWERED verdict lands at, whichever read delivered it:
+   * the startup read (`setVerdict`, from `announce`) or the re-read
+   * (`recheck`). The Python SDK's `Attachment._take_capture_verdict`.
+   *
+   * A yes turns both tiers on as the verdict says. An answered no goes
+   * through `refuseUpload` and, when the answer had been unknown until now,
+   * deletes the outcomes that waited on it (`purgeUnansweredOutcomes`): an
+   * answered no means nothing will ever send them, exactly as `reportOutcome`
+   * keeps none after a no. That second step used to run on the re-read alone,
+   * so a process that learned its no AT STARTUP never purged what an earlier
+   * process had kept while the control plane was unreachable, and those
+   * outcomes uploaded once consent was granted. Outcomes kept after THIS
+   * process's intake 403 are not unknown ones (`consentRefused` is already
+   * true) and stay.
+   *
+   * The state changes before the first await, so a caller that does not
+   * await sees the verdict at once. Never rejects.
+   */
+  async function takeAnsweredVerdict(v) {
     if (!v.mayUpload) {
       const wasUnknown = !mayUpload && !consentRefused;
-      refuseUpload(v.reason);
+      refuseUpload(v.reason ?? null);
       if (wasUnknown) await purgeUnansweredOutcomes();
       return;
     }
     mayUpload = true;
     refusal = null;
     consentRefused = false;
-    mayCaptureModelContent = v.mayCaptureModelContent;
-    modelContentReason = mayCaptureModelContent ? null : v.modelContentReason;
+    mayCaptureModelContent = v.mayCaptureModelContent === true;
+    modelContentReason = mayCaptureModelContent ? null
+      : (v.modelContentReason ?? null);
     epoch += 1;
   }
 
   /**
    * The control plane said NO: the intake's 403, or an answered verdict
-   * re-read by `recheck`. Stop sending, say why.
+   * (`takeAnsweredVerdict`). Stop sending, say why.
    *
    * THE PYTHON SDK'S `_refuse_upload`, and the one place `mayUpload` turns
    * false after it was true. A trace rides on a turn, so a refused turn
@@ -2027,18 +2048,31 @@ export function createTurnUploader({
      * Record the control plane's verdict. Until this runs, nothing uploads.
      * `since`, when given, is `verdictEpoch` as it was when the verdict was
      * ASKED: a verdict overtaken meanwhile (a 403 arrived) is not applied.
+     *
+     * An ANSWERED verdict lands at `takeAnsweredVerdict`, the seam the
+     * re-read lands at, so an answered no at startup deletes the outcomes an
+     * earlier process kept waiting on it. Returns that promise (it never
+     * rejects); the consent state has changed by the time this returns.
      */
     setVerdict(v, { since = null } = {}) {
       announced = true;
-      if (since !== null && since !== epoch) return;
+      if (since !== null && since !== epoch) return Promise.resolve();
+      // `captureVerdict`'s `answered: false` is no answer.
+      if (v?.answered !== false) {
+        return takeAnsweredVerdict({
+          mayUpload: Boolean(v?.mayUpload),
+          reason: v?.reason ?? null,
+          mayCaptureModelContent: v?.mayCaptureModelContent === true,
+          modelContentReason: v?.modelContentReason ?? v?.reason ?? null,
+        });
+      }
       epoch += 1;
-      mayUpload = Boolean(v?.mayUpload);
+      mayUpload = false;
       refusal = v?.reason ?? null;
-      // An answered no; `captureVerdict`'s `answered: false` is no answer.
-      consentRefused = !mayUpload && v?.answered !== false;
-      mayCaptureModelContent = mayUpload && v?.mayCaptureModelContent === true;
-      modelContentReason = mayCaptureModelContent ? null
-        : (v?.modelContentReason ?? refusal);
+      consentRefused = false;
+      mayCaptureModelContent = false;
+      modelContentReason = v?.modelContentReason ?? refusal;
+      return Promise.resolve();
     },
     /**
      * One turn happened. Kicks a flush when the cadence is due.
@@ -2509,9 +2543,9 @@ export function announce({ transport, uploader, config, pluginId, logger }) {
   const since = uploader.verdictEpoch ?? null;
   return Promise.resolve()
     .then(() => transport.captureCurrent(config.agentId))
-    .then((response) => {
+    .then(async (response) => {
       const v = captureVerdict(response);
-      uploader.setVerdict(v, { since });
+      await uploader.setVerdict(v, { since });
       logger?.info?.(v.mayUpload
         ? `[${pluginId}] production capture is ENABLED for '${config.agentId}'; ` +
           `turns upload every ${FLUSH_EVERY} turns and at shutdown.`

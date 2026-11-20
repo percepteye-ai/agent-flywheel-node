@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  createTurnUploader, OUTCOME_MAX_AGE_MS, OUTCOME_SPLIT_MAX_REQUESTS,
+  announce, createTurnUploader, OUTCOME_MAX_AGE_MS, OUTCOME_SPLIT_MAX_REQUESTS,
   pruneTurns, registerTurnCapture, createTurnCapture,
 } from "../src/capture.js";
 import { TransportError } from "../src/errors.js";
@@ -358,6 +358,46 @@ describe("reportOutcome: consent not yet known", () => {
     assert.ok(warnings.some((w) => w.includes("1 reported outcome(s)")
       && w.includes("opt-in per agent")));
     assert.deepEqual(tr.outcomes.map((o) => o.outcome_id), [episode]);
+  });
+
+  it("deletes what an earlier process kept when this one's startup read answers no", async () => {
+    // An earlier process kept outcomes while the control plane could not
+    // answer; this one's STARTUP read (`announce`) answers no. That no lands
+    // at the seam the re-read's no lands at, so what waited on it is deleted
+    // -- once only `recheck` purged, and these uploaded the day consent was
+    // granted. An outcome naming only an episode never waited and stays. The
+    // Python SDK's test_an_answered_no_at_startup_deletes_what_an_earlier_process_kept.
+    // Mutation: `setVerdict` sets the refused state without the seam -> the
+    // outcome stays, red.
+    const root = tmp();
+    const first = createTurnUploader({
+      transport: fakeTransport({ outcomesRaise: new TransportError("connection reset") }),
+      agentId: "a1", root,
+    });
+    first.setVerdict({ mayUpload: false, reason: "no answer", answered: false });
+    assert.ok(first.reportOutcome("resolved", { turnId: "t1" }));
+    const episode = first.reportOutcome("resolved", { episodeId: "rl_ep1" });
+    await settle(first);
+    assert.equal(pending(root).length, 2);
+
+    const warnings = [];
+    const tr = fakeTransport({ outcomesRaise: new TransportError("connection reset") });
+    tr.captureCurrent = async () => ({
+      capture: { turns: false, reason: "opt-in per agent" } });
+    const logger = { warn: (m) => warnings.push(m), info() {} };
+    const second = createTurnUploader({ transport: tr, agentId: "a1", root, logger });
+    const v = await announce({
+      transport: tr, uploader: second, config: { agentId: "a1" },
+      pluginId: "p", logger,
+    });
+    assert.equal(v.answered, true);
+    assert.equal(second.mayUpload, false);
+    assert.equal(second.refusal, "opt-in per agent");
+    assert.deepEqual(
+      pending(root).map((n) => JSON.parse(readFileSync(join(root, n), "utf8")).outcome_id),
+      [episode]);
+    assert.ok(warnings.some((w) => w.includes("1 reported outcome(s)")
+      && w.includes("opt-in per agent")));
   });
 
   it("keeps the outcomes an intake 403 left when the read later answers no", async () => {
