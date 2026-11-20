@@ -114,22 +114,18 @@ function overHttp(routes) {
 
 /** Let the flush a report kicks finish, then flush once more and return it. */
 async function settle(u) {
-  for (let i = 0; i < 50; i += 1) {
-    const r = await u.flush();
-    if (!r.skipped) return r;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("the kicked flush never finished");
+  // `reportOutcome` kicks a flush it does not await. A flush asked for while
+  // one runs is that one's coalesced rerun, so awaiting this one waits the
+  // kicked one out. (It used to answer `{skipped: true}` and be polled;
+  // `skipped` is now the count of unanswered turns held back.)
+  return u.flush();
 }
 
-/** Wait out the kicked flush WITHOUT starting another. */
+/** Wait out the kicked flush: one asked for meanwhile is its coalesced
+ *  rerun, after a beat for the kicked one to start. */
 async function idle(u) {
-  for (let i = 0; i < 200; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-    const r = await u.flush();
-    if (!r.skipped) return r;
-  }
-  throw new Error("the kicked flush never finished");
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  return u.flush();
 }
 
 const said = (warnings, ...words) =>

@@ -98,13 +98,11 @@ function overHttp(routes) {
 
 /** Queue without the kicked flush racing the test's own. */
 async function settle(u) {
-  // `reportOutcome` kicks a flush it does not await; let it finish.
-  for (let i = 0; i < 50; i += 1) {
-    const r = await u.flush();
-    if (!r.skipped) return r;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("the kicked flush never finished");
+  // `reportOutcome` kicks a flush it does not await. A flush asked for while
+  // one runs is that one's coalesced rerun, so awaiting this one waits the
+  // kicked one out. (It used to answer `{skipped: true}` and be polled;
+  // `skipped` is now the count of unanswered turns held back.)
+  return u.flush();
 }
 
 describe("reportOutcome: the happy path", () => {
@@ -334,18 +332,52 @@ describe("reportOutcome: consent not yet known", () => {
     assert.deepEqual(pending(root), []);
   });
 
-  it("is a no-op again once the control plane answers no", async () => {
+  it("is a no-op again once the control plane answers no, and what waited is deleted", async () => {
+    // Only the control plane's answered no ends the waiting: what was kept
+    // for that answer is deleted, since nothing will ever send it, and
+    // nothing new is kept. An outcome naming only an episode never waited on
+    // consent and stays (and is sent). The Python SDK's
+    // test_an_explicit_no_learned_later_makes_reporting_a_no_op_again.
+    // Changed: it pinned the waiting outcome left on disk after the no.
+    // Mutation: drop the purge from `recheck` -> the outcome stays, red.
     const root = tmp();
+    const warnings = [];
     const tr = fakeTransport();
     tr.captureCurrent = async () => ({
       capture: { turns: false, reason: "opt-in per agent" } });
-    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    const u = createTurnUploader({
+      transport: tr, agentId: "a1", root, logger: { warn: (m) => warnings.push(m) },
+    });
     assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
+    const episode = u.reportOutcome("resolved", { episodeId: "rl_ep1" });
+    assert.ok(episode);
     await settle(u);
     assert.equal(u.refusal, "opt-in per agent");
     assert.equal(u.reportOutcome("reopened", { turnId: "t1" }), null);
+    assert.deepEqual(pending(root), [], "the consent-gated outcome is purged");
+    assert.ok(warnings.some((w) => w.includes("1 reported outcome(s)")
+      && w.includes("opt-in per agent")));
+    assert.deepEqual(tr.outcomes.map((o) => o.outcome_id), [episode]);
+  });
+
+  it("keeps the outcomes an intake 403 left when the read later answers no", async () => {
+    // They were not waiting on an unknown answer: the 403 was the answer,
+    // and they stay for their week like a refused turn. Mutation: purge on
+    // every answered no -> deleted, red.
+    const root = tmp();
+    const tr = fakeTransport({ outcomesRaise: new TransportError(
+      "POST /outcomes -> HTTP 403: capture is off", { statusCode: 403 }) });
+    tr.captureCurrent = async () => ({
+      capture: { turns: false, reason: "opt-in per agent" } });
+    const u = createTurnUploader({ transport: tr, agentId: "a1", root });
+    u.setVerdict({ mayUpload: true, mayCaptureModelContent: true });
+    assert.ok(u.reportOutcome("resolved", { turnId: "t1" }));
+    await settle(u);
+    assert.equal(u.mayUpload, false);
     assert.equal(pending(root).length, 1);
-    assert.deepEqual(tr.outcomes, []);
+    await settle(u);
+    assert.equal(u.refusal, "opt-in per agent", "the read was asked and answered");
+    assert.equal(pending(root).length, 1);
   });
 
   it("treats a verdict that did not answer as unknown, not as a no", () => {
@@ -377,7 +409,10 @@ describe("reportOutcome: consent not yet known", () => {
                    "a definitive answer is no longer 'unknown'");
       assert.match(u.refusal, /did not grant/);
       if (answer[0] !== 200) assert.match(u.refusal, new RegExp(`HTTP ${answer[0]}`));
-      assert.equal(pending(root).length, 1, "kept like a refused turn");
+      // Changed: it pinned the outcome kept. Kept for an answer that came
+      // back no, nothing will ever send it.
+      assert.deepEqual(pending(root), [],
+        "kept for an answer that came back no: nothing will send it");
     });
   }
 

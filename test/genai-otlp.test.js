@@ -17,7 +17,7 @@ import { pythonFile } from "./support/python-sdk.js";
 
 import {
   RESPONSE_FORMAT_ATTR, SCOPE_NAME, contentJson, newSpanId, newTraceId,
-  observationFromLines, renderTurnTrace, requestedOutputFormat,
+  observationFromLines, operationRecord, renderTurnTrace, requestedOutputFormat,
 } from "../src/genai-otlp.js";
 
 const GOLDEN_URL = new URL("./fixtures/genai-capture-golden.json", import.meta.url);
@@ -270,5 +270,20 @@ describe("values the wire cannot carry (ND-M18)", () => {
       requestedOutputFormat({ response_mime_type: "application/json",
         responseMimeType: "text/plain", responseSchema: { type: "OBJECT" } }),
       { response_mime_type: "application/json", responseSchema: { type: "OBJECT" } });
+  });
+});
+
+describe("recorded model content is always valid JSON", () => {
+  it("writes a non-finite number as null, as the Python SDK now does", () => {
+    // The Python SDK's test_a_non_finite_number_is_written_as_null_never_as_
+    // invalid_json: json.dumps wrote NaN/Infinity, which no JSON parser reads.
+    // Pinned here so the two stay one rule.
+    const value = { score: NaN, up: [Infinity, 1.5], down: [-Infinity] };
+    for (const line of [contentJson(value), operationRecord({ result: value })]) {
+      assert.ok(!/NaN|Infinity/.test(line), line);
+      JSON.parse(line);
+    }
+    assert.deepEqual(JSON.parse(contentJson(value)),
+      { score: null, up: [null, 1.5], down: [null] });
   });
 });

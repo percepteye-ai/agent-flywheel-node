@@ -78,9 +78,57 @@ describe("a turn batch the intake refuses", () => {
     assert.equal(counts.sent, 8);
     assert.equal(counts.dropped, 1);
     assert.ok(warnings.some((w) => w.includes("HTTP 413")));
+    // Marked uploaded, never deleted: the directory is the customer's copy.
+    assert.ok(existsSync(turnDir(root, "t5")));
+    assert.ok(u.uploadedIds().has("t5"));
     const tried = tr.tried.length;
     await u.flush();
     assert.equal(tr.tried.length, tried, "the dropped turn is not sent again");
+  });
+
+  it("drops a turn refused for its own content, marked uploaded and counted", async () => {
+    // A 422 about one record, isolated by the split: its other half was
+    // taken, so the refusal is the record's own.
+    const root = tmp();
+    for (const id of ["a", "b", "c", "d"]) answered(root, id);
+    const tr = turnRoute((batch) => (batch.includes("c") ? [422, "bad turn"] : null));
+    const { u } = uploader(root, tr);
+    const counts = await u.flush();
+    assert.deepEqual([counts.sent, counts.dropped, counts.failed ?? 0], [3, 1, 0]);
+    assert.ok(existsSync(turnDir(root, "c")) && u.uploadedIds().has("c"));
+  });
+
+  it("says a whole-batch refusal of turns without the outcomes' week", async () => {
+    // Turns are the customer's copy and never expire. Mutation: the
+    // outcomes' wording for every kind -> "week", red.
+    const root = tmp();
+    for (let n = 0; n < 6; n += 1) answered(root, `t${n}`);
+    const tr = turnRoute(() => [422, "unknown field"]);
+    const { u, warnings } = uploader(root, tr);
+    const counts = await u.flush();
+    assert.deepEqual([counts.sent, counts.failed, counts.dropped ?? 0], [0, 6, 0]);
+    const said = warnings.filter((w) => w.includes("whole batches"));
+    assert.equal(said.length, 1);
+    assert.ok(!said[0].includes("week"), said[0]);
+    assert.equal(u.uploadedIds().size, 0, "nothing marked uploaded");
+  });
+
+  it("counts what it held back and what it could not read", async () => {
+    // The Python SDK's flush counts: an unanswered turn held back is
+    // `skipped`, a turn that cannot be rendered is `failed` -- even when
+    // nothing else was pending. Mutation: drop either count -> red.
+    const root = tmp();
+    const cap = createTurnCapture({ root });
+    cap.onMessageReceived({ runId: "waiting", content: "hi", sessionKey: "c" }, HOST);
+    // A directory whose name is no turn id (leading whitespace, which every
+    // platform's file system keeps) cannot be rendered on the wire.
+    const broken = join(root, " not-an-id");
+    mkdirSync(broken);
+    writeFileSync(join(broken, "turns.jsonl"), '{"kind":"task","text":"x"}\n');
+    const tr = turnRoute(() => null);
+    const { u } = uploader(root, tr);
+    const counts = await u.flush();
+    assert.deepEqual([counts.sent, counts.skipped, counts.failed], [0, 1, 1]);
   });
 
   it("stops the flush on a transport failure instead of trying every chunk", async () => {
@@ -123,7 +171,51 @@ describe("a lone record refused for what is not its own", () => {
     const counts = await u.flush();
     assert.equal(readdirSync(root).filter((n) => n.startsWith(OUTCOME_FILE_PREFIX)).length, 1);
     assert.deepEqual([counts.outcomesFailed ?? 0, counts.outcomesDropped ?? 0], [1, 0]);
-    assert.ok(warnings.some((w) => w.includes("whole batches")));
+    // Said as what it is: a batch of one, not "whole batches" (changed).
+    assert.ok(warnings.some((w) => w.includes("batch of one")));
+    tr.reportOutcomes = async (_a, outcomes) => ({ outcomes: outcomes.map((o) => ({
+      outcome_id: o.outcome_id, accepted: true })) });
+    assert.equal((await u.flush()).outcomesSent, 1, "it goes with the next");
+  });
+
+  it("keeps a lone turn the same way", async () => {
+    // Mutation: drop the batch-of-one rule -> the turn is marked uploaded on
+    // a 422 every batch would draw, and never sent, red.
+    const root = tmp();
+    answered(root, "only");
+    let refuse = true;
+    const tr = turnRoute(() => (refuse ? [422, "unknown field"] : null));
+    const { u, warnings } = uploader(root, tr);
+    const counts = await u.flush();
+    assert.deepEqual([counts.sent, counts.failed, counts.dropped ?? 0], [0, 1, 0]);
+    assert.equal(u.uploadedIds().has("only"), false);
+    assert.ok(warnings.some((w) => w.includes("batch of one")));
+    refuse = false;
+    assert.equal((await u.flush()).sent, 1);
+  });
+
+  it("keeps a lone per-turn feedback report the same way", async () => {
+    const root = tmp();
+    const tr = turnRoute(() => null);
+    let refuse = true;
+    const sent = [];
+    tr.reportTurnFeedback = async (_a, feedback) => {
+      if (refuse) {
+        throw new TransportError("POST /turn-feedback -> HTTP 422: unknown field",
+          { statusCode: 422 });
+      }
+      sent.push(...feedback.map((f) => f.feedback_id));
+      return { feedback: feedback.map((f) => ({ feedback_id: f.feedback_id, accepted: true })) };
+    };
+    const { u } = uploader(root, tr);
+    const id = u.reportTurnFeedback("accepted", { episodeId: "rl_ep1", turnIndex: 0 });
+    assert.ok(id);
+    const counts = await u.flush();
+    assert.deepEqual([counts.feedbackFailed, counts.feedbackDropped], [1, 0]);
+    assert.equal(readdirSync(root).filter((n) => n.startsWith(".feedback.")).length, 1);
+    refuse = false;
+    await u.flush();
+    assert.deepEqual(sent, [id]);
   });
 });
 

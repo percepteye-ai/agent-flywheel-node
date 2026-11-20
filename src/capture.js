@@ -1174,6 +1174,10 @@ export function createTurnUploader({
    * kicked the flush has returned before anything is listed; then ONE
    * listing (`scanTurns`, `fs.promises`) gives every turn's index at once,
    * and the turns are read a few at a time between yields.
+   *
+   * `{turns, skipped, failed}`: an unanswered turn held back is `skipped`, a
+   * turn that cannot be rendered is `failed` (counted on every flush it
+   * stays unreadable), as the Python SDK's flush counts them.
    */
   async function pending({ includeUnanswered, quietBefore = null }) {
     await yieldToLoop();
@@ -1182,6 +1186,8 @@ export function createTurnUploader({
     const already = await uploadedIdsAsync();
     const out = [];
     let read = 0;
+    let skipped = 0;
+    let failed = 0;
     for (const t of turns) {
       if (already.has(t.name)) continue;
       if (++read % 8 === 0) await yieldToLoop();
@@ -1195,18 +1201,20 @@ export function createTurnUploader({
       } catch {
         // One unreadable turn costs that turn. A truncated trajectory is the
         // EXPECTED case here, not an exotic one.
+        failed += 1;
         continue;
       }
       if (!wire) continue;
       if (wire.final_text === null) {
-        if (!includeUnanswered) continue;
-        if (quietBefore !== null && await lastWrittenAt(t.path) > quietBefore) {
+        if (!includeUnanswered
+            || (quietBefore !== null && await lastWrittenAt(t.path) > quietBefore)) {
+          skipped += 1;
           continue;
         }
       }
       out.push(wire);
     }
-    return out;
+    return { turns: out, skipped, failed };
   }
 
   /**
@@ -1222,6 +1230,12 @@ export function createTurnUploader({
    * turned off, so neither tier is still on when the flush that asked goes
    * on to upload. A read that answered nothing (a blip, `answered: false`)
    * changes nothing: it must never revoke what was granted.
+   *
+   * THE NO THAT ENDS THE WAITING. Outcomes reported while the answer was
+   * unknown were kept for this answer; an answered no means nothing will ever
+   * send them, so they are deleted (`purgeUnansweredOutcomes`), exactly as
+   * `reportOutcome` keeps none after a no. Only when the answer WAS unknown:
+   * outcomes kept after an intake 403 or an earlier answered no stay.
    */
   async function recheck() {
     if (typeof transport?.captureCurrent !== "function") return;
@@ -1235,7 +1249,9 @@ export function createTurnUploader({
     // Overtaken while in flight (a 403 meanwhile): the fresher answer stands.
     if (asked !== epoch || !v.answered) return;
     if (!v.mayUpload) {
+      const wasUnknown = !mayUpload && !consentRefused;
       refuseUpload(v.reason);
+      if (wasUnknown) await purgeUnansweredOutcomes();
       return;
     }
     mayUpload = true;
@@ -1272,6 +1288,30 @@ export function createTurnUploader({
       `turns and ${wasUploading ? "uploading has stopped" : "nothing is uploaded"}: ` +
       `${reason} The turns stay on disk, and uploading resumes on its own if ` +
       `capture is enabled again.`);
+  }
+
+  /**
+   * Delete the outcomes that waited on the consent answer, now that it is no.
+   * An outcome naming only an episode never waited on it
+   * (`namesOnlyAnEpisode`) and stays. Said once, with the count and the
+   * control plane's sentence. Never rejects. The Python SDK's
+   * `_purge_unanswered_outcomes`.
+   */
+  async function purgeUnansweredOutcomes() {
+    let dropped = 0;
+    for (const path of await queuedFilesAsync(OUTCOME_FILE_PREFIX)) {
+      let wire = null;
+      try { wire = JSON.parse(await readFile(path, "utf8")); } catch { /* deleted */ }
+      if (wire !== null && typeof wire === "object" && !Array.isArray(wire)
+          && namesOnlyAnEpisode(wire)) continue;
+      try { await rm(path); dropped += 1; } catch { /* kept */ }
+    }
+    if (dropped) {
+      logger?.warn?.(
+        `[agent-flywheel] ${dropped} reported outcome(s) kept while the ` +
+        `control plane had not answered were deleted: it answered that this ` +
+        `agent may not upload production traffic (${refusal})`);
+    }
   }
 
   /**
@@ -1787,15 +1827,14 @@ export function createTurnUploader({
       // A BATCH OF ONE, refused not for its size, cannot tell a refusal of
       // the record from a refusal of the batch -- a control plane on another
       // contract minor refuses every batch alike, the last record of a flush
-      // included. So it is KEPT, as a whole-batch refusal is; the week's
-      // expiry still bounds it. Only a record isolated by the split, whose
-      // other half was taken, is known to be refused for itself.
+      // included. So it is KEPT, said once as such, and the batches after it
+      // still go (the Python SDK's rule). Only a record isolated by the
+      // split, whose other half was taken, is known to be refused for itself.
       if (!halves && refused.length === 1 && refused[0].batch.length === 1
           && !outcomeRefusedForSize(refused[0].status)) {
-        failed += 1 + left();
-        queue.length = 0;
-        warnWholeBatchRefusal(kind, refused[0].cause);
-        break;
+        failed += 1;
+        warnWholeBatchRefusal(kind, refused[0].cause, { alone: true });
+        continue;
       }
       const split = [];
       for (const { batch, status, cause } of refused) {
@@ -1834,17 +1873,31 @@ export function createTurnUploader({
   /**
    * Say ONCE per kind and cause that the control plane refuses whole batches:
    * it holds for every flush until one side is upgraded, and a warning per
-   * flush would be a week of the same line. The Python SDK's
-   * `_warn_whole_batch_refusal`.
+   * flush would be a week of the same line. `alone`: the batch held one
+   * record, so which of the two it refused is unknown. The Python SDK's
+   * `_warn_whole_batch_refusal`, word for word.
    */
-  function warnWholeBatchRefusal(kind, cause) {
+  function warnWholeBatchRefusal(kind, cause, { alone = false } = {}) {
     if (batchRefusalSaid.get(kind.many) === cause) return;
     batchRefusalSaid.set(kind.many, cause);
+    if (alone) {
+      logger?.warn?.(
+        `[agent-flywheel] the control plane refused a batch of one of the ` +
+        `${kind.many} (${cause}); with nothing beside it, a refusal of the ` +
+        `record cannot be told from one of the batch, so it stays on disk ` +
+        `and is sent again with the next.`);
+      return;
+    }
+    // Turns are the customer's copy and never expire; the queued reports
+    // do, after a week.
+    const kept = kind === TURNS
+      ? "they stay on disk and are sent again on a later flush"
+      : "they stay on disk, are sent again on a later flush, and are " +
+        "dropped only after a week undelivered";
     logger?.warn?.(
       `[agent-flywheel] the control plane refused whole batches of ` +
       `${kind.many} (${cause}), which is about the batch, not a record in it; ` +
-      `they stay on disk, are sent again on a later flush, and are dropped ` +
-      `only after a week undelivered.`);
+      `${kept}.`);
   }
 
   /**
@@ -1922,11 +1975,19 @@ export function createTurnUploader({
     // yes: one read per flush, the Python SDK's cadence.
     if (announced && (!mayUpload || !mayCaptureModelContent)) await recheck();
     if (!mayUpload) return { sent: 0, notPermitted: true };
-    const turns = await pending({
+    const { turns, skipped, failed: unreadable } = await pending({
       includeUnanswered,
       quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
     });
-    if (!turns.length) return { sent: 0 };
+    // `skipped` and `failed` only when there are some; the unreadable ones
+    // are counted even when nothing else was pending -- a flush where every
+    // turn failed to render is not a flush with nothing to do.
+    const held = (counts) => {
+      if (skipped) counts.skipped = skipped;
+      if (unreadable) counts.failed = (counts.failed ?? 0) + unreadable;
+      return counts;
+    };
+    if (!turns.length) return held({ sent: 0 });
     // THE REPORTS' RULES (`sendReports`): a 403 stops sending, in the
     // intake's own words; a batch refused for a record is split until the
     // record stands alone and only it is dropped (marked sent, never resent);
@@ -1943,9 +2004,11 @@ export function createTurnUploader({
     });
     const counts = { sent: result.sent };
     if (result.failed) counts.failed = result.failed;
+    // Refused standing alone, or by name: marked sent, never resent, never
+    // deleted -- the turn directory is the customer's copy.
     if (result.dropped) counts.dropped = result.dropped;
     if (refused) counts.notPermitted = true;
-    return counts;
+    return held(counts);
   }
 
   return {
