@@ -17,13 +17,18 @@
 import "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync,
+  utimesSync, writeFileSync,
+} from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { LeaseLost, TransportError } from "../src/errors.js";
 import {
-  MAX_AGE_MS, OUTBOX_SCHEMA, createOutbox, outboxDir, spoolName,
+  CLAIM_STALE_MS, MAX_AGE_MS, OUTBOX_SCHEMA, createOutbox, outboxDir, pathSegment,
+  spoolName,
 } from "../src/outbox.js";
 import {
   ContractError, MAX_REPORTED_CHECKS, rolloutOutputToWire,
@@ -272,16 +277,37 @@ describe("the delivery mechanism cannot become the outage", () => {
       `the poisoned file was not quarantined by name: ${listing(dir)}`);
   });
 
-  it("quarantines a record whose envelope this SDK cannot use", async () => {
+  it("quarantines a record whose envelope no outbox writes", async () => {
     const dir = tmp();
     writeFileSync(join(dir, "r-b.json"),
-      JSON.stringify({ schema: "percepteye.outbox/v99", rollout_id: "r-b" }),
-      "utf8");
+      JSON.stringify({ schema: "something/else", rollout_id: "r-b" }), "utf8");
     const next = createOutbox({ dir, send: async () => {} });
     assert.equal(await next.drain(), 0);
     assert.deepEqual(retryable(dir), [],
-      "a record this SDK cannot send must leave the retry set, not be retried forever");
+      "a record nobody can send must leave the retry set, not be retried forever");
     assert.ok(listing(dir).includes("r-b.json.unreadable"));
+  });
+
+  it("leaves a record a NEWER SDK spooled exactly where it is (ND-H16)", async () => {
+    // OUTBOX_SCHEMA's promise: a future SDK's file is left alone rather than
+    // half-read. It was renamed out as .unreadable, so the SDK that wrote it
+    // -- after a downgrade and upgrade -- never found its own result again.
+    // This used to be pinned the other way round.
+    const dir = tmp();
+    const body = JSON.stringify({ schema: "percepteye.outbox/v99", rollout_id: "r-b" });
+    writeFileSync(join(dir, "r-b.json"), body, "utf8");
+    const sent = [];
+    const warns = [];
+    const next = createOutbox({
+      dir, send: async (r) => { sent.push(r); }, logger: { warn: (m) => warns.push(m) },
+    });
+    assert.equal(await next.drain(), 0);
+    assert.equal(await next.drain(), 0);
+    assert.deepEqual(sent, []);
+    assert.deepEqual(listing(dir), ["r-b.json"]);
+    assert.equal(readFileSync(join(dir, "r-b.json"), "utf8"), body);
+    assert.equal(warns.filter((w) => w.includes("newer SDK")).length, 1,
+      "named once, not on every pass");
   });
 
   it("stops retrying a result nobody has been able to deliver for a week", async () => {
@@ -541,5 +567,241 @@ describe("deliver never throws into the host hook", () => {
       warns.some((w) => w.includes("r-1") && w.includes("neither spooled nor reported")),
       `the failure did not name the rollout: ${JSON.stringify(warns)}`,
     );
+  });
+});
+
+/** A record as this SDK spools it, for a file "another process" left. */
+const spooled = (rolloutId, extra = {}) => JSON.stringify({
+  schema: OUTBOX_SCHEMA, rollout_id: rolloutId, first_seen_ts: Date.now(),
+  attempts: 0, last_error: null, output: { finalText: rolloutId }, ...extra,
+});
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+describe("one sender per file (ND-C8)", () => {
+  it("makes a second delivery of an id wait for the first, so neither loses the other", async () => {
+    // Without it the second delivery wrote the file, failed and held it --
+    // and the first one's success then deleted that file: a held result gone.
+    const dir = tmp();
+    let active = 0;
+    let most = 0;
+    const sent = [];
+    const outbox = createOutbox({
+      dir,
+      send: async (_r, output) => {
+        active += 1;
+        most = Math.max(most, active);
+        sent.push(output.finalText);
+        await sleep(output.finalText === "first" ? 30 : 0);
+        active -= 1;
+        if (output.finalText === "second") throw http(503);
+      },
+    });
+    const one = outbox.deliver(ROLLOUT, { finalText: "first" });
+    await sleep(5);
+    const two = outbox.deliver(ROLLOUT, { finalText: "second" });
+    assert.deepEqual([await one, await two], [true, false]);
+    assert.equal(most, 1, "two sends of one id ran at once");
+    assert.deepEqual(sent, ["first", "second"]);
+    assert.deepEqual(retryable(dir), [spoolName("r-1")],
+      "the held second result was deleted by the first one's success");
+    assert.equal(
+      JSON.parse(readFileSync(join(dir, spoolName("r-1")), "utf8")).output.finalText, "second");
+  });
+
+  it("writes through a temp file of its own, not a shared fixed name", async () => {
+    // `${path}.tmp` was every writer's temp file; a stray one (here a
+    // directory in its place) stopped the result being spooled at all.
+    const dir = tmp();
+    mkdirSync(join(dir, `${spoolName("r-1")}.tmp`), { recursive: true });
+    const outbox = createOutbox({ dir, send: async () => { throw http(503); } });
+    await outbox.deliver(ROLLOUT, OUTPUT);
+    assert.ok(retryable(dir).includes(spoolName("r-1")), `not spooled: ${listing(dir)}`);
+    assert.deepEqual(listing(dir).filter((n) => /\.\d+\.[0-9a-f]+\.tmp$/.test(n)), [],
+      "a temp file was left behind");
+  });
+
+  it("leaves a file another process is sending to that process", async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, spoolName("r-9")), spooled("r-9"));
+    writeFileSync(join(dir, `${spoolName("r-9")}.claim`), "4242.abc");
+    const sent = [];
+    const outbox = createOutbox({ dir, send: async (r) => { sent.push(r.rolloutId); } });
+    assert.equal(await outbox.drain(), 0);
+    assert.deepEqual(sent, [], "a result another process holds was sent a second time");
+    assert.ok(retryable(dir).includes(spoolName("r-9")));
+  });
+
+  it("takes over a claim left by a process that died holding it", async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, spoolName("r-9")), spooled("r-9"));
+    const claim = join(dir, `${spoolName("r-9")}.claim`);
+    writeFileSync(claim, "4242.abc");
+    const old = (Date.now() - CLAIM_STALE_MS - 60_000) / 1000;
+    utimesSync(claim, old, old);
+    const sent = [];
+    const outbox = createOutbox({ dir, send: async (r) => { sent.push(r.rolloutId); } });
+    assert.equal(await outbox.drain(), 1);
+    assert.deepEqual(sent, ["r-9"]);
+    assert.deepEqual(listing(dir), [], "a claim or the record was left behind");
+  });
+
+  it("spools beside a file another process is sending, never over it", async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, spoolName("r-1")), spooled("r-1"));
+    writeFileSync(join(dir, `${spoolName("r-1")}.claim`), "4242.abc");
+    const outbox = createOutbox({ dir, send: async () => { throw http(503); } });
+    assert.equal(await outbox.deliver(ROLLOUT, { finalText: "mine" }), false);
+    const texts = retryable(dir)
+      .map((n) => JSON.parse(readFileSync(join(dir, n), "utf8")).output.finalText).sort();
+    assert.deepEqual(texts, ["mine", "r-1"], "one process's result overwrote the other's");
+  });
+
+  it("sends each held result once when several processes drain one outbox", async () => {
+    const dir = tmp();
+    const ids = Array.from({ length: 12 }, (_, i) => `r-${String(i).padStart(2, "0")}`);
+    for (const id of ids) writeFileSync(join(dir, spoolName(id)), spooled(id));
+    const log = join(tmp(), "sent.log");
+    const module = new URL("../src/outbox.js", import.meta.url).href;
+    const script = `
+      import { appendFileSync } from "node:fs";
+      const { createOutbox } = await import(${JSON.stringify(module)});
+      const outbox = createOutbox({ dir: ${JSON.stringify(dir)}, send: async (r) => {
+        appendFileSync(${JSON.stringify(log)}, r.rolloutId + "\\n");
+        await new Promise((ok) => setTimeout(ok, 5));
+      } });
+      await outbox.drain();`;
+    await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script],
+        { stdio: ["ignore", "ignore", "pipe"] });
+      let err = "";
+      child.stderr.on("data", (d) => { err += d; });
+      child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(err))));
+    })));
+    const sent = readFileSync(log, "utf8").trim().split("\n").sort();
+    assert.deepEqual(sent, ids, "a held result was sent more than once, or not at all");
+    assert.deepEqual(listing(dir), []);
+  });
+});
+
+describe("a drain is bounded (ND-H16)", () => {
+  it("stops the pass at the first outage instead of failing every file", async () => {
+    const dir = tmp();
+    for (const id of ["r-a", "r-b", "r-c"]) writeFileSync(join(dir, spoolName(id)), spooled(id));
+    let calls = 0;
+    const outbox = createOutbox({ dir, send: async () => { calls += 1; throw http(503); } });
+    assert.equal(await outbox.drain(), 0);
+    assert.equal(calls, 1, "every held result was tried against a control plane that is down");
+    assert.equal(retryable(dir).length, 3);
+    calls = 0;
+    const offline = createOutbox({
+      dir, send: async () => { calls += 1; throw new TransportError("connect ECONNREFUSED"); },
+    });
+    await offline.drain();
+    assert.equal(calls, 1);
+  });
+
+  it("carries on past a refusal of one result", async () => {
+    const dir = tmp();
+    for (const id of ["r-a", "r-b"]) writeFileSync(join(dir, spoolName(id)), spooled(id));
+    const sent = [];
+    const outbox = createOutbox({
+      dir, send: async (r) => { sent.push(r.rolloutId); if (r.rolloutId === "r-a") throw http(422); },
+    });
+    assert.equal(await outbox.drain(), 1);
+    assert.deepEqual(sent, ["r-a", "r-b"]);
+  });
+
+  it("retires a record whose first_seen_ts is not a number", async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, spoolName("r-n")), spooled("r-n", { first_seen_ts: "yesterday" }));
+    const sent = [];
+    const outbox = createOutbox({ dir, send: async (r) => { sent.push(r.rolloutId); } });
+    await outbox.drain();
+    assert.deepEqual(sent, []);
+    assert.ok(listing(dir).includes(`${spoolName("r-n")}.stale`), `got ${listing(dir)}`);
+  });
+
+  it("skips a directory named *.json without leaving a file per pass", async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, "odd.json"));
+    const outbox = createOutbox({ dir, send: async () => {} });
+    for (let i = 0; i < 3; i += 1) await outbox.drain();
+    assert.deepEqual(listing(dir), ["odd.json"]);
+  });
+
+  it("never leaves an empty file when a retirement cannot be moved", async () => {
+    // A directory where the record should be: nothing can be spooled there,
+    // the 422 is retired, and the move reserved an empty name it then could
+    // not fill.
+    const dir = tmp();
+    mkdirSync(join(dir, spoolName("r-1")));
+    const outbox = createOutbox({ dir, send: async () => { throw http(422); } });
+    assert.equal(await outbox.deliver(ROLLOUT, OUTPUT), false);
+    const empty = listing(dir).filter((n) => {
+      const st = statSync(join(dir, n));
+      return st.isFile() && st.size === 0;
+    });
+    assert.deepEqual(empty, [], "a 0-byte reservation was left behind");
+  });
+});
+
+describe("a lease token outlives no failure (ND-H16)", () => {
+  it("drops it when the result could not even be prepared", async () => {
+    const dir = tmp();
+    const seen = [];
+    const outbox = createOutbox({ dir, send: async (r) => { seen.push(r.leaseToken); } });
+    const hostile = { get finalText() { throw new Error("boom"); } };
+    assert.equal(await outbox.deliver(ROLLOUT, hostile), false);
+    writeFileSync(join(dir, spoolName("r-1")), spooled("r-1"));
+    await outbox.drain();
+    assert.deepEqual(seen, [null], "the token of a result that never existed was kept");
+  });
+
+  it("drops it when the held result goes stale", async () => {
+    const dir = tmp();
+    let clock = 1_000_000;
+    const seen = [];
+    let fail = true;
+    const outbox = createOutbox({
+      dir, now: () => clock,
+      send: async (r) => { seen.push(r.leaseToken); if (fail) throw http(503); },
+    });
+    await outbox.deliver(ROLLOUT, OUTPUT);
+    clock += MAX_AGE_MS + 1;
+    await outbox.drain();
+    fail = false;
+    writeFileSync(join(dir, spoolName("r-1")), spooled("r-1", { first_seen_ts: clock }));
+    await outbox.drain();
+    assert.deepEqual(seen, ["lease-abc", null]);
+  });
+});
+
+describe("every id is a file name (ND-H16)", () => {
+  it("names an id with a lone surrogate instead of throwing, and keeps two apart", async () => {
+    assert.notEqual(spoolName("a\ud800"), spoolName("a\udc00"));
+    assert.notEqual(spoolName("a\ud800"), spoolName("a\ufffd"));
+    const dir = tmp();
+    const outbox = createOutbox({ dir, send: async () => { throw http(503); } });
+    assert.equal(await outbox.deliver({ rolloutId: "r\ud800" }, OUTPUT), false);
+    assert.deepEqual(retryable(dir), [spoolName("r\ud800")]);
+  });
+
+  it("gives ids differing only by case names a case-insensitive disk keeps apart", () => {
+    const folded = (id) => spoolName(id).toLowerCase();
+    assert.notEqual(folded("R-1"), folded("r-1"));
+    assert.notEqual(folded("Ab"), folded("aB"));
+    assert.equal(spoolName("r-1"), "r-1.json", "a lowercase id keeps its plain name");
+    assert.equal(pathSegment("AB") === pathSegment("AB").toLowerCase(), false);
+  });
+
+  it("finds an outbox an older SDK left under an agent id with a capital", () => {
+    const home = mkdtempSync(join(tmpdir(), "percepteye-outbox-home-"));
+    const env = { PERCEPTEYE_HOME: home };
+    const legacy = join(home, "outbox", "MyAgent");
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "r-1.json"), spooled("r-1"));
+    const now = outboxDir("MyAgent", env);
+    assert.notEqual(now, legacy);
+    assert.deepEqual(listing(now), ["r-1.json"], "the held result was orphaned");
   });
 });

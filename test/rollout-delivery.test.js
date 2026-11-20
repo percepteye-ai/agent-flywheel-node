@@ -81,7 +81,10 @@ describe("the producer: every outcome is written down before it is sent", () => 
     let onDisk = null;
     const h = driverOn(home, {
       report: async () => {
-        onDisk = listing(outboxDir("a1", { PERCEPTEYE_HOME: home }));
+        // The spool files, not the `.claim` this process holds on one while
+        // it sends it.
+        onDisk = listing(outboxDir("a1", { PERCEPTEYE_HOME: home }))
+          .filter((n) => n.endsWith(".json"));
         throw new Error("killed mid-POST");
       },
     });
