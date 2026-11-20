@@ -6,7 +6,9 @@
 import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { ControlPlaneClient, MAX_BACKOFF_MS, cut } from "../src/http.js";
+import {
+  ControlPlaneClient, MAX_BACKOFF_MS, MAX_ERROR_BODY_BYTES, cut,
+} from "../src/http.js";
 import { LeaseLost, TransportError } from "../src/errors.js";
 
 /** A fetch stub that replays a scripted sequence and records what it saw. */
@@ -249,12 +251,12 @@ describe("an error body is cut at 300 CODE POINTS, as Python's text[:300] cuts i
     });
   });
 
-  it("reads no further into a body than the 300 code points it keeps", () => {
-    // Every refused and retried attempt cuts its body, and an error body can
-    // be megabytes: a cut that spread the whole body into one string per
-    // character paid heap in proportion to it, on every attempt. Pinned on
-    // what is READ, which a timing could not pin: this body refuses to be
-    // read past its 301st code point (the one the loop stops on).
+  it("iterates no further into a string than the 300 code points it keeps", () => {
+    // A cut that spread the whole string into one entry per character paid
+    // heap in proportion to it, on every attempt. Pinned on what is ITERATED,
+    // which a timing could not pin: this string refuses to be read past its
+    // 301st code point (the one the loop stops on). How much of a BODY is read
+    // off the wire is `detail`'s bound, pinned below.
     let pulled = 0;
     const endless = {
       *[Symbol.iterator]() {
@@ -270,5 +272,120 @@ describe("an error body is cut at 300 CODE POINTS, as Python's text[:300] cuts i
     const huge = BOX.repeat(2_000_000);
     assert.equal(cut(huge), BOX.repeat(300));
     assert.equal(cut("short"), "short");
+  });
+});
+
+describe("what one attempt may cost, and what an error keeps", () => {
+  it("treats a connection reset as possibly performed (ND-H1)", async () => {
+    // A reset arrives on an ESTABLISHED connection, after the request may have
+    // been written and processed. It was listed as "never sent", so a call
+    // with ambiguous retries off was resent and the error said it had not
+    // happened.
+    const { c, seen } = client([netError("ECONNRESET"), { status: 200, body: "{}" }]);
+    await assert.rejects(
+      () => c.request("POST", "/x", { retryIfAmbiguous: false }),
+      (err) => {
+        assert.equal(err.ambiguous, true, "a reset was reported as never sent");
+        return true;
+      },
+    );
+    assert.equal(seen.length, 1, "a reset was resent with ambiguous retries off");
+  });
+
+  it("times out a server that sends headers and then stalls the body (ND-H2)", async () => {
+    let attempts = 0;
+    const impl = async (url, init) => {
+      attempts += 1;
+      const body = new ReadableStream({
+        start(controller) {
+          init.signal.addEventListener("abort", () => {
+            controller.error(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          });
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const c = new ControlPlaneClient("https://cp.test", "pefw_k", {
+      fetchImpl: impl, maxAttempts: 1, timeoutMs: 50,
+    });
+    await assert.rejects(() => c.request("GET", "/x"), (err) => {
+      assert.ok(err instanceof TransportError, String(err));
+      assert.equal(err.ambiguous, true);
+      assert.equal(err.statusCode, 200);
+      return true;
+    });
+    assert.equal(attempts, 1);
+  });
+
+  it("serialises the body once and never sends one JSON cannot carry (ND-H3)", async () => {
+    const { c, seen } = client([{ status: 200, body: "{}" }]);
+    await assert.rejects(() => c.request("POST", "/x", { jsonBody: { n: 1n } }), (err) => {
+      assert.ok(err instanceof TransportError);
+      assert.equal(err.ambiguous, false, "nothing was sent, so nothing may have happened");
+      assert.match(err.message, /cannot be serialised as JSON/);
+      return true;
+    });
+    assert.equal(seen.length, 0, "a body that cannot be serialised was attempted");
+  });
+
+  it("keeps the last status on an error that ran out of attempts (ND-M6)", async () => {
+    const { c } = client([{ status: 503, headers: { "retry-after": "0" } }], { maxAttempts: 2 });
+    await assert.rejects(() => c.request("GET", "/x"), (err) => {
+      assert.equal(err.statusCode, 503, `got ${err.statusCode}`);
+      return true;
+    });
+  });
+
+  it("keeps the status on a 2xx whose body cannot be parsed (ND-M6)", async () => {
+    const { c } = client([{ status: 200, body: "<html>proxy</html>" }]);
+    await assert.rejects(() => c.request("GET", "/x"), (err) => {
+      assert.equal(err.statusCode, 200);
+      assert.equal(err.ambiguous, true);
+      return true;
+    });
+  });
+
+  it("answers a redirect as an error and never follows it (ND-M6)", async () => {
+    const { c, seen } = client([
+      { status: 302, headers: { location: "https://elsewhere.test/login" } },
+      { status: 200, body: "{}" },
+    ]);
+    await assert.rejects(() => c.request("POST", "/x", { jsonBody: {} }), (err) => {
+      assert.equal(err.statusCode, 302);
+      assert.match(err.message, /does not redirect/);
+      assert.match(err.message, /elsewhere\.test/);
+      return true;
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].init.redirect, "manual",
+      "fetch was left to follow a redirect with the bearer key");
+  });
+
+  it("reads no more of a refusal's body than MAX_ERROR_BODY_BYTES (ND-M6)", async () => {
+    let pulled = 0;
+    const chunk = new Uint8Array(4096).fill(0x61);
+    const impl = async () => new Response(new ReadableStream({
+      pull(controller) {
+        pulled += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    }), { status: 400 });
+    const c = new ControlPlaneClient("https://cp.test", "pefw_k", { fetchImpl: impl });
+    await assert.rejects(() => c.request("GET", "/x"), (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.ok(err.message.endsWith("a".repeat(300)), err.message.slice(0, 80));
+      return true;
+    });
+    assert.ok(pulled <= MAX_ERROR_BODY_BYTES + 3 * chunk.byteLength,
+      `read ${pulled} bytes of an endless error body`);
+  });
+
+  it("refuses an attempt count that is not a positive integer (ND-M6)", () => {
+    for (const maxAttempts of [Number.NaN, Infinity, 0, -1, 1.5, "3"]) {
+      assert.throws(
+        () => new ControlPlaneClient("https://cp.test", "pefw_k", { maxAttempts }),
+        TransportError, String(maxAttempts),
+      );
+    }
   });
 });
