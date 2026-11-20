@@ -37,13 +37,15 @@
  * turn ends and the next begins is how one user's tool calls end up in
  * another's record.
  */
+import { randomBytes } from "node:crypto";
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync,
-  writeFileSync,
+  appendFileSync, closeSync, existsSync, linkSync, mkdirSync,
+  openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync,
+  writeSync,
 } from "node:fs";
 import { basename, join } from "node:path";
 
-import { readTrajectory, TOOL_CALLS_FILENAME } from "./trajectory.js";
+import { readTrajectory } from "./trajectory.js";
 import { recordTurnSpan } from "./tracing.js";
 import {
   OBSERVATION_FILENAME, endRecord, newSpanId, newTraceId, observationFromLines,
@@ -78,7 +80,8 @@ export const TURN_KINDS = ["task", "answer"];
 export const MAX_TEXT_CHARS = 20_000;
 
 /**
- * `text[:MAX_TEXT_CHARS]` as PYTHON means it: code POINTS, not UTF-16 units.
+ * `text[:MAX_TEXT_CHARS]` as PYTHON means it: code POINTS, not UTF-16 units --
+ * of text the intake can store.
  *
  * `String.prototype.slice` counts UTF-16 code units, so it truncated a
  * mostly-emoji message at HALF the documented point -- the two corpora were
@@ -86,17 +89,91 @@ export const MAX_TEXT_CHARS = 20_000;
  * cut landing between the halves of a surrogate pair leaves a LONE SURROGATE,
  * which `JSON.stringify` writes into `turns.jsonl` and onto the wire; the
  * intake cannot encode it to UTF-8, the chunk is never acknowledged, and
- * `createTurnUploader.flush` leaves every marker in that chunk unwritten, so
- * the poisoned turn is re-sent on every flush forever. Iterating the string
- * yields whole code points, so neither is possible.
+ * the poisoned turn is re-sent on every flush forever. So the text is SCRUBBED
+ * first, whether or not it is cut: a lone surrogate the host already handed
+ * over becomes U+FFFD (`toWellFormed`), and NUL -- which the intake's text
+ * columns cannot hold -- is removed. Then the walk stops at the cap: it never
+ * spreads a long paste into an array of every one of its characters.
  *
- * The length guard is not an optimisation of the general case, it IS the
- * common case: code units are never fewer than code points, so text under the
- * cap in units is under it in points and never needs to be split at all.
+ * The length guard IS the common case: code units are never fewer than code
+ * points, so text under the cap in units is under it in points.
  */
-function truncateChars(text) {
-  if (text.length <= MAX_TEXT_CHARS) return text;
-  return [...text].slice(0, MAX_TEXT_CHARS).join("");
+export function truncateChars(text) {
+  const clean = text.toWellFormed().replaceAll("\u0000", "");
+  if (clean.length <= MAX_TEXT_CHARS) return clean;
+  let end = 0;
+  let points = 0;
+  for (const ch of clean) {
+    if (points === MAX_TEXT_CHARS) break;
+    end += ch.length;
+    points += 1;
+  }
+  return clean.slice(0, end);
+}
+
+/**
+ * Publish a write-once sidecar at `target`: `"published"` when this call
+ * wrote it, `"same"` when it already held what `same` accepts, `"different"`
+ * when it holds anything else, `"failed"` when neither could be told.
+ *
+ * NEVER OBSERVABLE HALF-WRITTEN. `wx` creates the file EMPTY and fills it
+ * after: a second writer arriving between the two read "" and recorded a
+ * permanent false `.conflict` (the Python SDK measured 55% of 8 concurrent
+ * writers). So the bytes go to a unique temp file (pid + random) and the temp
+ * is HARD-LINKED into place -- `link` fails with EEXIST rather than
+ * replacing, and the target appears with its whole content or not at all.
+ * The temp is always removed. A filesystem without hard links falls back to
+ * `wx`, the old behaviour, rather than recording nothing.
+ *
+ * NOT FSYNCED, for the reason the trajectory writer is not (the Python SDK's
+ * `outcomes.py` states it): this runs inside the hook of a turn a user is
+ * waiting on, an fsync costs ~30ms there (measured on APFS) against well
+ * under 1ms for the whole publish, and the failure capture has to survive is
+ * the process dying, which the page cache already does. Atomicity is the
+ * link's, not the fsync's.
+ */
+export function publishSidecar(target, data, same = (current) => current === data) {
+  const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  let written = false;
+  try {
+    const fd = openSync(tmp, "wx");
+    written = true;
+    try {
+      writeSync(fd, data);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      linkSync(tmp, target);
+      return "published";
+    } catch (err) {
+      if (err?.code === "EEXIST") {
+        // Someone published first; compare below.
+      } else if (["EPERM", "ENOTSUP", "ENOSYS", "EXDEV"].includes(err?.code)) {
+        try {
+          writeFileSync(target, data, { encoding: "utf8", flag: "wx" });
+          return "published";
+        } catch (inner) {
+          if (inner?.code !== "EEXIST") return "failed";
+        }
+      } else {
+        return "failed";
+      }
+    }
+    let current;
+    try {
+      current = readFileSync(target, "utf8");
+    } catch {
+      return "failed";
+    }
+    return same(current) ? "same" : "different";
+  } catch {
+    return "failed";
+  } finally {
+    if (written) {
+      try { unlinkSync(tmp); } catch { /* already gone */ }
+    }
+  }
 }
 
 /** One turn's directory. The directory name IS the turn id. */
@@ -136,8 +213,10 @@ export function recordTurnText(dir, kind, text, ids = {}) {
   if (!TURN_KINDS.includes(kind)) {
     throw new Error(`turn kind must be one of ${TURN_KINDS}, got ${kind}`);
   }
-  if (typeof text !== "string" || !text.trim()) return false;
-  const record = { kind, text: truncateChars(text.trim()) };
+  if (typeof text !== "string") return false;
+  const kept = truncateChars(text.trim()).trim();
+  if (!kept) return false;
+  const record = { kind, text: kept };
   for (const [k, v] of Object.entries(ids)) {
     if (typeof v === "string" && v) record[k] = v;
   }
@@ -182,18 +261,26 @@ export function recordTurnText(dir, kind, text, ids = {}) {
   return true;
 }
 
-/** Record which conversation this turn belongs to. Idempotent, never throws. */
+/**
+ * Record which conversation this turn belongs to. Never throws; true when the
+ * turn is (now or already) bound to this conversation.
+ *
+ * WRITTEN ONCE, published whole (`publishSidecar`). It used to be rewritten
+ * by every hook of the turn, truncating it first: a reader in between saw an
+ * empty file (no conversation, index 0), and the file's mtime -- the turn's
+ * START, which orders its conversation (`listTurnDirs`) -- moved with every
+ * tool call. The first binding stands; a different id later is refused.
+ */
 export function recordConversationId(dir, conversationId) {
   const exact = productionIdentifier(conversationId);
   if (exact === null) return false;
   try {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, CONVERSATION_ID_FILENAME),
-                  exact, "utf8");
-    return true;
   } catch {
     return false;
   }
+  const result = publishSidecar(join(dir, CONVERSATION_ID_FILENAME), exact);
+  return result === "published" || result === "same";
 }
 
 /**
@@ -208,19 +295,9 @@ export function recordTaskId(dir, taskId) {
   try {
     mkdirSync(dir, { recursive: true });
     if (existsSync(conflict)) return false;
-    try {
-      writeFileSync(sidecar, exact, { encoding: "utf8", flag: "wx" });
-      return true;
-    } catch (err) {
-      if (err?.code !== "EEXIST") return false;
-    }
-    let current = null;
-    try {
-      current = readFileSync(sidecar, "utf8");
-    } catch {
-      current = null;
-    }
-    if (current === exact) return true;
+    const result = publishSidecar(sidecar, exact);
+    if (result === "published" || result === "same") return true;
+    if (result === "failed") return false;
     try {
       writeFileSync(conflict, "", { encoding: "utf8", flag: "wx" });
     } catch (err) {
@@ -245,23 +322,15 @@ export function recordExecutionFingerprint(dir, fingerprint) {
   try {
     mkdirSync(dir, { recursive: true });
     if (existsSync(conflict)) return false;
-    try {
-      writeFileSync(sidecar, JSON.stringify(expected), { encoding: "utf8", flag: "wx" });
-      return true;
-    } catch (err) {
-      if (err?.code !== "EEXIST") return false;
-    }
-    let current = null;
-    try {
-      current = JSON.parse(readFileSync(sidecar, "utf8"));
-    } catch {
-      current = null;
-    }
-    if (
-      current && typeof current === "object" && !Array.isArray(current)
-      && Object.keys(current).length === 1
-      && current.execution_sha256 === digest
-    ) return true;
+    const result = publishSidecar(sidecar, JSON.stringify(expected), (raw) => {
+      let current = null;
+      try { current = JSON.parse(raw); } catch { current = null; }
+      return Boolean(current) && typeof current === "object"
+        && !Array.isArray(current) && Object.keys(current).length === 1
+        && current.execution_sha256 === digest;
+    });
+    if (result === "published" || result === "same") return true;
+    if (result === "failed") return false;
     try {
       writeFileSync(conflict, "", { encoding: "utf8", flag: "wx" });
     } catch (err) {
@@ -327,7 +396,11 @@ export function recordModelBoundary(dir, boundary) {
     mkdirSync(dir, { recursive: true });
     const path = join(dir, OBSERVATION_FILENAME);
     const lines = [];
-    if (!existsSync(path)) {
+    // A file with no bytes yet holds no header either (a write cut off
+    // before its first line): it gets one, or its trace is never readable.
+    let size = 0;
+    try { size = statSync(path).size; } catch { size = 0; }
+    if (size === 0) {
       lines.push(traceRecord({
         traceId: newTraceId(), spanId: newSpanId(), start: boundary.start,
       }));
@@ -427,7 +500,7 @@ export function readTurnText(dir) {
  *
  *   rows present            -> the calls
  *   file present, no rows   -> []    (it ran and called nothing)
- *   file absent             -> null  (nothing was recorded for it)
+ *   file absent/unreadable  -> null  (nothing was recorded for it)
  */
 export function turnWire(dir, { turnIndex = 0, modelContentAgent = null } = {}) {
   const turnId = productionTurnIdentifier(basename(dir));
@@ -443,10 +516,11 @@ export function turnWire(dir, { turnIndex = 0, modelContentAgent = null } = {}) 
   const taskId = readTaskId(dir);
   const cid = readConversationId(dir);
 
-  let toolCalls;
-  if (calls && calls.length) toolCalls = calls;
-  else if (existsSync(join(dir, TOOL_CALLS_FILENAME))) toolCalls = [];
-  else toolCalls = null;
+  // `readTrajectory`'s own tri-state: `null` when there is no file OR it
+  // could not be read -- the Python SDK's `Trajectory.read` reads an
+  // unreadable file as no observation, and `[]` would assert one: "it ran
+  // and called nothing".
+  const toolCalls = calls;
 
   // WHAT THE MODEL SAW AND SAID, when this turn recorded it -- and only when
   // the caller says model content may be uploaded now, by naming the agent it

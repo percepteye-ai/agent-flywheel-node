@@ -31,6 +31,22 @@ const OPTIONAL_KEYS = [
 ];
 
 /**
+ * A tool call's arguments as the contract's OBJECT, the way the Python SDK's
+ * `record_tool_call` builds them (`dict(arguments or {})`): an object as
+ * given; an array of `[key, value]` pairs as the object those pairs make;
+ * anything else -- another array, a string, nothing -- as `{}`. An array went
+ * onto the wire as an array before, which the intake refuses as a turn.
+ */
+export function argumentsObject(args) {
+  if (Array.isArray(args)) {
+    const pairs = args.every((p) => Array.isArray(p) && p.length === 2
+      && typeof p[0] === "string");
+    return pairs ? Object.fromEntries(args) : {};
+  }
+  return args && typeof args === "object" ? args : {};
+}
+
+/**
  * One record, shaped to match `ToolCallOutcome.to_wire()` exactly.
  *
  * `status_code` is always present and always null from here: OpenClaw's tool
@@ -42,7 +58,7 @@ export function toWire({ name, args, outcome, status_code = null, entity_ids,
                          ...rest }) {
   const d = {
     name,
-    arguments: args && typeof args === "object" ? args : {},
+    arguments: argumentsObject(args),
     outcome,
     status_code: status_code ?? null,
   };
