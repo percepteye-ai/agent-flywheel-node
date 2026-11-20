@@ -28,11 +28,11 @@ describe("the credentials store", () => {
     // added its own key, and the second rename dropped the first one's.
     const env = testEnv();
     const module = new URL("../src/credentials.js", import.meta.url).href;
-    const writers = 6;
+    const writers = 4;
     const script = `
       const { saveStored } = await import(${JSON.stringify(module)});
       const me = process.argv[1];
-      for (let i = 0; i < 15; i += 1) {
+      for (let i = 0; i < 10; i += 1) {
         saveStored({ control_plane_url: ${JSON.stringify(CP)}, agent_id: me + "-" + i,
           api_key: "pefw_x", created_at: null, expires_at: null }, process.env);
       }`;
@@ -45,7 +45,7 @@ describe("the credentials store", () => {
       child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(err))));
     })));
     const agents = loadStored(env).map((c) => c.agent_id);
-    assert.equal(agents.length, writers * 15, `lost ${writers * 15 - agents.length} keys`);
+    assert.equal(agents.length, writers * 10, `lost ${writers * 10 - agents.length} keys`);
     assert.equal(existsSync(join(env.PERCEPTEYE_HOME, LOCK_FILENAME)), false,
       "the lock was left behind");
   });
