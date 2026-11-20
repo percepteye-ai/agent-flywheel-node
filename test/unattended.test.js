@@ -337,6 +337,30 @@ describe("stopping, starting and pacing (ND-H9)", () => {
     assert.equal(h.calls.turns.length, 0);
   });
 
+  it("...including while the attended claim is still in flight", async () => {
+    // The race the per-lane checks missed: neither rollout is in inFlight yet.
+    const answers = [];
+    let claims = 0;
+    const driver = createRolloutDriver({
+      env: testEnv(),
+      transport: {
+        claim: () => { claims += 1; return new Promise((r) => { answers.push(r); }); },
+        report: async () => {}, abandon: async () => {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+    });
+    const runner = createUnattendedRunner({
+      driver, startTurn: async () => ({ started: true }),
+    });
+    const attended = driver.onSessionStart({ sessionKey: "a-person" });
+    await new Promise((r) => setImmediate(r));
+    const ticking = runner.tick();
+    await new Promise((r) => setImmediate(r));
+    for (const answer of answers) answer({ rollouts: [] });
+    await Promise.all([attended, ticking]);
+    assert.equal(claims, 1, "two claims in flight on a worker registered for one");
+  });
+
   it("...and an unattended rollout blocks the attended claim", async () => {
     const h = harness();
     await h.runner.tick();
