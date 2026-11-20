@@ -365,7 +365,10 @@ describe("what one attempt may cost, and what an error keeps", () => {
     let pulled = 0;
     const chunk = new Uint8Array(4096).fill(0x61);
     const impl = async () => new Response(new ReadableStream({
+      // Finite (2 MiB), so a client that reads it all finishes and says how
+      // much it read rather than hanging the suite.
       pull(controller) {
+        if (pulled >= 2 * 1024 * 1024) { controller.close(); return; }
         pulled += chunk.byteLength;
         controller.enqueue(chunk);
       },
@@ -377,7 +380,7 @@ describe("what one attempt may cost, and what an error keeps", () => {
       return true;
     });
     assert.ok(pulled <= MAX_ERROR_BODY_BYTES + 3 * chunk.byteLength,
-      `read ${pulled} bytes of an endless error body`);
+      `read ${pulled} bytes of a 2 MiB error body`);
   });
 
   it("refuses an attempt count that is not a positive integer (ND-M6)", () => {
