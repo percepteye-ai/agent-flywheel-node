@@ -128,6 +128,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { createOutbox, outboxDir, pathSegment } from "./outbox.js";
+import { isSubagentSessionKey } from "./scope.js";
 import { percepteyeHome } from "./session.js";
 import { declareRulebook, rulesNeverSent } from "./transport.js";
 import {
@@ -856,6 +857,10 @@ export function createRolloutDriver({
     if (
       !sessionKey || blockNextRun.has(sessionKey)
       || inFlight.has(sessionKey) || claiming.has(sessionKey)
+      // A subagent's session is part of the run that spawned it, never a
+      // rollout of its own: claiming here would hand it a whole episode and
+      // grade the subagent's answer as the agent's.
+      || isSubagentSessionKey(sessionKey)
     ) {
       return null;
     }

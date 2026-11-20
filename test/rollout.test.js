@@ -1144,6 +1144,22 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-2" }), undefined);
   });
 
+  it("never claims a rollout for a subagent's session", async () => {
+    // A subagent belongs to the run that spawned it. Mutation: drop the
+    // subagent guard in onSessionStart -- it claims, red.
+    const tx = fakeTransport({
+      claim: async () => ({ rollouts: [{ rolloutId: "r-sub", turnInput: "x", leaseToken: "lt" }] }),
+    });
+    tx.heartbeat = async () => {};
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx, enqueue: async () => ({ enqueued: true }),
+    });
+    const key = "agent:openclaw:subagent:0f8c1a52-3b1e-4c0e-9d0a-2b6f1e4c7a10";
+    assert.equal(await d.onSessionStart({ sessionKey: key }), null);
+    assert.equal(tx.calls.claim?.length ?? 0, 0);
+    assert.equal(d.inFlight.size, 0);
+  });
+
   it("hands back at once a rollout claimed after its session ended", async () => {
     // ND-H5. session_end arrived while claim(1) was long-polling: it found
     // nothing in flight, and the rollout was then tracked -- a heartbeat
