@@ -19,7 +19,7 @@ import { CONTRACT_VERSION } from "./wire.js";
 import { LeaseLost, TransportError } from "./errors.js";
 
 /** Transient. Retry these, honouring Retry-After when present. */
-const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+export const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
 /**
  * Node's fetch rejects with a TypeError whose `cause.code` names the syscall
@@ -95,13 +95,13 @@ export const MAX_BACKOFF_MS = 8000;
  * agents that all retry on the same schedule reconverges into exactly the
  * spike that caused the backoff.
  */
-function backoffMs(attempt) {
+export function backoffMs(attempt) {
   return Math.random() * Math.min(MAX_BACKOFF_MS, 500 * 2 ** (attempt - 1));
 }
 
 /** The server's own backoff, capped at the same ceiling as our jitter. */
-function retryAfterMs(response) {
-  const raw = response.headers.get("retry-after");
+export function retryAfterMs(response) {
+  const raw = response.headers?.get?.("retry-after");
   if (!raw) return null;
   const seconds = Number(raw);
   return Number.isFinite(seconds)
@@ -142,7 +142,7 @@ export const MAX_ERROR_BODY_BYTES = 64 * 1024;
 
 /** At most `limit` bytes of `response`'s body, decoded; the rest is never
  * downloaded. A response with no stream (a test double) is read whole. */
-async function readCapped(response, limit) {
+export async function readCapped(response, limit) {
   const stream = response.body;
   if (!stream || typeof stream.getReader !== "function") return response.text();
   const reader = stream.getReader();

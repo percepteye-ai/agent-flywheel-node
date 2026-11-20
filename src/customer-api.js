@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.51.0).
+ * Reads of the customer-automation API (customer contract 1.54.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -19,10 +19,14 @@
  * setting, is refused with `CustomerContractTooOld` rather than believed.
  */
 import { DEFAULT_CONTROL_PLANE } from "./config.js";
-import { ConfigurationError } from "./errors.js";
-import { SDK_VERSION } from "./http.js";
+import { ConfigurationError, TransportError } from "./errors.js";
+import {
+  MAX_ERROR_BODY_BYTES, RETRY_STATUS, SDK_VERSION, backoffMs, cut, readCapped,
+  retryAfterMs,
+} from "./http.js";
+import { urlSegment } from "./transport.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.51.0";
+export const CUSTOMER_CONTRACT_VERSION = "1.54.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
@@ -97,7 +101,11 @@ export const CYBER_REFUSAL_CODES = Object.freeze([
  * evidence); a pool that cannot train the objective (1.46.0); a chosen model
  * that cannot be trained (1.49.0); a base model named by no usable id, a
  * destination that cannot train the algorithm, a checkpoint another
- * organization's runs produced (1.51.0, raised before it published them).
+ * organization's runs produced (1.51.0, raised before it published them); a
+ * hill climb started from a trained model it cannot start from, and the merge
+ * of that model into its base failing, the platform's (1.52.0); a ruling on
+ * the reward plan's Decision -- what decides whether an attempt succeeded --
+ * by anyone but an org admin (1.54.0).
  */
 export const TRAINING_REFUSAL_CODES = Object.freeze([
   "opsd_prompts_exceed_host",
@@ -113,6 +121,9 @@ export const TRAINING_REFUSAL_CODES = Object.freeze([
   "base_model_unresolvable",
   "destination_algorithm_unsupported",
   "provider_checkpoint_not_owned",
+  "hillclimb_start_invalid",
+  "base_merge_failed",
+  "authority_ruling_requires_org_admin",
 ]);
 /**
  * Why a round with your agent is refused before anything is spent (1.51.0;
@@ -149,13 +160,32 @@ export function customerApiBase(controlPlaneUrl, env = process.env) {
   return `${url.protocol}//${url.host}${prefix}${CUSTOMER_PREFIX}`;
 }
 
+/**
+ * FastAPI's request-validation answer (a 422 whose `detail` is a list of
+ * `{loc, msg}`), as one readable sentence, or null for anything else. Read as
+ * an object it had no `message`, so the refusal said only "HTTP 422".
+ */
+function validationMessage(detail) {
+  if (!Array.isArray(detail) || !detail.length) return null;
+  const parts = detail.map((item) => {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object") return null;
+    const where = Array.isArray(item.loc) ? item.loc.map(String).join(".") : null;
+    const what = text(item.msg) ?? text(item.message);
+    if (!what) return null;
+    return where ? `${where}: ${what}` : what;
+  }).filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
 export class CustomerRefusal extends Error {
   constructor(statusCode, body) {
     const detail = body && typeof body === "object" ? body.detail : undefined;
-    const refusal = detail && typeof detail === "object" ? detail : {};
+    const refusal = detail && typeof detail === "object" && !Array.isArray(detail) ? detail : {};
     const code = text(refusal.code);
     const message = text(refusal.message)
       ?? (typeof detail === "string" ? detail : null)
+      ?? validationMessage(detail)
       ?? `HTTP ${statusCode}`;
     super(`HTTP ${statusCode}${code ? ` ${code}` : ""}: ${message}`);
     this.name = "CustomerRefusal";
@@ -203,8 +233,17 @@ function query(values) {
   return s ? `?${s}` : "";
 }
 
+/** Whole-request deadline (headers AND body), and attempts per read. */
+export const CUSTOMER_API_TIMEOUT_MS = 30_000;
+export const CUSTOMER_API_MAX_ATTEMPTS = 3;
+
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
 export class CustomerApiClient {
-  constructor({ apiKey, controlPlaneUrl, baseUrl, fetchImpl, env = process.env } = {}) {
+  constructor({
+    apiKey, controlPlaneUrl, baseUrl, fetchImpl, env = process.env,
+    timeoutMs = CUSTOMER_API_TIMEOUT_MS,
+  } = {}) {
     const key = (text(apiKey) ?? text(env[ENV_CUSTOMER_API_KEY]) ?? "").trim();
     if (!key) {
       throw new ConfigurationError(
@@ -217,8 +256,18 @@ export class CustomerApiClient {
         + "customer-automation key (mck_): run `pe login`, or issue one in the "
         + "dashboard under Settings, control-plane keys");
     }
-    this.baseUrl = (baseUrl ?? customerApiBase(controlPlaneUrl, env)).replace(/\/+$/, "");
+    if (baseUrl !== undefined && baseUrl !== null) {
+      // An empty one made every read a request for a bare path ("/runs").
+      let parsed = null;
+      try { parsed = new URL(String(baseUrl).trim()); } catch { /* refused below */ }
+      if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+        throw new ConfigurationError(
+          `baseUrl must be an absolute http(s) URL, not ${JSON.stringify(baseUrl)}`);
+      }
+    }
+    this.baseUrl = (baseUrl ?? customerApiBase(controlPlaneUrl, env)).trim().replace(/\/+$/, "");
     this._fetch = fetchImpl ?? globalThis.fetch;
+    this._timeoutMs = timeoutMs;
     this._headers = {
       Authorization: `Bearer ${key}`,
       Accept: "application/json",
@@ -226,17 +275,89 @@ export class CustomerApiClient {
     };
   }
 
+  /**
+   * One GET. Every read is safe to resend, so a failure that is not the
+   * server's answer -- no connection, a timeout, 408, 429 or a 5xx it may
+   * recover from -- is retried, honouring `Retry-After`, up to
+   * `CUSTOMER_API_MAX_ATTEMPTS`. The deadline covers the body read too.
+   *
+   * ONLY A 2xx JSON BODY IS AN ANSWER. A redirect (a login page, a proxy) is a
+   * `TransportError`, never followed with the key; a 2xx that is not JSON (an
+   * HTML page from something that is not the control plane) is one too; a 4xx
+   * or 5xx is the server's `CustomerRefusal`.
+   */
   async _get(path, params) {
-    const resp = await this._fetch(`${this.baseUrl}${path}${query(params)}`, {
-      method: "GET", headers: this._headers,
-    });
-    const raw = await resp.text();
-    let body = null;
-    if (raw) {
-      try { body = JSON.parse(raw); } catch { body = raw; }
+    const url = `${this.baseUrl}${path}${query(params)}`;
+    let last = null;
+    for (let attempt = 1; attempt <= CUSTOMER_API_MAX_ATTEMPTS; attempt += 1) {
+      const final = attempt === CUSTOMER_API_MAX_ATTEMPTS;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this._timeoutMs);
+      let wait;
+      try {
+        let resp;
+        try {
+          resp = await this._fetch(url, {
+            method: "GET", headers: this._headers, signal: controller.signal,
+            redirect: "manual",
+          });
+        } catch (err) {
+          last = new TransportError(
+            `GET ${path} failed: ${err?.name ?? "Error"}: ${err?.message ?? err}`,
+            { cause: err, ambiguous: true });
+          if (final) break;
+          wait = backoffMs(attempt);
+          continue;
+        }
+        const status = resp.status;
+        if (status >= 300 && status < 400) {
+          const location = resp.headers?.get?.("location");
+          throw new TransportError(
+            `GET ${path} -> HTTP ${status}: the customer API does not redirect, so ` +
+            `${this.baseUrl} is not answering as it` +
+            (location ? ` (it redirects to ${cut(location)})` : ""),
+            { statusCode: status });
+        }
+        let raw;
+        try {
+          raw = status >= 400
+            ? await readCapped(resp, MAX_ERROR_BODY_BYTES)
+            : await resp.text();
+        } catch (err) {
+          last = new TransportError(
+            `GET ${path} -> HTTP ${status} with a body that could not be read: ` +
+            `${err?.name ?? "Error"}: ${err?.message ?? err}`,
+            { statusCode: status, cause: err, ambiguous: true });
+          if (final) break;
+          wait = backoffMs(attempt);
+          continue;
+        }
+        let body = null;
+        let json = true;
+        if (raw) {
+          try { body = JSON.parse(raw); } catch { body = raw; json = false; }
+        }
+        if (status >= 400) {
+          const refusal = new CustomerRefusal(status, body);
+          if (!RETRY_STATUS.has(status) || final) throw refusal;
+          last = refusal;
+          wait = retryAfterMs(resp) ?? backoffMs(attempt);
+          continue;
+        }
+        if (!json) {
+          throw new TransportError(
+            `GET ${path} -> HTTP ${status} with a body that is not JSON ` +
+            `(${JSON.stringify(cut(raw).slice(0, 80))}), so ${this.baseUrl} is not ` +
+            "answering as the customer API",
+            { statusCode: status });
+        }
+        return body;
+      } finally {
+        clearTimeout(timer);
+        if (wait !== undefined) await sleep(wait);
+      }
     }
-    if (resp.status >= 400) throw new CustomerRefusal(resp.status, body);
-    return body;
+    throw last;
   }
 
   /** Whether the server speaks this client's contract major (GET /health). */
@@ -255,8 +376,12 @@ export class CustomerApiClient {
    * (`algorithm`, 1.46.0) and the run it belongs to (`owner_run_id`, 1.47.0;
    * null for a run the customer started): one row per run the customer
    * started, the rest folded under it. A server older than those versions
-   * omits the fields. Paging past the server's depth is refused
-   * `run_page_too_deep`: use `startedBefore`.
+   * omits the fields. 1.53.0: `latest_activity_at` and `latest_status` (the
+   * newest activity across the runs a top-level run continued through),
+   * `attempts` (those runs), `best_measured` (the best held-out measurement
+   * across them, with its baseline) and `measured` (this run's own newest
+   * held-out result); each is null where it does not apply. Paging past the
+   * server's depth is refused `run_page_too_deep`: use `startedBefore`.
    */
   listRuns({
     status, limit, offset, startedAfter, startedBefore, productId,
@@ -326,9 +451,13 @@ export class CustomerApiClient {
    * `capability` (1.45.0) are unpaired, ungated arms. Each is null
    * (`checkpoints` []) on a run that did not choose cyber, and absent on an
    * older server. A run that is not a hill climb of this organization is
-   * refused 404 `hillclimb_not_found`.
+   * refused 404 `hillclimb_not_found`. A `runId` that cannot be one path
+   * segment (`..`, a separator, empty, `undefined`) is refused with a
+   * `ContractError` before anything is sent.
    */
-  getHillclimbSecurity(runId) {
-    return this._get(`/hillclimbs/${encodeURIComponent(String(runId))}/security`, {});
+  async getHillclimbSecurity(runId) {
+    const id = urlSegment(
+      Number.isInteger(runId) ? String(runId) : runId, "runId");
+    return this._get(`/hillclimbs/${id}/security`, {});
   }
 }
