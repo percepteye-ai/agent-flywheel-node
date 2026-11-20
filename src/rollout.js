@@ -75,6 +75,13 @@
  *   so it cannot be detected after the fact and is read from `api.config`
  *   instead, using the host's own predicate.
  *
+ * `subagent_spawned`           AVAILABLE, not conversation-gated. Its context
+ *   names `requesterSessionKey` and `childSessionKey` -- the only place a
+ *   subagent's parent is named at all (its session key is
+ *   `agent:<id>:subagent:<uuid>`, openclaw-tools-KulZ1cdH.js:11227) -- and it
+ *   fires after the subagent's run was started (:11619). Used to hold a
+ *   rollout that spawned one out of training (`onSubagentSpawned`).
+ *
  * llm_input / llm_output are available, but they bracket a host attempt
  * rather than each provider invocation and carry no call id. Tool loops,
  * retries, and compaction can issue several provider calls inside one
@@ -140,6 +147,7 @@ export const BEFORE_AGENT_RUN = "before_agent_run";
 export const BEFORE_TOOL_CALL = "before_tool_call";
 export const GATEWAY_START = "gateway_start";
 export const GATEWAY_STOP = "gateway_stop";
+export const SUBAGENT_SPAWNED = "subagent_spawned";
 
 /** The host's own ceilings, so an oversized task is refused, not dropped. */
 export const MAX_INJECTION_BYTES = 32 * 1024;
@@ -314,6 +322,13 @@ export function createRolloutDriver({
 
   /** sessionKey -> the rollout this session is running. */
   const inFlight = new Map();
+  /**
+   * subagent sessionKey -> the rollout session it descends from, as the
+   * host's `subagent_spawned` names it (`onSubagentSpawned`). Bounded.
+   */
+  const subagentOf = new Map();
+  /** Rollouts already said to have spawned a subagent: said once each. */
+  const subagentSaid = new WeakSet();
   /** sessionKey -> fixed-cadence lease renewal for its current rollout. */
   const heartbeats = new Map();
   /** sessionKey -> host run id (or null), once the injected turn starts. */
@@ -422,7 +437,12 @@ export function createRolloutDriver({
   };
 
   const route = {
-    /** `before_model_resolve`: our provider for a session running a rollout. */
+    /**
+     * `before_model_resolve`: our provider for a session running a rollout --
+     * that session only. A subagent the rollout spawns is not routed: its
+     * parent cannot be known before its first model call, so the rollout is
+     * held out of training instead (`onSubagentSpawned`).
+     */
     handleModelResolve(_event, ctx) {
       const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
       const rollout = sessionKey ? inFlight.get(sessionKey) : null;
@@ -719,6 +739,52 @@ export function createRolloutDriver({
     } catch {
       /* the result will be reported without an attested count */
     }
+  }
+
+  /**
+   * `subagent_spawned`: a session spawned a subagent. When the spawner is a
+   * rollout's session (or a subagent of one), that rollout's answer now
+   * depends on a model the rollout did not sample: the subagent's session
+   * is not the rollout's, so its calls resolve to the host's own model, and
+   * its result feeds the rollout's answer. Training on that as the policy's
+   * own output would be training on mixed-policy text.
+   *
+   * REFUSED, NOT ROUTED. The parent is identifiable only here -- the host's
+   * subagent session key is `agent:<id>:subagent:<uuid>` and carries no
+   * parent, and neither do the model and session hooks' contexts -- and the
+   * host fires this AFTER it has started the subagent's run, so its first
+   * model call can resolve before this names its parent: routing would be
+   * best effort, and a half-routed subagent is still mixed policy. So the
+   * rollout's model-call count is marked unattestable with this cause
+   * (`modelCalls.markUncertain`): its result is reported without
+   * `llm_call_count`, which the control plane reconciles against what its
+   * gateway observed and holds out of training as `llm_calls_unobserved`.
+   * Said once per rollout. Returns whether the spawn was a rollout's.
+   */
+  function onSubagentSpawned(event, ctx = {}) {
+    const child = ctx?.childSessionKey ?? event?.childSessionKey;
+    const requester = ctx?.requesterSessionKey ?? event?.requesterSessionKey;
+    if (!child || !requester) return false;
+    const root = inFlight.has(requester) ? requester : subagentOf.get(requester);
+    const rollout = root === undefined ? undefined : inFlight.get(root);
+    if (!rollout) return false;
+    subagentOf.delete(child);
+    subagentOf.set(child, root);
+    while (subagentOf.size > 1024) subagentOf.delete(subagentOf.keys().next().value);
+    const reason = `the rollout spawned subagent session ${child}, whose model ` +
+      `calls run on the host's own model, not the rollout's`;
+    try { modelCalls?.markUncertain?.(root, reason); } catch { /* evidence */ }
+    if (!subagentSaid.has(rollout)) {
+      subagentSaid.add(rollout);
+      try {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId}: ${reason}. Its result ` +
+          `is reported without llm_call_count, so the control plane holds it ` +
+          `out of training (llm_calls_unobserved) rather than train on output ` +
+          `another model shaped.`);
+      } catch { /* telemetry */ }
+    }
+    return true;
   }
 
   /** Generic adapter seam: one host-proven provider invocation began. */
@@ -1198,7 +1264,7 @@ export function createRolloutDriver({
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
     onBeforeToolCall, rolloutFor, route, trajectoryDirFor, reserve, release,
     stopTimers,
-    onModelCallStarted, onModelCallEnded,
+    onModelCallStarted, onModelCallEnded, onSubagentSpawned,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
     // `claim` is what the UNATTENDED runner claims through -- not
@@ -1505,6 +1571,7 @@ export function registerRolloutDriver(api, {
   api.on(SESSION_START, safe(driver.onSessionStart));
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));
+  api.on(SUBAGENT_SPAWNED, safe(driver.onSubagentSpawned));
   // This gate MUST return its decision. The observation-only wrapper above
   // deliberately fire-and-forgets, which would discard a block result and
   // let a revoked rollout reach the model anyway.

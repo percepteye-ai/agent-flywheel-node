@@ -193,6 +193,56 @@ describe("rollout reporting", () => {
     assert.equal(reports[0].llmCallCount, undefined);
   });
 
+  it("holds out a rollout whose session spawned a subagent, naming the cause", async () => {
+    // A subagent the rollout spawns runs in a session of its own, which is
+    // not routed to the rollout's gateway (its parent is named only by
+    // `subagent_spawned`, after its run started), so it samples the host's
+    // model while its result feeds the rollout's answer. Counted calls of
+    // the rollout's own session alone then reported a count the gateway
+    // agreed with, and mixed-policy output passed as on-policy. Mutation:
+    // `onSubagentSpawned` marks nothing -> the count of 1 is reported, red.
+    const h = harness();
+    await h.driver.onSessionStart({ sessionKey: "s1" });
+    h.driver.onModelCallStarted({ runId: "run-1", callId: "call-1", sessionKey: "s1" });
+    h.driver.onModelCallEnded(completed("run-1", "call-1", "s1"));
+    const child = "agent:main:subagent:1b2c";
+    assert.equal(h.driver.onSubagentSpawned(
+      { childSessionKey: child },
+      { childSessionKey: child, requesterSessionKey: "s1" }), true);
+    // A subagent of that subagent descends from the same rollout.
+    assert.equal(h.driver.onSubagentSpawned(
+      {}, { childSessionKey: `${child}:subagent:9`, requesterSessionKey: child }), true);
+    // One spawned from an ordinary session is not the rollout's.
+    assert.equal(h.driver.onSubagentSpawned(
+      {}, { childSessionKey: "agent:main:subagent:x", requesterSessionKey: "human" }), false);
+    await h.driver.onAgentEnd(
+      { runId: "run-1", success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(h.reports[0].llmCallCount, undefined);
+    assert.equal(h.warnings.filter((w) => w.includes("subagent")).length >= 1, true);
+    assert.ok(h.warnings.some((w) => w.includes("r1") && w.includes(child)
+      && w.includes("llm_calls_unobserved")), h.warnings.join("\n"));
+    assert.ok(h.warnings.some((w) => w.includes("ineligible")
+      && w.includes(child)), "the missing count names the subagent as its cause");
+  });
+
+  it("subscribes the host's subagent_spawned hook", () => {
+    const handlers = new Map();
+    const api = {
+      on: (name, handler) => handlers.set(name, handler),
+      config: { plugins: { entries: { flywheel: {
+        hooks: { allowConversationAccess: true } } } } },
+      session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+      registerProvider: () => {},
+    };
+    registerRolloutDriver(api, {
+      env: testEnv(), config: { mode: "training", apiKey: "key" }, pluginId: "flywheel",
+      transport: { report: async () => {}, abandon: async () => {} },
+    });
+    assert.equal(typeof handlers.get("subagent_spawned"), "function");
+  });
+
   it("registers no invented OpenClaw provider-call hooks or count claim", async () => {
     const handlers = new Map();
     const reports = [];

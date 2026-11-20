@@ -62,6 +62,19 @@ export function createModelCallCounter() {
     return removed;
   }
 
+  /**
+   * This lifecycle's count cannot be attested, for `reason`: a model call
+   * served for it that no adapter can see (a subagent the rollout spawned,
+   * sampling on the host's own model). `finish` then yields no count and
+   * names this reason. False when the session has no active lifecycle.
+   */
+  function markUncertain(sessionKey, reason) {
+    const state = active.get(nonempty(sessionKey));
+    if (state === undefined) return false;
+    state.uncertain ??= reason;
+    return true;
+  }
+
   function markEveryActive(reason) {
     for (const state of active.values()) state.uncertain ??= reason;
   }
@@ -206,6 +219,7 @@ export function createModelCallCounter() {
   return {
     begin,
     abandon,
+    markUncertain,
     observeStarted,
     observeEnded,
     finish,
