@@ -19,11 +19,12 @@ import { join } from "node:path";
 
 import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveDeclaration } from "../src/declaration.js";
-import { LeaseLost } from "../src/errors.js";
+import { LeaseLost, TransportError } from "../src/errors.js";
 import { withholdFingerprints } from "../src/execution-identity.js";
 import { SDK_UA } from "../src/http.js";
 import {
-  MAX_INJECTION_BYTES, conversationAccessGranted, createRolloutDriver,
+  MAX_INJECTION_BYTES, REGISTRATION_RETRY_BASE_MS, REGISTRATION_RETRY_MAX_MS,
+  conversationAccessGranted, createRolloutDriver,
   driveVerdict, lastAssistantText, registerRolloutDriver, taskText,
 } from "../src/rollout.js";
 import { OUTCOME_FILENAME, TRAJECTORY_DIR_ENV } from "../src/trajectory.js";
@@ -255,6 +256,8 @@ describe("driveVerdict names ONE cause", () => {
 describe("training worker registration gates every claim", () => {
   function registrationHarness({
     fail = false,
+    failures = [],
+    clock = null,
     executionIdentity = null,
     servedContracts = ["flywheel/1"],
     config = {},
@@ -272,6 +275,7 @@ describe("training worker registration gates every claim", () => {
         order.push("register");
         registrations.push(spec);
         if (fail) throw new Error("registration refused");
+        if (failures.length) throw failures.shift();
         return { accepted: true };
       },
       async claim() {
@@ -290,6 +294,7 @@ describe("training worker registration gates every claim", () => {
       logger: api.logger,
       executionIdentity,
       declaration,
+      ...(clock ? { now: clock.now, random: () => 1 } : {}),
     });
     return { api, driver, order, registrations };
   }
@@ -396,6 +401,47 @@ describe("training worker registration gates every claim", () => {
       h.api.logs.filter((line) => line.includes("registration failed")).length,
       1,
     );
+  });
+
+  it("retries a TRANSIENT registration failure after a backoff, then claims", async () => {
+    // ND-H8: a control plane that was down at boot disabled rollouts for the
+    // life of the process.
+    let t = 1_000_000;
+    const clock = { now: () => t };
+    const h = registrationHarness({
+      clock,
+      failures: [
+        new TransportError("POST /agents -> HTTP 503: restarting", { statusCode: 503 }),
+        new TransportError("fetch failed"),
+      ],
+    });
+    assert.equal(await h.driver.ensureRegistered(), false);
+    // Inside the wait, however many claims arrive, nothing is re-asked.
+    assert.equal(await h.driver.onSessionStart({ sessionKey: "s1" }), null);
+    assert.equal(h.registrations.length, 1);
+    t += REGISTRATION_RETRY_BASE_MS;
+    assert.equal(await h.driver.ensureRegistered(), false, "a second transient failure");
+    assert.equal(h.registrations.length, 2);
+    t += REGISTRATION_RETRY_BASE_MS;
+    assert.equal(await h.driver.ensureRegistered(), false, "the wait doubled");
+    assert.equal(h.registrations.length, 2);
+    t += REGISTRATION_RETRY_BASE_MS;
+    assert.equal(await h.driver.ensureRegistered(), true);
+    await h.driver.onSessionStart({ sessionKey: "s2" });
+    assert.ok(h.order.includes("claim"), "rollouts resume without a restart");
+    assert.match(h.api.logs.join("\n"), /rollouts are paused .* retried in 5s/);
+  });
+
+  it("does not retry a 4xx refusal", async () => {
+    let t = 1_000_000;
+    const h = registrationHarness({
+      clock: { now: () => t },
+      failures: [new TransportError("POST /agents -> HTTP 403: no", { statusCode: 403 })],
+    });
+    assert.equal(await h.driver.ensureRegistered(), false);
+    t += REGISTRATION_RETRY_MAX_MS * 10;
+    assert.equal(await h.driver.ensureRegistered(), false);
+    assert.equal(h.registrations.length, 1);
   });
 
   it("refuses an incompatible control plane before registration or claim", async () => {

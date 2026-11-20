@@ -160,6 +160,27 @@ export const ROLLOUT_MODEL = "policy";
  */
 export const REPORT_MARGIN_MS = 10_000;
 
+/** The first wait before a TRANSIENT registration failure is retried. */
+export const REGISTRATION_RETRY_BASE_MS = 5_000;
+/** The longest wait between registration retries. */
+export const REGISTRATION_RETRY_MAX_MS = 300_000;
+
+/**
+ * Whether a registration failure is TRANSIENT -- worth asking again later:
+ * no answer at all (`statusCode` null: a network error, a timeout), a 5xx,
+ * or a 429. A 4xx is the control plane's refusal and a ConfigurationError is
+ * this install's (no compatible contract, a transport without the method);
+ * neither changes by asking again.
+ */
+export function registrationFailureIsTransient(err) {
+  if (err instanceof ConfigurationError || err?.name === "ConfigurationError") {
+    return false;
+  }
+  if (err?.name !== "TransportError" && err?.name !== "LeaseLost") return false;
+  const status = err?.statusCode ?? null;
+  return status === null || status >= 500 || status === 429;
+}
+
 /** Where a rollout's credential comes from, said one way. */
 export const ROLLOUT_KEY_ORIGIN =
   "the rollout's own key for its per-rollout gateway (the claim's api_key)";
@@ -1168,6 +1189,9 @@ export function registerRolloutDriver(api, {
   // here would be untestable without mutating the process's environment.
   env = process.env,
   declaration = null,
+  // The clock and the jitter source the registration retry is paced by.
+  now = () => Date.now(),
+  random = Math.random,
 }) {
   // THE CONFIGURED `rules` ON A LANE THAT DOES NOT DRIVE. What stops this
   // install claiming -- the conversation-access opt-in, an injection API --
@@ -1270,8 +1294,21 @@ export function registerRolloutDriver(api, {
       registrationFingerprint.execution_sha256;
   }
   let registration = null;
+  // NOT CACHED FOREVER WHEN THE FAILURE IS TRANSIENT. A control plane that
+  // was down or answered 5xx at boot used to disable rollouts for the life
+  // of the process -- every later claim awaited the same failed promise --
+  // so a deploy that briefly restarted the control plane silently stopped
+  // every training worker until somebody restarted it too. A transient
+  // failure is now asked again after a jittered, exponentially growing wait
+  // (one attempt per wait, however many claims arrive); a refusal still
+  // stops, once, as before.
+  let registrationFailures = 0;
+  let retryAt = null;
   function ensureRegistered() {
-    if (registration !== null) return registration;
+    if (registration !== null && !(retryAt !== null && now() >= retryAt)) {
+      return registration;
+    }
+    retryAt = null;
     registration = (async () => {
       if (typeof transport?.health !== "function") {
         throw new ConfigurationError(
@@ -1303,14 +1340,36 @@ export function registerRolloutDriver(api, {
         // runs". The control plane names whichever is off; say it once.
         const line = practiceLine(answer);
         if (line) logger?.warn?.(`[${pluginId}] ${line}`);
+        registrationFailures = 0;
         return true;
       })
       .catch((err) => {
-        logger?.warn?.(
-          `[${pluginId}] rollouts are disabled for this run because worker ` +
-          `registration failed: ${err?.message ?? err}. Local capture is ` +
-          `unaffected.`,
-        );
+        if (registrationFailureIsTransient(err)) {
+          registrationFailures += 1;
+          const ceiling = Math.min(
+            REGISTRATION_RETRY_MAX_MS,
+            REGISTRATION_RETRY_BASE_MS * 2 ** (registrationFailures - 1),
+          );
+          // Jittered, so a fleet that lost the control plane together does
+          // not come back to it together.
+          const waitMs = Math.round(ceiling * (0.5 + 0.5 * random()));
+          retryAt = now() + waitMs;
+          try {
+            logger?.warn?.(
+              `[${pluginId}] rollouts are paused because worker registration ` +
+              `failed (${err?.message ?? err}); it is retried in ` +
+              `${Math.ceil(waitMs / 1000)}s. Local capture is unaffected.`,
+            );
+          } catch { /* telemetry */ }
+          return false;
+        }
+        try {
+          logger?.warn?.(
+            `[${pluginId}] rollouts are disabled for this run because worker ` +
+            `registration failed: ${err?.message ?? err}. Local capture is ` +
+            `unaffected.`,
+          );
+        } catch { /* telemetry */ }
         return false;
       });
     return registration;
