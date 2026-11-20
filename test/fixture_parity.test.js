@@ -47,7 +47,7 @@ const SHARED = {
   // OTLP (`turn-feedback-span.test.js`); what the control plane's reader of
   // the feedback event is driven with.
   "turn_feedback_span.json":
-    "8b9ba5c2c548942aa868128988140f86505f2fa685279d7f5d004e6ebcf1fb01",
+    "79e96262a8b3138a3497e52de5655244af5cb4e1af15757eaf6de66aadff649c",
 };
 
 const ours = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
