@@ -117,6 +117,14 @@ export const SOURCE_TYPE = "openclaw_llm_input";
 export const FRAMEWORK = "openclaw";
 
 /**
+ * Who registers with the control plane when nobody says otherwise: this
+ * package loaded as an OpenClaw plugin. The framework API passes its own.
+ */
+export const OPENCLAW_HOST = Object.freeze({
+  entrypoint: "openclaw-plugin", framework: FRAMEWORK,
+});
+
+/**
  * Postgres JSONB cannot store a NUL byte or a lone surrogate in any string:
  * it raises `unsupported Unicode escape sequence`, which surfaces as an
  * uncaught 500 on registration, 100% of the time, for that agent.
@@ -171,7 +179,7 @@ function scrubDeep(value) {
  *
  * @returns {{name:string,description:string,input_schema:object,original_format:string}|null}
  */
-export function normalizeTool(raw) {
+export function normalizeTool(raw, { format = "openclaw_tool" } = {}) {
   if (!raw || typeof raw !== "object") return null;
 
   // The OpenAI function-calling envelope: the real tool is one level down.
@@ -202,12 +210,12 @@ export function normalizeTool(raw) {
       schema && typeof schema === "object"
         ? scrubDeep(schema)
         : { type: "object", properties: {} },
-    original_format: isEnvelope ? "openai_function" : "openclaw_tool",
+    original_format: isEnvelope ? "openai_function" : format,
   };
 }
 
 /** Normalise the host's tool array. `undefined` in means `null` out. */
-export function normalizeTools(rawTools) {
+export function normalizeTools(rawTools, opts = {}) {
   // THE ABSENCE CONTRACT, preserved across the process boundary. `null` means
   // we could not look; `[]` means we looked and the agent has no tools. The
   // consumer stamps a `not observed` marker on the first and grades on the
@@ -217,7 +225,7 @@ export function normalizeTools(rawTools) {
   if (!Array.isArray(rawTools)) return null;
   const out = [];
   for (const raw of rawTools) {
-    const tool = normalizeTool(raw);
+    const tool = normalizeTool(raw, opts);
     if (tool) out.push(tool);
   }
   return out;
@@ -231,12 +239,20 @@ export function normalizeTools(rawTools) {
  * are one ABI; this is the Node end of it, exactly as `trajectory.js` is the
  * Node end of the tool-outcome ABI.
  */
-export function buildRecord(event, ctx = {}) {
-  const tools = normalizeTools(event?.tools);
+export function buildRecord(event, ctx = {}, { framework = FRAMEWORK } = {}) {
+  // PROVENANCE, said truthfully: OpenClaw's `llm_input`, or -- under the
+  // framework API -- the SDK observing the agent at runtime, which is the
+  // Python SDK's word (`sdk_runtime`) with the framework as the tool format.
+  const openclaw = framework === FRAMEWORK;
+  const tools = normalizeTools(event?.tools, {
+    format: openclaw ? "openclaw_tool" : framework,
+  });
   const record = {
-    agent_name: scrub(String(ctx.agentId || event?.sessionId || "openclaw-agent")),
-    framework: FRAMEWORK,
-    source_type: SOURCE_TYPE,
+    agent_name: scrub(String(ctx.agentId || event?.sessionId || `${framework}-agent`)),
+    // The HOST's framework: OpenClaw for the plugin, the customer's for the
+    // framework API (flywheel.js), which says which.
+    framework,
+    source_type: openclaw ? SOURCE_TYPE : "sdk_runtime",
     role: "standalone",
     tool_definitions: tools,
   };
@@ -275,7 +291,7 @@ export function buildRecord(event, ctx = {}) {
  * The first event always writes, so an agent that genuinely has no tools
  * still produces a file and still reaches `described`.
  */
-export function createDescriber({ dir = null, onError = null } = {}) {
+export function createDescriber({ dir = null, onError = null, framework = FRAMEWORK } = {}) {
   let best = -1;
   let warned = false;
 
@@ -290,7 +306,7 @@ export function createDescriber({ dir = null, onError = null } = {}) {
       const base = resolveDir();
       if (!base) return false;
 
-      const record = buildRecord(event, ctx);
+      const record = buildRecord(event, ctx, { framework });
       const count = record.tool_definitions?.length ?? 0;
       if (best >= 0 && count <= best) return false;
 
@@ -326,10 +342,13 @@ export function createDescriber({ dir = null, onError = null } = {}) {
  * refusal is a diagnostic on ITS side and our handler simply never fires --
  * so the caller warns at startup instead.
  */
-export function registerDescriber(api, { logger = null, onObservation = null } = {}) {
+export function registerDescriber(api, {
+  logger = null, onObservation = null, framework = FRAMEWORK,
+} = {}) {
   if (typeof api?.on !== "function") return null;
 
   const describer = createDescriber({
+    framework,
     onError: (err) => logger?.warn?.(
       `[agent-flywheel] agent description write failed; this agent ` +
       `will register as introspection_state=unreadable and no workflows will ` +

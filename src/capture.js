@@ -74,7 +74,7 @@ import {
   applyDeclaration,
   declarationRegistrationFields,
 } from "./declaration.js";
-import { FRAMEWORK } from "./describe.js";
+import { OPENCLAW_HOST } from "./describe.js";
 import { nowUnixNano } from "./genai-otlp.js";
 import {
   conversationAccessGranted, conversationIdOf, lastAssistantText, taskIdOf,
@@ -2161,6 +2161,10 @@ export const GATEWAY_STOP = "gateway_stop";
 export function registerTurnCapture(api, {
   config, turns, pluginId, logger = null, env = process.env,
   makeTransport = defaultTransport, declaration = null,
+  // WHO IS REGISTERING: the OpenClaw plugin unless the framework API
+  // (flywheel.js) says otherwise. One value, from `register()`, shared with
+  // the rollout lane's registration and the describer.
+  hostIdentity = OPENCLAW_HOST,
 }) {
   if (!turns || typeof api?.on !== "function") return null;
   // The store's own root: one answer to where this agent's turns are, the
@@ -2302,7 +2306,7 @@ export function registerTurnCapture(api, {
     //
     // NOT AWAITED: `register()` must return to the host synchronously, and a
     // control plane that is slow or down must not delay a plugin load.
-    started = enrol({ transport, config, pluginId, logger, declaration })
+    started = enrol({ transport, config, pluginId, logger, declaration, hostIdentity })
       .then(() => announce({ transport, uploader, config, pluginId, logger, env }));
     // THE RULES, after the verdict read and OFF the chain every other startup
     // read waits on. `registerServingPolicy` reads the approved prompt and
@@ -2490,7 +2494,10 @@ function defaultTransport(config) {
  * package has already paid for one exported control-plane call that nothing
  * called: `AttachTransport.register` itself, which is the defect above.
  */
-function enrol({ transport, config, pluginId, logger = null, declaration = null }) {
+function enrol({
+  transport, config, pluginId, logger = null, declaration = null,
+  hostIdentity = OPENCLAW_HOST,
+}) {
   return Promise.resolve()
     .then(() => transport.register({
       agent_id: config.agentId,
@@ -2515,14 +2522,16 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
       // is what `attach()` sends.
       concurrency: 1,
       input_shape: "text",
-      entrypoint: "openclaw-plugin",
+      entrypoint: hostIdentity.entrypoint,
       // See the docstring: omitted on a refusal, the declaration when there
       // is one, and otherwise null -- never invented. Last, where it always
       // was, so an undeclared registration is the same bytes as before. The
-      // framework is the host's: this plugin knows it runs in OpenClaw.
+      // framework is the host's (`hostIdentity`): OpenClaw, or the one the
+      // framework API names.
       ...(config.introspect === false ? {} : {
         discovered_agent: applyDeclaration(declaration, {
-          reflected: null, agentName: config.agentId, framework: FRAMEWORK,
+          reflected: null, agentName: config.agentId,
+          framework: hostIdentity.framework,
         }) ?? null,
       }),
       // Where the agent's API spec is published, when `describe` says

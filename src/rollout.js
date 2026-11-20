@@ -118,7 +118,7 @@ import {
   applyDeclaration,
   declarationRegistrationFields,
 } from "./declaration.js";
-import { FRAMEWORK } from "./describe.js";
+import { OPENCLAW_HOST } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
@@ -1162,9 +1162,13 @@ export function createRolloutDriver({
           ? undefined : trajectory.malformed,
         //
         // A value this lane already has is not replaced by the file's: the
-        // host saying the run succeeded stands, and otherwise the
-        // environment's own verdict is the only one there is.
-        success: event?.success === true ? true : stated.success,
+        // host saying the run succeeded stands; otherwise the environment's
+        // own verdict; otherwise a run the host says FAILED is reported as
+        // `success: false` -- as the Python runner reports an agent that
+        // raised -- never as no verdict at all.
+        success: event?.success === true
+          ? true
+          : (stated.success ?? (event?.success === false ? false : undefined)),
         // Counted from the host's provider-call lifecycle and reconciled by
         // run/call ids. Never copied from the control plane's gateway.
         llmCallCount: modelCallMeasurement.count ?? undefined,
@@ -1321,7 +1325,19 @@ export function registerRolloutDriver(api, {
   // The clock and the jitter source the registration retry is paced by.
   now = () => Date.now(),
   random = Math.random,
+  // A HOST THAT STARTS ITS OWN TURNS. The framework API (`flywheel.js`) runs
+  // the customer's agent function itself, so it hands its turn starter and
+  // its run canceller here instead of the OpenClaw cron seam and the
+  // next-turn injection. Everything else -- registration, claim, heartbeat,
+  // deadline, outbox, report -- is this one lane, never a copy of it.
+  startTurn = null,
+  cancel = null,
+  // Who is registering (capture.js `registerTurnCapture` says why one value).
+  hostIdentity = OPENCLAW_HOST,
 }) {
+  if (startTurn !== null && typeof startTurn !== "function") {
+    throw new ConfigurationError("startTurn must be a function when supplied");
+  }
   // THE CONFIGURED `rules` ON A LANE THAT DOES NOT DRIVE. What stops this
   // install claiming -- the conversation-access opt-in, an injection API --
   // is not what the rulebook route needs: that is a key and a client, and the
@@ -1348,7 +1364,9 @@ export function registerRolloutDriver(api, {
   }
   const enqueueFn = api?.session?.workflow?.enqueueNextTurnInjection
     ?? api?.enqueueNextTurnInjection;
-  if (typeof enqueueFn !== "function") {
+  // A host that starts its own turns needs no injection: nothing is ever
+  // delivered into a turn somebody else started.
+  if (startTurn === null && typeof enqueueFn !== "function") {
     logger?.warn?.(
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
       `claimed task could not be delivered to the agent. Not claiming.`,
@@ -1393,7 +1411,7 @@ export function registerRolloutDriver(api, {
     isolation: "inprocess",
     concurrency: 1,
     input_shape: "text",
-    entrypoint: "openclaw-plugin",
+    entrypoint: hostIdentity.entrypoint,
   };
   // CONSENT, asked as the Python SDK's serve() asks it. Refused, the key is
   // OMITTED, which the control plane records as the customer's opt-out
@@ -1409,8 +1427,9 @@ export function registerRolloutDriver(api, {
     registrationSpec.discovered_agent = applyDeclaration(declaration, {
       reflected: registrationDescription ?? null,
       agentName: config.agentId,
-      // With nothing observed, the host is still known: this is OpenClaw.
-      framework: FRAMEWORK,
+      // With nothing observed, the host is still known: OpenClaw, or the
+      // framework the framework API was told.
+      framework: hostIdentity.framework,
     }) ?? null;
     // Where the agent's API spec is published, when `describe` says
     // (declaration.js): a reference beside the description, never the
@@ -1543,7 +1562,13 @@ export function registerRolloutDriver(api, {
 
   driver = createRolloutDriver({
     transport: registeredTransport,
-    enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
+    enqueue: typeof enqueueFn === "function"
+      ? (injection) => enqueueFn.call(api.session?.workflow ?? api, injection)
+      : () => {
+        throw new ConfigurationError(
+          "this host starts its own rollout turns; nothing is injected");
+      },
+    cancel,
     logger,
     executionIdentity,
     env,
@@ -1641,7 +1666,7 @@ export function registerRolloutDriver(api, {
       // No transport of its own: it claims through `driver.claim`, which is
       // both the registration gate and the outbox drain. See `claim` above.
       driver,
-      startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
+      startTurn: startTurn ?? cronTurnStarter(() => gatewayCtx?.getCron?.()),
       logger,
     });
     const capture = (ctx) => {

@@ -765,8 +765,10 @@ describe("the claim / deliver / report loop", () => {
     );
     assert.equal(tx.calls.report.length, 1);
     assert.equal(tx.calls.abandon.length, 0);
-    // `success` is not asserted true on a failed run, and never `[]` for calls.
-    assert.equal(tx.calls.report[0][1].success, undefined);
+    // A run the host says failed is reported `success: false` -- as Python
+    // reports an agent that raised -- never true and never no verdict; and
+    // never `[]` for calls.
+    assert.equal(tx.calls.report[0][1].success, false);
   });
 
   // THE AGENT'S OWN GRADE. The Python runner reads
@@ -824,7 +826,8 @@ describe("the claim / deliver / report loop", () => {
   });
 
   it("ignores a malformed grade and never coerces one", async () => {
-    const { output } = await driven({ reward: "1", success: "yes" });
+    // No host verdict, so only the file could supply one -- and must not.
+    const { output } = await driven({ reward: "1", success: "yes" }, { event: {} });
     assert.equal(output.reward, undefined);
     assert.equal(output.success, undefined);
   });
@@ -861,7 +864,8 @@ describe("the claim / deliver / report loop", () => {
 
   it("does not grade a rollout with a file written before it ran", async () => {
     // An episode that never reached `onAgentEnd` leaves its file behind.
-    const { output, path } = await driven({ reward: 1, success: true }, { write: "before" });
+    const { output, path } = await driven(
+      { reward: 1, success: true }, { write: "before", event: {} });
     assert.equal(output.reward, undefined);
     assert.equal(output.success, undefined);
     assert.equal(existsSync(path), false);

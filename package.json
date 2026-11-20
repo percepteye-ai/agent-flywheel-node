@@ -1,16 +1,28 @@
 {
   "name": "@percepteye/agent-flywheel",
   "version": "0.5.0",
-  "description": "Close the loop on your OpenClaw or DeepSeek Harness agent: record what your tools actually did — ok, failed or unknown — claim graded rollouts in training mode, and report them back. Never alters a tool result; set PERCEPTEYE_AGENT_MODE=production for a serving install, which claims no rollouts and starts no turn but does capture the turns you serve and apply the system prompt and the model your control plane has approved.",
+  "description": "Agent Flywheel for JavaScript and TypeScript agents: capture the turns your agent serves, run the graded training rollouts your control plane sends, and apply the system prompt and model a person approved. Works with any framework (Vercel AI SDK, LangChain.js, LangGraph.js, Mastra, the OpenAI SDK or plain code) through one import, and loads as a plugin into OpenClaw and DeepSeek Harness. Never alters a tool result. Zero runtime dependencies.",
   "license": "MIT",
   "author": "PerceptEye",
   "type": "module",
   "main": "./src/index.js",
+  "types": "./types/index.d.ts",
   "bin": {
     "agent-flywheel": "src/cli.js"
   },
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./ai-sdk": {
+      "types": "./types/ai-sdk.d.ts",
+      "default": "./src/adapters/ai-sdk.js"
+    },
+    "./langchain": {
+      "types": "./types/langchain.d.ts",
+      "default": "./src/adapters/langchain.js"
+    },
     "./classify": "./src/classify.js",
     "./trajectory": "./src/trajectory.js",
     "./dsh": "./src/dsh.js",
@@ -20,6 +32,7 @@
   "files": [
     "src",
     "schema",
+    "types",
     "openclaw.plugin.json",
     "cordis.patch.yml",
     "README.md",
@@ -37,7 +50,15 @@
     "agent",
     "reinforcement-learning",
     "continual-learning",
-    "observability"
+    "observability",
+    "typescript",
+    "vercel-ai-sdk",
+    "ai-sdk",
+    "langchain",
+    "langgraph",
+    "mastra",
+    "llm",
+    "agents"
   ],
   "engines": {
     "node": ">=22.22.3"
