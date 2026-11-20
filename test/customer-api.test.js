@@ -5,7 +5,7 @@ import "./support/home.js";
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigurationError, TransportError } from "../src/errors.js";
 import { ContractError } from "../src/wire.js";
@@ -290,7 +290,7 @@ describe("customer api", () => {
 
 describe("the customer api's own source of truth", () => {
   it("declares the contract version Mission Control's source declares (XR-2)", () => {
-    // Read from customer_contract.py, not docs/openapi.json, which is
+    // Read from the control plane's customer_contract.py, not docs/openapi.json, which is
     // generated and can lag it. A set PERCEPTEYE_CONTROL_PLANE_CHECKOUT is a
     // promise (a release, docs/RELEASING.md), so a missing file fails; unset
     // (every CI run, which cannot name a private checkout) only the shape is
@@ -298,8 +298,12 @@ describe("the customer api's own source of truth", () => {
     assert.match(CUSTOMER_CONTRACT_VERSION, /^1\.[0-9]+\.[0-9]+$/);
     const checkout = process.env.PERCEPTEYE_CONTROL_PLANE_CHECKOUT;
     if (!checkout) return;
-    const source = readFileSync(
-      join(checkout, "mission_control", "api", "customer_contract.py"), "utf8");
+    // The control plane's package directory is found, not named: this file
+    // is published, and the open-source boundary forbids its internal paths.
+    const pkg = readdirSync(checkout, { withFileTypes: true }).find((e) => e.isDirectory()
+      && existsSync(join(checkout, e.name, "api", "customer_contract.py")));
+    assert.ok(pkg, `no */api/customer_contract.py under ${checkout}`);
+    const source = readFileSync(join(checkout, pkg.name, "api", "customer_contract.py"), "utf8");
     const declared = /^CUSTOMER_CONTRACT_VERSION(?:: *Final)? *= *"([^"]+)"/m.exec(source);
     assert.ok(declared, "the control plane declares no version");
     assert.equal(declared[1], CUSTOMER_CONTRACT_VERSION);
