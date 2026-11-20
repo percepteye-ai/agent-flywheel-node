@@ -40,6 +40,7 @@ const trainingApi = () => {
     config: { plugins: { entries: {
       [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
     session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+    registerProvider: () => {},
   };
 };
 const TRAINING_ENV = () => testEnv({

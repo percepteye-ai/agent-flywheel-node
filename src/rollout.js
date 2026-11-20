@@ -122,6 +122,10 @@ import { declareRulebook, rulesNeverSent } from "./transport.js";
 import { takeReportedOutcome, TRAJECTORY_DIR_ENV } from "./trajectory.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
+import {
+  PROVIDER_ID, PROVIDER_TRANSPORT_API, registerFlywheelProvider,
+  subscribeModelResolve,
+} from "./policy.js";
 
 export const SESSION_START = "session_start";
 export const SESSION_END = "session_end";
@@ -133,6 +137,18 @@ export const GATEWAY_STOP = "gateway_stop";
 
 /** The host's own ceilings, so an oversized task is refused, not dropped. */
 export const MAX_INJECTION_BYTES = 32 * 1024;
+
+/**
+ * The model a rollout asks its gateway for. SYMBOLIC, as Mission Control's
+ * per-rollout gateway documents it (`inference.py`): the agent must not know
+ * or choose which model is under training, and the gateway replaces this
+ * with the checkpoint the rollout was minted for.
+ */
+export const ROLLOUT_MODEL = "policy";
+
+/** Where a rollout's credential comes from, said one way. */
+export const ROLLOUT_KEY_ORIGIN =
+  "the rollout's own key for its per-rollout gateway (the claim's api_key)";
 
 /**
  * Everything that must be true before this install claims work.
@@ -267,6 +283,52 @@ export function createRolloutDriver({
    */
   const claiming = new Set();
   let warnedMissingModelCallCount = false;
+
+  // ── WHERE A ROLLOUT SAMPLES ────────────────────────────────────────────
+  //
+  // THROUGH ITS OWN GATEWAY, `rollout.llmUrl` with `rollout.apiKey`, and
+  // nowhere else. Those calls are the policy being trained, and the gateway
+  // is where Mission Control captures them; the Python SDK points a rollout
+  // there with OPENAI_BASE_URL. This lane parsed both fields and read neither,
+  // so every OpenClaw rollout ran on the host's configured model and was
+  // scored as the checkpoint's.
+  //
+  // The mechanism is production's, not a second one: `before_model_resolve`
+  // names the provider this plugin registers (`policy.js
+  // registerFlywheelProvider`), and its transport and credential seams answer
+  // with the routed rollout's address and key. The host's provider contexts
+  // carry no session, so they answer for the rollout the model hook last
+  // routed -- one at a time, which the shared claim gate guarantees -- and
+  // only while it is still in flight: when it ends, a later call through the
+  // provider finds no address, and the session's next turn is not routed.
+  let routed = null;
+  const live = (rollout) => {
+    if (!rollout) return false;
+    for (const held of inFlight.values()) if (held === rollout) return true;
+    return false;
+  };
+  const route = {
+    /** `before_model_resolve`: our provider for a session running a rollout. */
+    handleModelResolve(_event, ctx) {
+      const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
+      const rollout = sessionKey ? inFlight.get(sessionKey) : null;
+      if (!rollout?.llmUrl) return undefined;
+      routed = rollout;
+      return { providerOverride: PROVIDER_ID, modelOverride: ROLLOUT_MODEL };
+    },
+    /** The provider's address: the routed rollout's gateway, verbatim. */
+    normalizeTransport(ctx) {
+      if (ctx?.provider !== PROVIDER_ID || !live(routed)) return undefined;
+      return { api: PROVIDER_TRANSPORT_API, baseUrl: routed.llmUrl };
+    },
+    /** The provider's credential: the routed rollout's own key. */
+    resolveSyntheticAuth(ctx) {
+      if (ctx?.provider !== PROVIDER_ID || !live(routed) || !routed.apiKey) {
+        return undefined;
+      }
+      return { apiKey: routed.apiKey, source: ROLLOUT_KEY_ORIGIN, mode: "api-key" };
+    },
+  };
 
   function stopHeartbeat(sessionKey) {
     const state = heartbeats.get(sessionKey);
@@ -822,7 +884,7 @@ export function createRolloutDriver({
   // different ways.
   return {
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
-    onBeforeToolCall, rolloutFor,
+    onBeforeToolCall, rolloutFor, route,
     onModelCallStarted, onModelCallEnded,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
@@ -903,6 +965,27 @@ export function registerRolloutDriver(api, {
     logger?.warn?.(
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
       `claimed task could not be delivered to the agent. Not claiming.`,
+    );
+    declareWithoutDriving();
+    return null;
+  }
+
+  // THE ROUTE TO THE CHECKPOINT BEING TRAINED, opened before anything is
+  // claimed. A rollout that cannot be pointed at its own gateway would run on
+  // this host's configured model and be scored as the checkpoint's -- data
+  // that teaches the policy about a model it is not -- so a host that will
+  // not register the provider gets no rollouts, and is told why.
+  let driver = null;
+  const routeRefusal = registerFlywheelProvider(api, {
+    answer: () => driver?.route,
+    hint: `Supplied for you in training mode: a rollout session authenticates ` +
+      `to its own per-rollout gateway with ${ROLLOUT_KEY_ORIGIN}.`,
+  });
+  if (routeRefusal) {
+    logger?.warn?.(
+      `[${pluginId}] not claiming rollouts: ${routeRefusal}. A rollout must ` +
+      `sample through its own gateway (the checkpoint being trained); on ` +
+      `this host's own model it would be scored as something it is not.`,
     );
     declareWithoutDriving();
     return null;
@@ -1036,7 +1119,7 @@ export function registerRolloutDriver(api, {
     heartbeat: (...args) => transport.heartbeat(...args),
   };
 
-  const driver = createRolloutDriver({
+  driver = createRolloutDriver({
     transport: registeredTransport,
     enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
     logger,
@@ -1053,6 +1136,9 @@ export function registerRolloutDriver(api, {
         `[${pluginId}] rollout hook failed: ${err?.message ?? err}`));
   };
 
+  // Routing returns its decision, so it is not behind `safe`, which discards
+  // what a handler returns.
+  subscribeModelResolve(api, (event, ctx) => driver.route.handleModelResolve(event, ctx));
   api.on(SESSION_START, safe(driver.onSessionStart));
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));

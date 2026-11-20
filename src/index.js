@@ -64,11 +64,17 @@
  *
  * They are a certified PAIR, which is why they are applied together and why
  * applying one alone is reported as such. That is the last mile of the loop
- * this package exists to close, and the only thing here that changes what the
- * agent does rather than recording it. `policy.js` holds both decisions, the
- * pair check, the per-agent scope, and the two off switches --
- * `applyPrompt: false` / PERCEPTEYE_APPLY_PROMPT=0 and `applyModel: false` /
+ * this package exists to close. `policy.js` holds both decisions, the pair
+ * check, the per-agent scope, and the two off switches -- `applyPrompt:
+ * false` / PERCEPTEYE_APPLY_PROMPT=0 and `applyModel: false` /
  * PERCEPTEYE_APPLY_MODEL=0.
+ *
+ * WHAT TRAINING MODE CHANGES: the model a ROLLOUT samples. A session running
+ * a claimed rollout is pointed, through the same provider, at that rollout's
+ * own gateway (`rollout.llmUrl`) -- the checkpoint being trained, where its
+ * calls are captured and scored -- and back to the host's own model when the
+ * rollout ends (`rollout.js`, "WHERE A ROLLOUT SAMPLES"). No other session's
+ * model changes, and no approved prompt or model is applied in training.
  */
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";

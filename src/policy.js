@@ -73,13 +73,19 @@
  * answers each call. The pair statement `announcePair` logged is the startup
  * answer's.
  *
- * ── TRAINING MODE DOES NOT REACH THIS FILE ────────────────────────────────
+ * ── TRAINING MODE REACHES THE PROVIDER, AND NOTHING ELSE HERE ────────────
  *
  * `registerServingPolicy` is called from the production branch of
- * `index.js` only, the same structural split `mode.js` describes. A rollout is
- * evidence about the agent as configured; applying an unproven prompt or model
- * during one would change the behaviour being measured and attribute the
- * difference to the gradient step.
+ * `index.js` only, the same structural split `mode.js` describes: a rollout
+ * is evidence about the agent as configured, and applying an approved prompt
+ * or model during one would change the behaviour being measured.
+ *
+ * What training DOES share is the provider seam (`registerFlywheelProvider`,
+ * `subscribeModelResolve`): a rollout must sample through ITS OWN gateway
+ * (`rollout.llmUrl`, with the rollout's key), because that is the checkpoint
+ * being trained and those are the trajectories that get scored. That is not
+ * applying a policy; it is where the rollout's model is. `rollout.js` routes
+ * its rollout sessions through the same provider this file registers.
  *
  * ── THE HOST SEAMS ────────────────────────────────────────────────────────
  *
@@ -1271,6 +1277,60 @@ export function createPolicySource({
 }
 
 /**
+ * Register THE provider this plugin answers for, and say why not when it
+ * cannot. The one seam that turns `providerOverride: PROVIDER_ID` into an
+ * address and a credential, shared by BOTH lanes: production points an agent
+ * at its approved model through it, and training points a rollout at its own
+ * per-rollout gateway through it (`rollout.js`). `answer()` is whatever
+ * currently decides -- the policy source, or the rollout router -- and must
+ * offer `normalizeTransport` and `resolveSyntheticAuth`, each of which
+ * answers for `PROVIDER_ID` only.
+ *
+ * @returns {string|null} the refusal, or null once registered
+ */
+export function registerFlywheelProvider(api, { answer, hint }) {
+  if (typeof api?.registerProvider !== "function") {
+    return NO_PROVIDER_SURFACE_REASON;
+  }
+  try {
+    api.registerProvider({
+      id: PROVIDER_ID,
+      label: "PerceptEye Flywheel",
+      // An empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
+      // leaves the host's auth surfaces with nothing to show an operator,
+      // and this is the one place an operator reads where the key comes
+      // from before any answer has arrived.
+      auth: [{ id: "api_key", label: "API key", kind: "api_key", hint }],
+      normalizeTransport: (ctx) => answer()?.normalizeTransport(ctx),
+      // THE CREDENTIAL, supplied rather than asked for: the host's last
+      // resort after the operator's own profile, env and config entry.
+      resolveSyntheticAuth: (ctx) => answer()?.resolveSyntheticAuth(ctx),
+    });
+  } catch (err) {
+    // A refused provider registration must not take anything else down with
+    // it -- it costs what needed the provider, and only that.
+    return providerRefusedReason(err?.message ?? err);
+  }
+  return null;
+}
+
+/**
+ * Subscribe `before_model_resolve` to `handle`, swallowing a throw: the hook
+ * sits in front of every model call, and one swallowed error is a call on the
+ * host's own model, where a throw would be a host warning per call, forever.
+ * Shared by both lanes, as `registerFlywheelProvider` is.
+ */
+export function subscribeModelResolve(api, handle) {
+  api.on(MODEL_HOOK_NAME, (event, ctx) => {
+    try {
+      return handle(event, ctx ?? null);
+    } catch {
+      return undefined;
+    }
+  });
+}
+
+/**
  * Subscribe both seams and start the one-shot read. Production only.
  *
  * Returns the source whether or not anything was wired, so a caller always
@@ -1323,45 +1383,21 @@ export function registerServingPolicy(api, {
   const openModelSeam = () => {
     if (!applyModel) return MODEL_OFF_REASON;
     if (!conversationAccess) return modelHookBlockedReason(pluginId);
-    if (typeof api.registerProvider !== "function") {
-      return NO_PROVIDER_SURFACE_REASON;
-    }
-    try {
-      // REGISTERED BEFORE WE KNOW WHETHER A MODEL IS SERVED:
-      // `providerOverride` names it on a later turn, and a provider registered
-      // at that point would be too late. It answers for nothing until
-      // `appliedModel` is set, and never for anyone else's provider id.
-      api.registerProvider({
-        id: PROVIDER_ID,
-        label: "PerceptEye Flywheel",
-        // The served endpoint is OpenAI-compatible and may need a key, which
-        // the control plane names rather than this plugin inventing one. An
-        // empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
-        // leaves the host's auth surfaces with nothing to show an operator,
-        // and this is the one place an operator reads where the key comes
-        // from before any answer has arrived.
-        auth: [{
-          id: "api_key",
-          label: "API key",
-          kind: "api_key",
-          hint: `Supplied for you when the control plane names ` +
-            `${FLYWHEEL_KEY_ENV} for a served endpoint at its own address: ` +
-            `the provider authenticates with ${flywheelKeyOrigin(pluginId)}. ` +
-            `Set models.providers.${PROVIDER_ID}.apiKey for any other ` +
-            "endpoint that needs a credential; yours takes precedence.",
-        }],
-        normalizeTransport: (ctx) => source?.normalizeTransport(ctx),
-        // THE CREDENTIAL, supplied rather than asked for: the host's last
-        // resort after the operator's own profile, env and config entry.
-        resolveSyntheticAuth: (ctx) => source?.resolveSyntheticAuth(ctx),
-      });
-    } catch (err) {
-      // A refused provider registration must not take the prompt half, the
-      // turn capture, or the plugin load down with it -- it costs the MODEL
-      // half, and only that.
-      return providerRefusedReason(err?.message ?? err);
-    }
-    return null;
+    // REGISTERED BEFORE WE KNOW WHETHER A MODEL IS SERVED:
+    // `providerOverride` names it on a later turn, and a provider registered
+    // at that point would be too late. It answers for nothing until
+    // `appliedModel` is set, and never for anyone else's provider id.
+    return registerFlywheelProvider(api, {
+      answer: () => source,
+      // The served endpoint is OpenAI-compatible and may need a key, which
+      // the control plane names rather than this plugin inventing one.
+      hint: `Supplied for you when the control plane sends a key for a ` +
+        `served endpoint, or names ${FLYWHEEL_KEY_ENV} for one at its own ` +
+        `address: the provider then authenticates with that key, or with ` +
+        `${flywheelKeyOrigin(pluginId)}. Set models.providers.${PROVIDER_ID}` +
+        ".apiKey for any other endpoint that needs a credential; yours takes " +
+        "precedence.",
+    });
   };
 
   // Not attempted at all with no key: nothing is read, so there is nothing for
@@ -1438,13 +1474,7 @@ export function registerServingPolicy(api, {
       `${modelBlocked}. ${MODEL_HOOK_NAME} is not subscribed. The prompt ` +
       "half is unaffected.");
   } else {
-    api.on(MODEL_HOOK_NAME, (event, ctx) => {
-      try {
-        return source.handleModelResolve(event, ctx ?? null);
-      } catch {
-        return undefined;
-      }
-    });
+    subscribeModelResolve(api, (event, ctx) => source.handleModelResolve(event, ctx));
   }
 
   // NOT AWAITED and never rejecting: `register()` must return to the host

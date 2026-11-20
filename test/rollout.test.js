@@ -41,14 +41,19 @@ const ROLLOUT_HOOKS = [
 ];
 
 /** A host api that records what was subscribed. */
-function fakeApi({ conversationAccess = true, enqueue } = {}) {
+function fakeApi({ conversationAccess = true, enqueue, providerSurface = true } = {}) {
   const hooks = [];
   const enqueued = [];
   const logs = [];
+  const providers = [];
   return {
     hooks,
     enqueued,
     logs,
+    providers,
+    /** What the host's hook dispatcher would get back from `name`. */
+    hook: (name) => hooks.find((h) => h.name === name)?.fn,
+    ...(providerSurface ? { registerProvider: (p) => providers.push(p) } : {}),
     id: PLUGIN_ID,
     logger: {
       info: (m) => logs.push(String(m)),
@@ -425,6 +430,71 @@ function fakeTransport(overrides = {}) {
     abandon: overrides.abandon ?? (async (r, o) => { calls.abandon.push([r, o]); }),
   };
 }
+
+describe("a rollout samples through ITS OWN gateway (the checkpoint being trained)", () => {
+  // `rollout.llmUrl` / `rollout.apiKey` were parsed and read nowhere, so every
+  // OpenClaw rollout ran on the host's configured model and was scored as the
+  // checkpoint's. Driven end to end through what the host calls: the
+  // `before_model_resolve` hook, then the registered provider's transport
+  // and credential seams.
+  function routedHarness(api = fakeApi()) {
+    const transport = {
+      async health() { return { contract_versions_supported: ["flywheel/1"] }; },
+      async register() { return { accepted: true }; },
+      async claim() {
+        return { rollouts: [{
+          rolloutId: "r7", turnInput: "do it", llmUrl: "https://cp.example/llm/v1/o/org/rollouts/r7",
+          apiKey: "rk_r7", deadlineTs: Date.now() / 1000 + 3600,
+        }] };
+      },
+      async report() {}, async abandon() {}, async heartbeat() {},
+    };
+    const driver = registerRolloutDriver(api, {
+      env: testEnv(), config: { mode: "training", apiKey: "key", agentId: "support" },
+      transport, pluginId: PLUGIN_ID, logger: api.logger,
+    });
+    return { api, driver };
+  }
+  const OURS = { provider: "percepteye-flywheel" };
+
+  it("routes a rollout session's model calls to rollout.llmUrl with the rollout's key, and reverts when it ends", async () => {
+    const { api, driver } = routedHarness();
+    assert.equal(api.providers.length, 1, "the provider is registered before any claim");
+    const provider = api.providers[0];
+    const resolve = api.hook("before_model_resolve");
+    assert.ok(resolve, "before_model_resolve is subscribed in training mode");
+
+    await driver.onSessionStart({ sessionKey: "s1" });
+    assert.deepEqual(resolve({ prompt: "hi" }, { sessionKey: "s1" }), {
+      providerOverride: "percepteye-flywheel", modelOverride: "policy",
+    });
+    assert.deepEqual(provider.normalizeTransport(OURS), {
+      api: "openai-completions", baseUrl: "https://cp.example/llm/v1/o/org/rollouts/r7",
+    });
+    assert.equal(provider.resolveSyntheticAuth(OURS).apiKey, "rk_r7");
+    // Somebody else's provider and a session with no rollout are never ours.
+    assert.equal(provider.normalizeTransport({ provider: "openai" }), undefined);
+    assert.equal(provider.resolveSyntheticAuth({ provider: "openai" }), undefined);
+    assert.equal(resolve({ prompt: "hi" }, { sessionKey: "a-person" }), undefined);
+
+    await driver.onAgentEnd(
+      { success: true, messages: [{ role: "assistant", content: "done" }] },
+      { sessionKey: "s1" },
+    );
+    assert.equal(resolve({ prompt: "hi" }, { sessionKey: "s1" }), undefined,
+      "the session's next turn runs on the host's own model");
+    assert.equal(provider.normalizeTransport(OURS), undefined);
+    assert.equal(provider.resolveSyntheticAuth(OURS), undefined);
+  });
+
+  it("claims nothing on a host that cannot register the provider, and says why", async () => {
+    const api = fakeApi({ providerSurface: false });
+    const { driver } = routedHarness(api);
+    assert.equal(driver, null);
+    assert.ok(!api.hooks.some((h) => h.name === "session_start"));
+    assert.match(api.logs.join("\n"), /not claiming rollouts: .*api\.registerProvider is missing/);
+  });
+});
 
 describe("the claim / deliver / report loop", () => {
   it("delivers the claimed task into the next turn", async () => {

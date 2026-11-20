@@ -402,6 +402,7 @@ describe("the plugin wires the rollout driver to the recorder", () => {
       config: { plugins: { entries: {
         [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
       session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+      registerProvider: () => {},
       logger: { info() {}, warn() {} },
     };
     const t = fakeTracer();
