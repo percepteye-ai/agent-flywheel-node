@@ -79,9 +79,15 @@ const CLIENT = 3;
 // OTLP Status.StatusCode ERROR, set only when an operation ended in an error.
 const STATUS_ERROR = 2;
 
-/** A content value as the JSON string carried on the span. */
+/**
+ * A content value as the JSON string carried on the span. ALWAYS a string:
+ * `JSON.stringify` answers `undefined` (not a string) for `undefined`, a
+ * function or a symbol, which put `{stringValue: undefined}` on the wire --
+ * an attribute OTLP cannot decode. Those are JSON `null`, the bytes Python's
+ * `json.dumps(None)` writes for the absent value.
+ */
 export function contentJson(value) {
-  return JSON.stringify(value);
+  return JSON.stringify(value) ?? "null";
 }
 
 /** Wall-clock nanoseconds as a decimal string (the value exceeds 2**53). */
@@ -111,8 +117,21 @@ function isId(value, pattern) {
   return typeof value === "string" && pattern.test(value) && /[^0]/.test(value);
 }
 
+/** The largest time OTLP carries: `fixed64` nanoseconds. */
+const UINT64_MAX = (1n << 64n) - 1n;
+
+/** A decimal nanosecond time OTLP can carry, else `null`: a `fixed64`, so a
+ * string of digits past 2**64 - 1 names no time the wire can hold. */
 function nanos(value) {
-  return typeof value === "string" && DECIMAL.test(value) ? value : null;
+  return typeof value === "string" && DECIMAL.test(value)
+    && BigInt(value) <= UINT64_MAX ? value : null;
+}
+
+/** A span's end, never before its start: an operation observed to end before
+ * it began (a clock step between the two readings) is rendered as taking no
+ * time, not as a span whose duration is negative. */
+function notBefore(start, end) {
+  return BigInt(end) < BigInt(start) ? start : end;
 }
 
 function text(value) {
@@ -157,8 +176,11 @@ function geminiOutputFormat(request) {
   if (typeof mime !== "string" || mime.trim().toLowerCase() !== "application/json") {
     return null;
   }
+  // ONE MIME key: the spelling that was read. A request carrying both
+  // spellings asked for one format, and the other (possibly a different
+  // type) is not what decided it.
   return Object.fromEntries(Object.entries(request).filter(([k, v]) => (
-    (GEMINI_MIME_KEYS.includes(k) && typeof v === "string")
+    (k === key && typeof v === "string")
     || (GEMINI_SCHEMA_KEYS.includes(k) && isObject(v)))));
 }
 
@@ -181,7 +203,7 @@ function finishSpan(op, attrs, { traceId, spanId, parent, name, kind, start, end
 function chatSpan(op, { traceId, parent, conversationId }) {
   const spanId = op.span_id;
   const start = nanos(op.start_time_unix_nano);
-  const end = nanos(op.end_time_unix_nano);
+  let end = nanos(op.end_time_unix_nano);
   const provider = text(op.provider_name);
   // The conventions REQUIRE the provider and the requested model on an
   // inference span; a call observed without either is skipped rather than
@@ -192,6 +214,7 @@ function chatSpan(op, { traceId, parent, conversationId }) {
       || !Array.isArray(inputs)) {
     return null;
   }
+  end = notBefore(start, end);
   const attrs = [
     attr("gen_ai.operation.name", s("chat")),
     attr("gen_ai.provider.name", s(provider)),
@@ -231,9 +254,10 @@ function chatSpan(op, { traceId, parent, conversationId }) {
 function toolSpan(op, { traceId, parent, conversationId, agentName }) {
   const spanId = op.span_id;
   const start = nanos(op.start_time_unix_nano);
-  const end = nanos(op.end_time_unix_nano);
+  let end = nanos(op.end_time_unix_nano);
   const name = text(op.tool_name);
   if (!isId(spanId, HEX16) || !start || !end || !name) return null;
+  end = notBefore(start, end);
   const attrs = [
     attr("gen_ai.operation.name", s("execute_tool")),
     attr("gen_ai.tool.name", s(name)),
@@ -270,12 +294,13 @@ export function renderTurnTrace(observation, { agentName, conversationId = null 
   const traceId = observation.trace_id;
   const rootId = observation.span_id;
   const start = nanos(observation.start_time_unix_nano);
-  const end = nanos(observation.end_time_unix_nano);
+  let end = nanos(observation.end_time_unix_nano);
   const operations = observation.operations;
   if (!isId(traceId, HEX32) || !isId(rootId, HEX16) || !start || !end
       || !Array.isArray(operations)) {
     return null;
   }
+  end = notBefore(start, end);
   const conversation = text(conversationId);
   const children = [];
   let provider = null;

@@ -229,3 +229,46 @@ describe("the requested output format", () => {
     }
   });
 });
+
+describe("values the wire cannot carry (ND-M18)", () => {
+  const base = () => clone(GOLDEN.vectors[0].observation);
+  const render = (obs) => renderTurnTrace(obs, { agentName: "a" });
+
+  it("content JSON is always a string, null for undefined", () => {
+    // Mutation: drop `?? "null"` -> contentJson(undefined) is undefined, red.
+    assert.equal(contentJson(undefined), "null");
+    assert.equal(contentJson(() => 1), "null");
+    const obs = base();
+    const tool = obs.operations.find((op) => op.operation === "execute_tool");
+    tool.arguments = undefined;
+    const span = spans(render(obs)).find((sp) => sp.name.startsWith("execute_tool"));
+    assert.deepStrictEqual(attrs(span)["gen_ai.tool.call.arguments"], { stringValue: "null" });
+  });
+
+  it("refuses a time past uint64", () => {
+    // Mutation: drop the UINT64_MAX bound -> the trace renders, red.
+    const obs = base();
+    obs.end_time_unix_nano = "18446744073709551616";
+    assert.equal(render(obs), null);
+    obs.end_time_unix_nano = "18446744073709551615";
+    assert.notEqual(render(obs), null);
+  });
+
+  it("never renders a span that ends before it starts", () => {
+    // Mutation: drop notBefore -> end < start on the chat span, red.
+    const obs = base();
+    const chat = obs.operations.find((op) => op.operation === "chat");
+    chat.end_time_unix_nano = String(BigInt(chat.start_time_unix_nano) - 5n);
+    for (const sp of spans(render(obs))) {
+      assert.ok(BigInt(sp.endTimeUnixNano) >= BigInt(sp.startTimeUnixNano), sp.name);
+    }
+  });
+
+  it("keeps only the Gemini MIME key that was read", () => {
+    // Mutation: keep every MIME spelling -> both keys survive, red.
+    assert.deepStrictEqual(
+      requestedOutputFormat({ response_mime_type: "application/json",
+        responseMimeType: "text/plain", responseSchema: { type: "OBJECT" } }),
+      { response_mime_type: "application/json", responseSchema: { type: "OBJECT" } });
+  });
+});
