@@ -117,9 +117,15 @@ import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
-import { createOutbox, outboxDir } from "./outbox.js";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { createOutbox, outboxDir, pathSegment } from "./outbox.js";
+import { percepteyeHome } from "./session.js";
 import { declareRulebook, rulesNeverSent } from "./transport.js";
-import { takeReportedOutcome, TRAJECTORY_DIR_ENV } from "./trajectory.js";
+import {
+  readTrajectory, takeReportedOutcome, TOOL_CALLS_FILENAME, TRAJECTORY_DIR_ENV,
+} from "./trajectory.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
 import {
@@ -191,6 +197,20 @@ export function driveVerdict(config, api, pluginId) {
   return { canDrive: true, reason: null };
 }
 
+/**
+ * Where one claimed rollout's tool calls are recorded:
+ * `$PERCEPTEYE_HOME/trajectories/<agentId>/<rolloutId>/`, beside the outbox
+ * and keyed the same way. ONE DIRECTORY PER ROLLOUT, as the Python runner
+ * gives each rollout its own (`_trajectory_dir`): a process-wide directory
+ * would hand one rollout every call the process ever made.
+ */
+export function rolloutTrajectoryDir(agentId, rolloutId, env = process.env) {
+  return join(
+    percepteyeHome(env), "trajectories", pathSegment(agentId ?? "agent"),
+    pathSegment(rolloutId),
+  );
+}
+
 /** The task, as the agent will read it. */
 export function taskText(rollout) {
   return (
@@ -219,6 +239,11 @@ export function createRolloutDriver({
   now = () => Date.now(),
   env = process.env,
   outbox = null,
+  // Whether this host's tool recorder writes a rollout's calls where
+  // `trajectoryDirFor` says (index.js wires it). Only then are they read
+  // back and reported: a driver with no recorder behind it cannot claim to
+  // have observed zero calls.
+  recordsToolCalls = false,
 }) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
@@ -307,6 +332,17 @@ export function createRolloutDriver({
     for (const held of inFlight.values()) if (held === rollout) return true;
     return false;
   };
+  /** This rollout's own trajectory directory, or null without a recorder. */
+  const trajectoryOf = (rollout) => (recordsToolCalls && rollout?.rolloutId
+    ? rolloutTrajectoryDir(transport?.agentId, rollout.rolloutId, env)
+    : null);
+  /** Remove a rollout's trajectory once its calls are reported or moot. */
+  const dropTrajectory = (rollout) => {
+    const dir = trajectoryOf(rollout);
+    if (!dir) return;
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* disk */ }
+  };
+
   const route = {
     /** `before_model_resolve`: our provider for a session running a rollout. */
     handleModelResolve(_event, ctx) {
@@ -404,6 +440,7 @@ export function createRolloutDriver({
         return;
       }
       if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
+      dropTrajectory(rollout);
       try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
       const runStarted = activeRuns.has(sessionKey);
       const runId = activeRuns.get(sessionKey) ?? undefined;
@@ -503,6 +540,7 @@ export function createRolloutDriver({
   async function giveBack(sessionKey, rollout, reason, detail) {
     stopHeartbeat(sessionKey);
     inFlight.delete(sessionKey);
+    dropTrajectory(rollout);
     try {
       modelCalls?.abandon?.(sessionKey);
     } catch {
@@ -523,6 +561,23 @@ export function createRolloutDriver({
     // An outcome file already there was written before this rollout ran --
     // by an episode that never reached `onAgentEnd` -- and is not its grade.
     takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
+    // A FRESH, EMPTY trajectory: a re-claim of the same rollout must not
+    // inherit an earlier attempt's calls, and an attempt that makes none is
+    // then read back as `[]` -- observed zero -- rather than as no file.
+    const dir = trajectoryOf(rollout);
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, TOOL_CALLS_FILENAME), "", "utf8");
+      } catch (err) {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId}'s trajectory could ` +
+          `not be prepared (${err?.message ?? err}); its tool calls will be ` +
+          `reported as not observed.`);
+        dropTrajectory(rollout);
+      }
+    }
     inFlight.set(sessionKey, rollout);
     startHeartbeat(sessionKey, rollout);
     try {
@@ -788,6 +843,15 @@ export function createRolloutDriver({
     // reader, so an agent driven from here could never be scored by its own
     // environment. Same rules, one table (`wire.js reportedOutcome`).
     const stated = takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
+    // THE CALLS THE RECORDER OBSERVED in this rollout's session, read by the
+    // reader every lane uses (`readTrajectory`, the Python runner's
+    // `_attach_trajectory`): `null` when there is no trajectory to read, `[]`
+    // for one that recorded none, and every unparseable line counted into
+    // `tool_calls_omitted_count`, which forbids the training grade. This lane
+    // declares `reports_tool_calls: true` at registration -- which tells the
+    // control plane not to refuse it for reporting none -- and used to send
+    // none.
+    const trajectory = readTrajectory(trajectoryOf(rollout));
     try {
       // SPOOLED BEFORE IT IS SENT, and never merely awaited. `deliver` writes
       // the outcome to the outbox before the first network call and settles
@@ -799,9 +863,11 @@ export function createRolloutDriver({
       const delivered = await spool.deliver(rollout, {
         ...stated,
         finalText,
-        // `undefined`, never `[]`. The recorder owns tool calls and writes
-        // them to the trajectory; asserting zero here would overwrite what it
-        // observed with a claim this function cannot make.
+        // `undefined` -- not reported -- when there is no trajectory, never
+        // a `[]` this function did not read.
+        toolCalls: trajectory.calls ?? undefined,
+        toolCallsOmittedCount: trajectory.calls === null
+          ? undefined : trajectory.malformed,
         //
         // A value this lane already has is not replaced by the file's: the
         // host saying the run succeeded stands, and otherwise the
@@ -828,6 +894,9 @@ export function createRolloutDriver({
       // either landed or failed, not merely when the agent produced an answer.
       if (reporting.get(sessionKey) === rollout) reporting.delete(sessionKey);
       stopHeartbeat(sessionKey);
+      // Spooled with the outcome before the first send, so the directory is
+      // no longer the record of anything.
+      dropTrajectory(rollout);
     }
   }
 
@@ -878,13 +947,23 @@ export function createRolloutDriver({
     return sessionKey ? (inFlight.get(sessionKey) ?? null) : null;
   }
 
+  /**
+   * Where the tool recorder writes a call made in `ctx`'s session: that
+   * session's rollout's own trajectory, or null when it runs none. THE
+   * PRODUCER half of the seam `onAgentEnd` reads (index.js routes the
+   * training writer through it).
+   */
+  function trajectoryDirFor(ctx = {}) {
+    return trajectoryOf(rolloutFor(ctx));
+  }
+
   // `track` and `giveBack` are what the UNATTENDED runner needs: it does its
   // own claiming and turn-starting, but reporting and typed abandon must stay
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
   return {
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
-    onBeforeToolCall, rolloutFor, route,
+    onBeforeToolCall, rolloutFor, route, trajectoryDirFor,
     onModelCallStarted, onModelCallEnded,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
@@ -1125,6 +1204,10 @@ export function registerRolloutDriver(api, {
     logger,
     executionIdentity,
     env,
+    // `reports_tool_calls: true` is declared above, so the calls are read
+    // back and sent. The caller routes its tool recorder through
+    // `driver.trajectoryDirFor` (index.js does).
+    recordsToolCalls: true,
   });
 
   // Failures are swallowed at the boundary: a telemetry plugin must never be

@@ -496,6 +496,92 @@ describe("a rollout samples through ITS OWN gateway (the checkpoint being traine
   });
 });
 
+describe("a rollout reports the tool calls its session made (reports_tool_calls: true)", () => {
+  // Registration declares reports_tool_calls: true, which stops the control
+  // plane refusing the worker for reporting none -- and onAgentEnd sent none.
+  // Driven through register(): the host's after_tool_call hook, the real
+  // recorder and writer, the driver's report, and the request on the wire.
+  async function throughRegister(drive) {
+    const realFetch = globalThis.fetch;
+    const posted = [];
+    globalThis.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (init?.method === "POST") {
+        posted.push({ path, body: init.body ? JSON.parse(init.body) : null });
+      }
+      const body = path.endsWith("/health")
+        ? { contract_versions_supported: ["flywheel/1"] } : {};
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    try {
+      const api = fakeApi();
+      const env = testEnv({
+        PERCEPTEYE_AGENT_MODE: "training", PERCEPTEYE_API_KEY: "pefw_test",
+        PERCEPTEYE_CONTROL_PLANE_URL: "http://cp.test/api/flywheel/v1",
+      });
+      const out = register(api, {}, env);
+      await drive(api, out, env);
+      return posted;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+  const end = (out) => out.rollouts.onAgentEnd(
+    { success: true, messages: [{ role: "assistant", content: "done" }] },
+    { sessionKey: "s1" },
+  );
+
+  it("sends the calls observed in the rollout's session, and only those", async () => {
+    let dir = null;
+    const posted = await throughRegister(async (api, out) => {
+      const rollout = { rolloutId: "r42", turnInput: "x", llmUrl: "http://cp.test/llm", apiKey: "rk" };
+      out.rollouts.track("s1", rollout);
+      dir = out.rollouts.trajectoryDirFor({ sessionKey: "s1" });
+      const tool = api.hook("after_tool_call");
+      tool({ toolName: "read", params: { path: "a" }, result: "ok", toolCallId: "c1" },
+        { sessionKey: "s1", runId: "run1" });
+      tool({ toolName: "mcp_lookup", params: {}, result: { status: 200 } },
+        { sessionKey: "s1", runId: "run1" });
+      // A person's own session in the same process is not this rollout's.
+      tool({ toolName: "write", params: {}, result: "ok" },
+        { sessionKey: "a-person", runId: "run2" });
+      await end(out);
+    });
+    const result = posted.find((p) => p.path.endsWith("/rollouts/r42/result"));
+    assert.ok(result, "the result was posted");
+    assert.deepEqual(result.body.tool_calls.map((c) => [c.name, c.outcome]),
+      [["read", "ok"], ["mcp_lookup", "unknown"]]);
+    assert.equal(result.body.tool_calls[0].tool_call_id, "c1");
+    assert.equal(result.body.tool_calls_omitted_count, 0);
+    assert.equal(existsSync(dir), false, "the trajectory is removed once reported");
+  });
+
+  it("sends [] -- observed zero -- for a rollout that made no call", async () => {
+    const posted = await throughRegister(async (_api, out) => {
+      out.rollouts.track("s1", { rolloutId: "r43", turnInput: "x", llmUrl: "u", apiKey: "k" });
+      await end(out);
+    });
+    const result = posted.find((p) => p.path.endsWith("/rollouts/r43/result"));
+    assert.deepEqual(result.body.tool_calls, []);
+  });
+
+  it("counts an unreadable line as omitted, never as a complete list", async () => {
+    const posted = await throughRegister(async (api, out) => {
+      out.rollouts.track("s1", { rolloutId: "r44", turnInput: "x", llmUrl: "u", apiKey: "k" });
+      api.hook("after_tool_call")({ toolName: "read", params: {}, result: "ok" },
+        { sessionKey: "s1", runId: "run1" });
+      const dir = out.rollouts.trajectoryDirFor({ sessionKey: "s1" });
+      writeFileSync(join(dir, "tool_calls.jsonl"), "{not json\n", { flag: "a" });
+      await end(out);
+    });
+    const result = posted.find((p) => p.path.endsWith("/rollouts/r44/result"));
+    assert.equal(result.body.tool_calls.length, 1);
+    assert.equal(result.body.tool_calls_omitted_count, 1);
+  });
+});
+
 describe("the claim / deliver / report loop", () => {
   it("delivers the claimed task into the next turn", async () => {
     const enqueued = [];

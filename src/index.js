@@ -38,8 +38,10 @@
  * writes unconditionally -- and what it understated was the recording of
  * somebody's END USERS' message text. The truth:
  *
- *   training    tool outcomes go to the rollout's PERCEPTEYE_TRAJECTORY_DIR.
- *               With the variable unset nothing is written.
+ *   training    a claimed rollout's tool outcomes go to its own directory,
+ *               $PERCEPTEYE_HOME/trajectories/<agentId>/<rolloutId>, and are
+ *               reported with its result, then removed. Any other call goes
+ *               to PERCEPTEYE_TRAJECTORY_DIR; with that unset it is not written.
  *   production  every served turn -- the user's message, the tool calls, and
  *               (with allowConversationAccess) the agent's answer -- is written
  *               under PERCEPTEYE_CAPTURE_DIR, default ~/.percepteye/captured,
@@ -361,7 +363,10 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
   //
   // In TRAINING mode a trajectory belongs to one ROLLOUT, and the rollout
-  // driver names the directory through PERCEPTEYE_TRAJECTORY_DIR. Unchanged.
+  // driver names its directory (`trajectoryDirFor`), one per rollout, by the
+  // session running it. It used to be PERCEPTEYE_TRAJECTORY_DIR alone --
+  // which nothing here sets, and which is one directory for the whole
+  // process -- and the driver read nothing back.
   //
   // In PRODUCTION mode there is no rollout: a trajectory belongs to one TURN,
   // so each call is routed to its own turn directory by `runId`. The env var
@@ -372,7 +377,14 @@ export function register(api, pluginConfig = {}, env = process.env) {
     ? createTurnCapture({ root: captureRoot(env), logger })
     : null;
   const writer = createWriter({
-    resolveDir: turns ? turns.resolveToolDir : null,
+    // PRODUCTION: each call to its turn's directory. TRAINING: a call made
+    // in a session running a claimed rollout goes to THAT rollout's own
+    // trajectory, which `onAgentEnd` reads back and reports; any other call
+    // to PERCEPTEYE_TRAJECTORY_DIR, as before, when a harness sets it.
+    resolveDir: turns
+      ? turns.resolveToolDir
+      : (ctx) => rollouts?.trajectoryDirFor?.(ctx)
+        ?? process.env[TRAJECTORY_DIR_ENV] ?? null,
     onError: (err) => logger?.warn?.(
       `[${PLUGIN_ID}] trajectory write failed; tool outcomes are not being ` +
       `recorded for this run: ${err?.message ?? err}`,
