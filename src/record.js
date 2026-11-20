@@ -97,9 +97,9 @@ export function createRecorder({
           : undefined,
         entity_ids,
       }), {
-        // The WHOLE host context, with the run id resolved. Ignored by the
-        // default writer (a rollout has one directory); used by production
-        // capture, which routes the record to its turn by `runId` and also
+        // The WHOLE host context, with the run id resolved. Training routes
+        // the record by its session to that session's rollout's trajectory
+        // (index.js); production capture routes it to its turn by `runId` and also
         // records the conversation and task the context names. Handing it
         // only `{runId}` left that half reading fields that were never there.
         ...ctx,
