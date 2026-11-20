@@ -609,6 +609,7 @@ function trainingApi({ conversationAccess = true } = {}) {
     config: { plugins: { entries: {
       [PLUGIN_ID]: { hooks: { allowConversationAccess: conversationAccess } } } } },
     session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+    registerProvider: () => {},
   };
 }
 

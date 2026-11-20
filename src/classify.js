@@ -42,11 +42,22 @@ export const VERDICT_TOOLS = new Set([
  */
 export const IN_BAND_TOOLS = new Set(["bash", "exec"]);
 
+/**
+ * Where an exec result states its verdict, NUMBERS FIRST. An exit code is
+ * the process's own answer; a `status` word is the host's summary of it, and
+ * the two can disagree -- `{meta: {status: "ok"}, exitCode: 1}` is a command
+ * that failed. Reading `meta.status` first graded exactly that as `ok`.
+ */
 const EXIT_PATHS = [
-  ["meta", "exitCode"], ["meta", "exit_code"], ["meta", "status"],
-  ["details", "exitCode"], ["details", "status"],
+  ["meta", "exitCode"], ["meta", "exit_code"],
+  ["details", "exitCode"], ["details", "exit_code"],
   ["exitCode"], ["exit_code"],
+  ["meta", "status"], ["details", "status"],
 ];
+
+/** An `Error` a tool or host handed over: a failure, whatever the tool. */
+const isError = (value) => value instanceof Error
+  || Object.prototype.toString.call(value) === "[object Error]";
 
 function dig(obj, path) {
   let cur = obj;
@@ -71,7 +82,8 @@ export function readExit(result) {
 
 /**
  * @param {string} name       tool name, as the host reports it
- * @param {unknown} error     the host's error string; present only when truthy
+ * @param {unknown} error     the host's error: a string, or an `Error`;
+ *                            present only when truthy
  * @param {unknown} result    the tool result
  * @returns {{outcome:"ok"|"failed"|"unknown", status_code:null,
  *            error?:string, error_class?:string}}
@@ -86,6 +98,20 @@ export function classify(name, error, result) {
       // the part worth keeping. The Python SDK bounds it identically.
       error: bounded(error),
       error_class: "ToolError",
+    };
+  }
+  // The same assertion as an `Error` OBJECT rather than its message -- in
+  // the error field, or as the result itself. It used to fall through, and a
+  // VERDICT_TOOLS call (whose silence means success) was graded `ok` with
+  // the exception sitting in its result.
+  const thrown = isError(error) ? error : isError(result) ? result : null;
+  if (thrown) {
+    const message = String(thrown.message ?? "").trim();
+    return {
+      outcome: "failed",
+      status_code: null,
+      ...(message ? { error: bounded(message) } : {}),
+      error_class: String(thrown.name || "Error"),
     };
   }
 

@@ -308,6 +308,7 @@ describe("the production wiring", () => {
       config: { plugins: { entries: { "agent-flywheel": {
         hooks: { allowConversationAccess: true } } } } },
       session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+      registerProvider: () => {},
     };
     const driver = registerRolloutDriver(api, {
       config: { mode: "training", apiKey: "pefw_x", agentId: "svc-7" },

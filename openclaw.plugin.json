@@ -117,20 +117,11 @@
         "description": "Host-adapter evidence for exact execution identity. Component names are opaque to the SDK; incomplete or invalid evidence emits no identity. A startup observation enables pre-claim registration binding."
       },
       "mode": {
-        "type": "string",
-        "enum": [
-          "training",
-          "train",
-          "rollout",
-          "rollouts",
-          "fine-tuning",
-          "finetuning",
-          "improving",
-          "production",
-          "prod",
-          "serving"
+        "type": [
+          "string",
+          "null"
         ],
-        "description": "training: this install claims rollouts and drives turns. production: claims no rollout and starts no turn -- those hooks are never registered -- but captures the turns you serve and applies the system prompt your control plane approved. Unset means PERCEPTEYE_AGENT_MODE, then training; a value here overrides the environment."
+        "description": "training: this install claims rollouts and drives turns. production: claims no rollout and starts no turn -- those hooks are never registered -- but captures the turns you serve and applies the system prompt and the model your control plane approved. Unset (or null, or empty) means PERCEPTEYE_AGENT_MODE, then production; a value here overrides the environment. Spellings, in any case: training, train, rollout, rollouts, fine-tuning, finetuning, improving, production, prod, serving. Any other value runs production mode and says so."
       },
       "introspect": {
         "type": [

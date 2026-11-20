@@ -206,6 +206,7 @@ describe("rollout reporting", () => {
       session: { workflow: {
         enqueueNextTurnInjection: async () => ({ enqueued: true }),
       } },
+      registerProvider: () => {},
     };
     const driver = registerRolloutDriver(api, {
       env: testEnv(),

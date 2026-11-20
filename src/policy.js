@@ -39,58 +39,53 @@
  * Here we ARE the host's prompt and model seams, so the check that docstring
  * tells its caller to perform is ours to perform.
  *
- * ── RESOLVED AT START; THE PROMPT FOLLOWS LATER APPROVALS ──────────────────
+ * ── RESOLVED AT START; BOTH HALVES FOLLOW LATER ANSWERS ────────────────────
  *
- * Both reads happen once, after registration. The MODEL half's answer is held
- * for the life of the process (a moved address needs a restart, which is why
- * `serving_generation` supports equality and nothing else).
+ * Both reads happen once, after registration, and then `/policy/current` is
+ * read again at most once per `ttl_s` (floored at `PROMPT_REFRESH_MIN_MS`),
+ * on whichever hook runs first and never blocking it (`refresh`).
  *
  * THE PROMPT HALF DOES NOT STOP AT THE FIRST APPROVAL, because prompt
  * optimization does not. Mission Control keeps evolving the prompt from the
  * traces this agent keeps producing -- also while an operator has not yet
  * decided the last improvement -- and a round must beat the candidate already
- * waiting, so each approval is the best prompt found so far. A process that
- * applied its startup answer forever ran the first approval forever, and
- * nothing else re-read it: `serving_generation` did not even move for an
- * approved prompt until `prompt_generation` joined it.
+ * waiting, so each approval is the best prompt found so far. Only when the
+ * re-read's `prompt_generation` names a different approved prompt is the
+ * text re-read, and the decision is redone by the rule Python's
+ * `PolicySource` uses (`promptNeedsRefresh`, `refreshedPrompt`). The swap
+ * lands at a TURN boundary -- the turn that noticed runs the prompt it
+ * started with, the next runs the new one -- and every captured turn records
+ * the system prompt it actually ran. An empty or failed read never takes an
+ * applied prompt away. `PERCEPTEYE_APPLY_PROMPT=0` still turns the whole
+ * prompt half off.
  *
- * So at most once per `ttl_s` (floored at `PROMPT_REFRESH_MIN_MS`), on the
- * prompt hook itself and never blocking it, `/policy/current` is read again;
- * only when its `prompt_generation` names a different approved prompt is the
- * text re-read, and the decision is redone by the rule Python's `PolicySource`
- * uses (`promptNeedsRefresh`, `refreshedPrompt`). The swap lands at a TURN
- * boundary -- the turn that noticed runs the prompt it started with, the next
- * runs the new one -- and every captured turn records the system prompt it
- * actually ran, so the seam the old comment here worried about is on the
- * record. An empty or failed read never takes an applied prompt away.
- * `PERCEPTEYE_APPLY_PROMPT=0` still turns the whole prompt half off.
+ * THE MODEL HALF IS RE-DECIDED ON EVERY RE-READ (`refreshedModel`, Python's
+ * `_absorb` rule): a new endpoint or key replaces the held one, a WITHDRAWAL
+ * (`endpoint: null, withdrawn: true`) clears it so the agent runs on its
+ * host's own model from the next turn, and an empty or failed read -- which
+ * is also how an unreachable control plane reads -- keeps it. It used to be
+ * decided once and held for the life of the process, so a withdrawn agent
+ * kept calling a gateway with no approved model behind it, and a move to
+ * another provider never arrived, until a restart nobody was told to do.
+ * Within one address the gateway moves the checkpoint on its own: a model the
+ * platform serves is handed out as Mission Control's constant gateway URL for
+ * this agent, and the control plane decides behind it which checkpoint
+ * answers each call. The pair statement `announcePair` logged is the startup
+ * answer's.
  *
- * The one thing that moves the model without a restart moves on the control
- * plane's side, which made the change:
- *
- * THE GATEWAY MOVES THE MODEL HALF, AND ONLY THAT HALF. A model the platform
- * serves is handed out as Mission Control's CONSTANT gateway URL for this
- * agent (`api_key_env: PERCEPTEYE_API_KEY`), and the control plane decides
- * behind it which checkpoint answers each call. So after the first delivery
- * a promotion or rollback changes a running agent's MODEL without a restart
- * and without this process re-reading anything. Nothing else follows it:
- * the prompt half and the pair statement `announcePair` logged stay the
- * startup answer's, so a promotion whose bundle carries a different prompt
- * runs the old prompt over the new checkpoint -- not the certified pair --
- * until a restart on `serving_generation`, which that promotion changes. A
- * change of ADDRESS reaches a running agent not at all: the first delivery,
- * and a withdrawal (`endpoint: null, withdrawn: true`), which `modelDecision`
- * refuses at the next start so the agent runs on its host's own model. Until
- * that restart a withdrawn agent keeps calling the gateway URL, which has no
- * approved model to answer it with.
- *
- * ── TRAINING MODE DOES NOT REACH THIS FILE ────────────────────────────────
+ * ── TRAINING MODE REACHES THE PROVIDER, AND NOTHING ELSE HERE ────────────
  *
  * `registerServingPolicy` is called from the production branch of
- * `index.js` only, the same structural split `mode.js` describes. A rollout is
- * evidence about the agent as configured; applying an unproven prompt or model
- * during one would change the behaviour being measured and attribute the
- * difference to the gradient step.
+ * `index.js` only, the same structural split `mode.js` describes: a rollout
+ * is evidence about the agent as configured, and applying an approved prompt
+ * or model during one would change the behaviour being measured.
+ *
+ * What training DOES share is the provider seam (`registerFlywheelProvider`,
+ * `subscribeModelResolve`): a rollout must sample through ITS OWN gateway
+ * (`rollout.llmUrl`, with the rollout's key), because that is the checkpoint
+ * being trained and those are the trajectories that get scored. That is not
+ * applying a policy; it is where the rollout's model is. `rollout.js` routes
+ * its rollout sessions through the same provider this file registers.
  *
  * ── THE HOST SEAMS ────────────────────────────────────────────────────────
  *
@@ -230,6 +225,19 @@ export function controlPlaneOrigin(url) {
 
 /** `modelDecision`'s `credential` when the endpoint takes the flywheel key. */
 export const FLYWHEEL_KEY_CREDENTIAL = "flywheel_key";
+
+/**
+ * `modelDecision`'s `credential` when the control plane SENT the endpoint's
+ * key (`endpoint.api_key`, from its vault). Ranked first, as the Python SDK's
+ * `_endpoint_credential` ranks it: an agent the control plane moves to a
+ * DIFFERENT provider cannot read a variable it was never given, and without
+ * this it freezes on its last model with nothing said.
+ */
+export const ENDPOINT_KEY_CREDENTIAL = "endpoint_key";
+
+/** Where an endpoint key the control plane sent comes from, said one way. */
+export const ENDPOINT_KEY_ORIGIN =
+  "the key the control plane sent for this endpoint (endpoint.api_key)";
 
 /**
  * Where the flywheel key comes from, said the same way in the provider's
@@ -520,10 +528,12 @@ export function refreshedPrompt(held, heldGeneration, policy, answer) {
  * model, the one answer that falls back to the host's own model rather than
  * to a champion, because there is none.
  *
- * THE CREDENTIAL is the one other thing read here, and only read: it is
- * `FLYWHEEL_KEY_CREDENTIAL` when BOTH of these hold, and `null` otherwise,
- * which leaves the credential to the host's own `models.providers` entry
- * exactly as before:
+ * THE CREDENTIAL is the one other thing read here, in the Python SDK's
+ * order (`_endpoint_credential`). FIRST the key the control plane SENT for
+ * the endpoint (`endpoint.api_key`): `ENDPOINT_KEY_CREDENTIAL`, with the key
+ * itself as `endpointKey` -- never logged, never on `appliedModel`. Otherwise
+ * `FLYWHEEL_KEY_CREDENTIAL` when BOTH of these hold, and `null` when not,
+ * which leaves the credential to the host's own `models.providers` entry:
  *
  *   the control plane names `FLYWHEEL_KEY_ENV` for the endpoint, exactly;
  *   the endpoint is at `controlPlaneUrl`'s origin -- the address the key
@@ -542,7 +552,7 @@ export function refreshedPrompt(held, heldGeneration, policy, answer) {
  *   authenticates to with its flywheel key (`config.controlPlaneUrl`)
  * @returns {{apply: boolean, baseUrl: string|null, model: string|null,
  *            credential: string|null, credentialReason: string|null,
- *            reason: string}}
+ *            endpointKey: string|null, withdrawn: boolean, reason: string}}
  */
 export function modelDecision(policy, { controlPlaneUrl = null } = {}) {
   const p = policy && typeof policy === "object" ? policy : {};
@@ -561,7 +571,7 @@ export function modelDecision(policy, { controlPlaneUrl = null } = {}) {
   if (p.withdrawn === true) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
-      credentialReason: null,
+      credentialReason: null, endpointKey: null, withdrawn: true,
       reason: "the control plane WITHDREW the approved model for this agent " +
         `(withdrawn=true${str(p.reason) ? `, ${str(p.reason)}` : ""}), so ` +
         "this agent runs on the model its host configures",
@@ -571,7 +581,7 @@ export function modelDecision(policy, { controlPlaneUrl = null } = {}) {
   if (!baseUrl || !model) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
-      credentialReason: null,
+      credentialReason: null, endpointKey: null, withdrawn: false,
       reason: "the control plane is serving no endpoint for this agent " +
         "(nothing is deployed for it, or no policy resolved), so there is " +
         "nothing to point it at",
@@ -585,18 +595,38 @@ export function modelDecision(policy, { controlPlaneUrl = null } = {}) {
   if (isArchiveRef(model)) {
     return {
       apply: false, baseUrl: null, model: null, credential: null,
-      credentialReason: null,
+      credentialReason: null, endpointKey: null, withdrawn: false,
       reason: `the served model ${JSON.stringify(model)} is a stored-artifact ` +
         "reference, not a name an endpoint can serve; that address would 404 " +
         "on every completion",
     };
   }
 
+  const sent = str(ep.api_key);
   return {
     apply: true, baseUrl, model,
-    ...flywheelKeyDecision(ep, baseUrl, controlPlaneUrl),
+    ...(sent
+      ? { credential: ENDPOINT_KEY_CREDENTIAL, credentialReason: null, endpointKey: sent }
+      : { ...flywheelKeyDecision(ep, baseUrl, controlPlaneUrl), endpointKey: null }),
+    withdrawn: false,
     reason: "",
   };
+}
+
+/**
+ * The model decision to hold after a poll: Python's `PolicySource._absorb`
+ * rule for the model half. An applicable answer replaces what is held; a
+ * WITHDRAWAL clears it, because a person decided it; anything else -- an
+ * empty body (which is also what an unreachable control plane reads as),
+ * nothing deployed, an archive reference -- keeps what is held. Pure.
+ *
+ * @param {object|null} held the decision held now, or null for none
+ * @param {object} decision `modelDecision` of the body just read
+ * @returns {object|null}
+ */
+export function refreshedModel(held, decision) {
+  if (decision.apply || decision.withdrawn) return decision;
+  return held;
 }
 
 /**
@@ -752,6 +782,14 @@ export function createPolicySource({
   let lastPromptPollAt = 0;
   let promptPollMs = PROMPT_REFRESH_DEFAULT_MS;
   let refreshing = null;
+  // THE MODEL HALF'S RUNNING STATE: the decision in force (`refreshedModel`
+  // decides what replaces it), and the endpoint key the control plane sent
+  // with it -- held here, in this closure, and nowhere a getter or a log
+  // line can reach.
+  let heldModel = null;
+  let endpointKey = null;
+  /** Whether this source applies the model half at all (switch + seam). */
+  const modelHalfOn = applyModel && !modelBlocked;
 
   // NOTHING CAN BE APPLIED TO ANY RUN when the agent scope is unresolvable --
   // several agents on this host and none of them named -- because
@@ -804,6 +842,74 @@ export function createPolicySource({
       `${reason}.`);
   };
 
+  /**
+   * Hold `decision` as the model half's answer, and say what changed. At
+   * startup (`first`) every answer is said; on a refresh only a change is,
+   * because the poll sits in front of every turn.
+   */
+  const takeModel = (decision, first) => {
+    const next = first ? decision : refreshedModel(heldModel, decision);
+    if (!first && next === heldModel) return;
+    const before = appliedModel;
+    heldModel = next;
+    if (next?.apply) {
+      appliedModel = {
+        provider: PROVIDER_ID,
+        model: next.model,
+        baseUrl: next.baseUrl,
+        credential: next.credential,
+      };
+      endpointKey = next.endpointKey ?? null;
+      refusedModel = null;
+    } else {
+      appliedModel = null;
+      endpointKey = null;
+      refusedModel = next?.reason ?? refusedModel;
+    }
+    if (!first) {
+      if (appliedModel && before
+          && appliedModel.model === before.model
+          && appliedModel.baseUrl === before.baseUrl
+          && appliedModel.credential === before.credential) {
+        return;
+      }
+      logger?.info?.(appliedModel
+        ? `[${pluginId}] the control plane now serves the model ` +
+          `'${appliedModel.model}' at ${appliedModel.baseUrl} for this ` +
+          `agent; applying it from the next turn via ${MODEL_HOOK_NAME}.`
+        : `[${pluginId}] the approved model is no longer applied: ` +
+          `${refusedModel}. The model this host configures runs from the ` +
+          "next turn.");
+      return;
+    }
+    // WHICH KEY OPENS IT, said exactly: the operator reading this line is
+    // the one who has to supply it when we do not, and WHY we do not is
+    // the cause they act on -- a provider's own key, or an address that
+    // is not the control plane's.
+    const credentialLine =
+      appliedModel?.credential === ENDPOINT_KEY_CREDENTIAL
+        ? `The provider authenticates with ${ENDPOINT_KEY_ORIGIN}; a ` +
+          `models.providers.${PROVIDER_ID}.apiKey you set yourself takes ` +
+          "precedence. "
+        : appliedModel?.credential === FLYWHEEL_KEY_CREDENTIAL
+          ? `The control plane names ${FLYWHEEL_KEY_ENV} for that endpoint, ` +
+            "which is at its own address, so the provider authenticates with " +
+            `${flywheelKeyOrigin(pluginId)}; a models.providers.` +
+            `${PROVIDER_ID}.apiKey you set yourself takes precedence. `
+          : `This plugin's flywheel key is not supplied: ` +
+            `${decision.credentialReason}. If that endpoint needs a ` +
+            "credential it comes from your host's own " +
+            `models.providers.${PROVIDER_ID} entry. `;
+    logger?.info?.(appliedModel
+      ? `[${pluginId}] applying the approved model ` +
+        `'${appliedModel.model}' at ${appliedModel.baseUrl} via ` +
+        `${MODEL_HOOK_NAME}, through the provider '${PROVIDER_ID}' this ` +
+        `plugin registers. ${credentialLine}Set ` +
+        "PERCEPTEYE_APPLY_MODEL=0 to stop applying it."
+      : `[${pluginId}] the approved model is NOT being applied: ` +
+        `${refusedModel}.`);
+  };
+
   const source = {
     /** The `/policy/current` body. `{}` until resolved, or on any failure. */
     get policy() { return policy; },
@@ -813,9 +919,10 @@ export function createPolicySource({
     get appliedPrompt() { return applied; },
     /**
      * `{provider, model, baseUrl, credential}` handed to the host, or null
-     * when none is. `credential` is `FLYWHEEL_KEY_CREDENTIAL` when this
-     * plugin supplies its own key for the endpoint, null when the host's own
-     * `models.providers` entry has to. Never the key itself.
+     * when none is. `credential` is `ENDPOINT_KEY_CREDENTIAL` when the
+     * control plane sent the endpoint's key, `FLYWHEEL_KEY_CREDENTIAL` when
+     * this plugin supplies its own key for the endpoint, null when the
+     * host's own `models.providers` entry has to. Never the key itself.
      */
     get appliedModel() { return appliedModel; },
     /** Why no prompt is being applied, or null when one is. */
@@ -873,42 +980,11 @@ export function createPolicySource({
       // model half off is not owed a sentence about an endpoint they asked not
       // to use, and an endpoint that has no provider to reach it is not
       // applied however good the answer is.
-      if (applyModel && !modelBlocked) {
-        const decision = modelDecision(policy, { controlPlaneUrl });
-        if (decision.apply) {
-          appliedModel = {
-            provider: PROVIDER_ID,
-            model: decision.model,
-            baseUrl: decision.baseUrl,
-            credential: decision.credential,
-          };
-          refusedModel = null;
-        } else {
-          appliedModel = null;
-          refusedModel = decision.reason;
-        }
-        // WHICH KEY OPENS IT, said exactly: the operator reading this line is
-        // the one who has to supply it when we do not, and WHY we do not is
-        // the cause they act on -- a provider's own key, or an address that
-        // is not the control plane's.
-        const credentialLine = appliedModel?.credential === FLYWHEEL_KEY_CREDENTIAL
-          ? `The control plane names ${FLYWHEEL_KEY_ENV} for that endpoint, ` +
-            "which is at its own address, so the provider authenticates with " +
-            `${flywheelKeyOrigin(pluginId)}; a models.providers.` +
-            `${PROVIDER_ID}.apiKey you set yourself takes precedence. `
-          : `This plugin's flywheel key is not supplied: ` +
-            `${decision.credentialReason}. If that endpoint needs a ` +
-            "credential it comes from your host's own " +
-            `models.providers.${PROVIDER_ID} entry. `;
-        logger?.info?.(appliedModel
-          ? `[${pluginId}] applying the approved model ` +
-            `'${appliedModel.model}' at ${appliedModel.baseUrl} via ` +
-            `${MODEL_HOOK_NAME}, through the provider '${PROVIDER_ID}' this ` +
-            `plugin registers. ${credentialLine}Set ` +
-            "PERCEPTEYE_APPLY_MODEL=0 to stop applying it."
-          : `[${pluginId}] the approved model is NOT being applied: ` +
-            `${refusedModel}.`);
-      }
+      if (modelHalfOn) takeModel(modelDecision(policy, { controlPlaneUrl }), true);
+      // EITHER HALF keeps reading: the model half follows a promotion,
+      // a move to another provider and a withdrawal on the same cadence the
+      // prompt half follows a newer approval (see `refresh`).
+      if (modelHalfOn || applyPrompt) readThrough = transport;
 
       if (!applyPrompt) {
         // NOT FETCHED, not fetched-and-dropped. `/prompt/current` carries the
@@ -934,7 +1010,6 @@ export function createPolicySource({
       heldGeneration = typeof prompt?.text === "string" && prompt.text.trim()
         ? str(prompt.generation) || servedPromptGeneration(policy)
         : "";
-      readThrough = transport;
       if (!decision.apply) {
         applied = null;
         refusal = decision.reason;
@@ -956,16 +1031,23 @@ export function createPolicySource({
     },
 
     /**
-     * Re-read the PROMPT half if it is due. Returns the in-flight promise, or
-     * null when nothing was started. NEVER REJECTS and never blocks a turn:
-     * `handle` starts it and does not wait, so the swap lands on the NEXT
-     * turn. One read at a time; at most one per `ttl_s`.
+     * Re-read BOTH halves if due. Returns the in-flight promise, or null when
+     * nothing was started. NEVER REJECTS and never blocks a turn: either hook
+     * starts it and does not wait, so a swap lands on the NEXT turn. One read
+     * at a time; at most one per `ttl_s`.
      *
-     * Only after a startup that read the prompt (`readThrough`), so it is off
-     * exactly where the startup read was off: no transport, the prompt half
-     * switched off, or no agent scope.
+     * THE MODEL HALF IS RE-DECIDED ON EVERY TICK, from the body just read,
+     * by `refreshedModel`. It used to be decided once at startup and held for
+     * the life of the process, so a withdrawal (`withdrawn: true`) left the
+     * agent calling a gateway with no approved model behind it, and a move to
+     * another provider (a new `base_url` and `endpoint.api_key`) never
+     * arrived, until a restart nobody was told to do.
+     *
+     * Only after a startup read that applied either half (`readThrough`), so
+     * it is off exactly where that read was off: no transport, both halves
+     * switched off or blocked, or no agent scope.
      */
-    refreshPrompt() {
+    refresh() {
       if (!readThrough || refreshing) return refreshing;
       const t = now();
       if (t - lastPromptPollAt < promptPollMs) return null;
@@ -978,6 +1060,9 @@ export function createPolicySource({
           return;
         }
         promptPollMs = promptRefreshMs(body);
+        if (modelHalfOn) takeModel(modelDecision(body, { controlPlaneUrl }), false);
+        // The prompt half only where the startup read fetched one.
+        if (heldDecision === null) return;
         if (!promptNeedsRefresh(heldGeneration, body)) return;
         let answer = null;
         try {
@@ -1047,7 +1132,7 @@ export function createPolicySource({
      */
     handle(event, ctx) {
       // Started, never awaited: this turn runs the prompt it started with.
-      source.refreshPrompt();
+      source.refresh();
       if (!applied) return undefined;
       const scope = inScope(ctx);
       if (!scope.apply) {
@@ -1083,6 +1168,9 @@ export function createPolicySource({
      * given somebody else's prompt.
      */
     handleModelResolve(event, ctx) {
+      // Started, never awaited, as in `handle`: this hook is the only one
+      // subscribed when the prompt half is switched off.
+      source.refresh();
       if (!appliedModel) return undefined;
       const scope = inScope(ctx);
       if (!scope.apply) {
@@ -1139,11 +1227,16 @@ export function createPolicySource({
     },
 
     /**
-     * The provider's credential seam: `{apiKey, source, mode}` -- this
+     * The provider's credential seam: `{apiKey, source, mode}` -- the key the
+     * control plane SENT for the endpoint when it sent one, else this
      * plugin's flywheel key -- or `undefined` to leave the host's own answer.
      *
-     * THREE GATES, and each one keeps the key off an endpoint it was never
-     * meant for:
+     * The sent key (`ENDPOINT_KEY_CREDENTIAL`) comes first, as in the Python
+     * SDK: it is the control plane's credential FOR that endpoint, from its
+     * vault, and the one way an agent moved to another provider keeps
+     * working. It is answered only for our provider id and only while that
+     * endpoint is the applied one. The flywheel key passes THREE GATES, and
+     * each one keeps it off an endpoint it was never meant for:
      *
      *   an applied model     nothing is named before the read, and a refused
      *                        or withdrawn answer points nowhere.
@@ -1166,8 +1259,11 @@ export function createPolicySource({
      */
     resolveSyntheticAuth(ctx) {
       if (!appliedModel) return undefined;
-      if (appliedModel.credential !== FLYWHEEL_KEY_CREDENTIAL) return undefined;
       if (str(ctx?.provider) !== PROVIDER_ID) return undefined;
+      if (appliedModel.credential === ENDPOINT_KEY_CREDENTIAL && endpointKey) {
+        return { apiKey: endpointKey, source: ENDPOINT_KEY_ORIGIN, mode: "api-key" };
+      }
+      if (appliedModel.credential !== FLYWHEEL_KEY_CREDENTIAL) return undefined;
       const apiKey = str(flywheelKey);
       if (!apiKey) return undefined;
       return {
@@ -1178,6 +1274,60 @@ export function createPolicySource({
     },
   };
   return source;
+}
+
+/**
+ * Register THE provider this plugin answers for, and say why not when it
+ * cannot. The one seam that turns `providerOverride: PROVIDER_ID` into an
+ * address and a credential, shared by BOTH lanes: production points an agent
+ * at its approved model through it, and training points a rollout at its own
+ * per-rollout gateway through it (`rollout.js`). `answer()` is whatever
+ * currently decides -- the policy source, or the rollout router -- and must
+ * offer `normalizeTransport` and `resolveSyntheticAuth`, each of which
+ * answers for `PROVIDER_ID` only.
+ *
+ * @returns {string|null} the refusal, or null once registered
+ */
+export function registerFlywheelProvider(api, { answer, hint }) {
+  if (typeof api?.registerProvider !== "function") {
+    return NO_PROVIDER_SURFACE_REASON;
+  }
+  try {
+    api.registerProvider({
+      id: PROVIDER_ID,
+      label: "PerceptEye Flywheel",
+      // An empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
+      // leaves the host's auth surfaces with nothing to show an operator,
+      // and this is the one place an operator reads where the key comes
+      // from before any answer has arrived.
+      auth: [{ id: "api_key", label: "API key", kind: "api_key", hint }],
+      normalizeTransport: (ctx) => answer()?.normalizeTransport(ctx),
+      // THE CREDENTIAL, supplied rather than asked for: the host's last
+      // resort after the operator's own profile, env and config entry.
+      resolveSyntheticAuth: (ctx) => answer()?.resolveSyntheticAuth(ctx),
+    });
+  } catch (err) {
+    // A refused provider registration must not take anything else down with
+    // it -- it costs what needed the provider, and only that.
+    return providerRefusedReason(err?.message ?? err);
+  }
+  return null;
+}
+
+/**
+ * Subscribe `before_model_resolve` to `handle`, swallowing a throw: the hook
+ * sits in front of every model call, and one swallowed error is a call on the
+ * host's own model, where a throw would be a host warning per call, forever.
+ * Shared by both lanes, as `registerFlywheelProvider` is.
+ */
+export function subscribeModelResolve(api, handle) {
+  api.on(MODEL_HOOK_NAME, (event, ctx) => {
+    try {
+      return handle(event, ctx ?? null);
+    } catch {
+      return undefined;
+    }
+  });
 }
 
 /**
@@ -1233,45 +1383,21 @@ export function registerServingPolicy(api, {
   const openModelSeam = () => {
     if (!applyModel) return MODEL_OFF_REASON;
     if (!conversationAccess) return modelHookBlockedReason(pluginId);
-    if (typeof api.registerProvider !== "function") {
-      return NO_PROVIDER_SURFACE_REASON;
-    }
-    try {
-      // REGISTERED BEFORE WE KNOW WHETHER A MODEL IS SERVED:
-      // `providerOverride` names it on a later turn, and a provider registered
-      // at that point would be too late. It answers for nothing until
-      // `appliedModel` is set, and never for anyone else's provider id.
-      api.registerProvider({
-        id: PROVIDER_ID,
-        label: "PerceptEye Flywheel",
-        // The served endpoint is OpenAI-compatible and may need a key, which
-        // the control plane names rather than this plugin inventing one. An
-        // empty `auth` is accepted (registry-B8eQDFB4.js:2361-2367) but
-        // leaves the host's auth surfaces with nothing to show an operator,
-        // and this is the one place an operator reads where the key comes
-        // from before any answer has arrived.
-        auth: [{
-          id: "api_key",
-          label: "API key",
-          kind: "api_key",
-          hint: `Supplied for you when the control plane names ` +
-            `${FLYWHEEL_KEY_ENV} for a served endpoint at its own address: ` +
-            `the provider authenticates with ${flywheelKeyOrigin(pluginId)}. ` +
-            `Set models.providers.${PROVIDER_ID}.apiKey for any other ` +
-            "endpoint that needs a credential; yours takes precedence.",
-        }],
-        normalizeTransport: (ctx) => source?.normalizeTransport(ctx),
-        // THE CREDENTIAL, supplied rather than asked for: the host's last
-        // resort after the operator's own profile, env and config entry.
-        resolveSyntheticAuth: (ctx) => source?.resolveSyntheticAuth(ctx),
-      });
-    } catch (err) {
-      // A refused provider registration must not take the prompt half, the
-      // turn capture, or the plugin load down with it -- it costs the MODEL
-      // half, and only that.
-      return providerRefusedReason(err?.message ?? err);
-    }
-    return null;
+    // REGISTERED BEFORE WE KNOW WHETHER A MODEL IS SERVED:
+    // `providerOverride` names it on a later turn, and a provider registered
+    // at that point would be too late. It answers for nothing until
+    // `appliedModel` is set, and never for anyone else's provider id.
+    return registerFlywheelProvider(api, {
+      answer: () => source,
+      // The served endpoint is OpenAI-compatible and may need a key, which
+      // the control plane names rather than this plugin inventing one.
+      hint: `Supplied for you when the control plane sends a key for a ` +
+        `served endpoint, or names ${FLYWHEEL_KEY_ENV} for one at its own ` +
+        `address: the provider then authenticates with that key, or with ` +
+        `${flywheelKeyOrigin(pluginId)}. Set models.providers.${PROVIDER_ID}` +
+        ".apiKey for any other endpoint that needs a credential; yours takes " +
+        "precedence.",
+    });
   };
 
   // Not attempted at all with no key: nothing is read, so there is nothing for
@@ -1348,13 +1474,7 @@ export function registerServingPolicy(api, {
       `${modelBlocked}. ${MODEL_HOOK_NAME} is not subscribed. The prompt ` +
       "half is unaffected.");
   } else {
-    api.on(MODEL_HOOK_NAME, (event, ctx) => {
-      try {
-        return source.handleModelResolve(event, ctx ?? null);
-      } catch {
-        return undefined;
-      }
-    });
+    subscribeModelResolve(api, (event, ctx) => source.handleModelResolve(event, ctx));
   }
 
   // NOT AWAITED and never rejecting: `register()` must return to the host

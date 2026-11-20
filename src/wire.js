@@ -17,8 +17,41 @@ export const CONTRACT_VERSION = "flywheel/1";
 export const PRODUCTION_IDENTIFIER_MAX_CHARS = 255;
 export const PRODUCTION_TURN_BATCH_MAX_ITEMS = 64;
 
-const PRODUCTION_IDENTIFIER_RE = /^(?!\s)(?!.*\s$)[^\u0000-\u001F\u007F-\u009F]+$/u;
-const PRODUCTION_TURN_IDENTIFIER_RE = /^(?!\.{1,2}$)(?!\s)(?!.*\s$)(?!.*[\\/])[^\u0000-\u001F\u007F-\u009F]+$/u;
+/**
+ * The published identifier patterns, the strings `schema/flywheel-1.json`
+ * carries and the Python SDK's `contract.py` compiles -- ONE ANSWER IN EVERY
+ * ENGINE THAT READS THEM. So no `.`: ECMA-262's does not match U+2028/U+2029
+ * and Python's does, which let `"a\u2028 "` and `"a\u2028/b"` through here
+ * while Python refused them; `[\s\S]` is "any character" in both. And no
+ * `\s`: ECMA's includes U+FEFF and Python's does not, so the whitespace an id
+ * may not start or end with is spelled out as ECMA's set.
+ */
+const EDGE_WHITESPACE =
+  "[\\t-\\r \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]";
+export const PRODUCTION_IDENTIFIER_PATTERN =
+  `^(?!${EDGE_WHITESPACE})(?![\\s\\S]*${EDGE_WHITESPACE}$)` +
+  "[^\\u0000-\\u001F\\u007F-\\u009F]+$";
+export const PRODUCTION_TURN_IDENTIFIER_PATTERN =
+  `^(?!\\.{1,2}$)(?!${EDGE_WHITESPACE})(?![\\s\\S]*${EDGE_WHITESPACE}$)` +
+  "(?![\\s\\S]*[\\\\/])[^\\u0000-\\u001F\\u007F-\\u009F]+$";
+/**
+ * The schema's `task_id` pattern: as much of `productionTaskIdentifier`'s
+ * rule as an ECMA-262 pattern can name in every engine. The predicate below,
+ * not this, is what the SDK applies; this is what a schema validator applies.
+ */
+export const TASK_IDENTIFIER_PATTERN =
+  "^(?! )(?![\\s\\S]* $)" +
+  "[^\\u0000-\\u001F\\u007F-\\u00A0\\u00AD\\u0378\\u0379\\u0600-\\u0605\\u061C" +
+  "\\u06DD\\u070F\\u1680\\u180E\\u2000-\\u200F\\u2028-\\u202F\\u205F-\\u206F" +
+  "\\u3000\\uE000-\\uF8FF\\uFEFF\\uFFF9-\\uFFFB]+$";
+const PRODUCTION_IDENTIFIER_RE = new RegExp(PRODUCTION_IDENTIFIER_PATTERN, "u");
+const PRODUCTION_TURN_IDENTIFIER_RE = new RegExp(PRODUCTION_TURN_IDENTIFIER_PATTERN, "u");
+/**
+ * A character Python's `str.isprintable()` refuses: every "Other" category
+ * (control, format, surrogate, private use, unassigned) and every separator
+ * but the ASCII space.
+ */
+const NOT_PRINTABLE_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/u;
 
 function withinProductionIdentifierLimit(value) {
   // Python's len() and JSON Schema's maxLength count Unicode code points,
@@ -55,6 +88,27 @@ export function productionTurnIdentifier(value) {
     && wellFormedText(value)
     && withinProductionIdentifierLimit(value)
     && PRODUCTION_TURN_IDENTIFIER_RE.test(value)
+    ? value
+    : null;
+}
+
+/**
+ * A task id the control plane accepts, or null. THE CONTROL PLANE'S PREDICATE,
+ * MIRRORED EXACTLY (Mission Control's `is_canonical_task_id`, and the Python
+ * SDK's `contract._task_identifier`): a non-empty string of at most 255
+ * characters, equal to its own Python `strip()`, every character
+ * `str.isprintable()`. The shared identifier grammar let U+200B, U+2028,
+ * U+00AD, U+FEFF, U+00A0, unassigned and private-use code points through,
+ * and each 422'd the WHOLE turn batch it rode in. A failing id is OMITTED,
+ * as an invalid one always was -- never rewritten.
+ */
+export function productionTaskIdentifier(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && wellFormedText(value)
+    && withinProductionIdentifierLimit(value)
+    && !value.startsWith(" ") && !value.endsWith(" ")
+    && !NOT_PRINTABLE_RE.test(value)
     ? value
     : null;
 }
@@ -411,42 +465,100 @@ export function rfc3339UnixNanos(value) {
   return seconds * 1_000_000_000n + fraction;
 }
 
+/** The longest rollout id accepted: the Python SDK's `_PATH_SEGMENT_MAX_CHARS`. */
+export const ROLLOUT_ID_MAX_CHARS = 256;
+
+/**
+ * Why `value` cannot be a rollout id, or null when it can. The id goes into
+ * every request path this lane makes (heartbeat, report, abandon) and names
+ * a session and an outbox file, so it must be ONE path segment: refused are a
+ * non-string, an empty string, `.` and `..` (a proxy that normalises the path
+ * moves the request to a different route), a `/` or `\\` (a second segment),
+ * a control character, a lone surrogate, and more than
+ * `ROLLOUT_ID_MAX_CHARS` characters. The Python SDK's `_path_segment` rule.
+ */
+export function rolloutIdRefusal(value) {
+  if (typeof value !== "string") {
+    return `rollout_id must be a string, got ${jsonType(value)}`;
+  }
+  if (!value) return "rollout_id must not be empty";
+  if (value === "." || value === "..") {
+    return `rollout_id ${JSON.stringify(value)} is a dot segment, not an id`;
+  }
+  if (value.includes("/") || value.includes("\\")) {
+    return `rollout_id must not contain a path separator, got ${JSON.stringify(value)}`;
+  }
+  if (/[\u0000-\u001F\u007F-\u009F]/u.test(value)) {
+    return `rollout_id must not contain a control character, got ${JSON.stringify(value)}`;
+  }
+  if (!wellFormedText(value)) return "rollout_id must be well-formed Unicode text";
+  const length = [...value].length;
+  if (length > ROLLOUT_ID_MAX_CHARS) {
+    return `rollout_id must be at most ${ROLLOUT_ID_MAX_CHARS} characters, got ${length}`;
+  }
+  return null;
+}
+
+/** The fields a claimed rollout must carry: `contract.py RolloutRequest.from_wire`. */
+export const ROLLOUT_REQUEST_REQUIRED = Object.freeze([
+  "rollout_id", "turn_input", "llm_url", "api_key", "artifacts_dir", "deadline_ts",
+]);
+
 /**
  * One rollout, as the control plane handed it to us.
  *
  * Field names are the SERVER's, not ours -- renaming them here would put a
- * translation layer between two things that must agree exactly.
+ * translation layer between two things that must agree exactly. Refused, as
+ * the Python SDK's `RolloutRequest.from_wire` refuses them: a missing
+ * required field (an `llm_url` and `api_key` above all -- a rollout with no
+ * gateway to sample through cannot be run as the checkpoint being trained),
+ * an `environment` key (that channel was removed: configuration never
+ * reaches a running process by payload), and a rollout id that is not one
+ * path segment.
  */
 export function rolloutRequestFromWire(raw) {
-  if (!raw || typeof raw !== "object") {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ContractError("rollout payload is not an object");
   }
-  const rolloutId = raw.rollout_id ?? raw.rolloutId;
-  if (!rolloutId) throw new ContractError("rollout payload has no rollout_id");
-  const leaseExpiresTs = raw.lease_expires_ts ?? raw.leaseExpiresTs;
+  const missing = ROLLOUT_REQUEST_REQUIRED.filter((key) => !Object.hasOwn(raw, key));
+  if (missing.length) {
+    throw new ContractError(
+      `RolloutRequest missing required field(s): ${pyList(missing)}`,
+    );
+  }
+  if (Object.hasOwn(raw, "environment")) {
+    throw new ContractError(
+      "RolloutRequest carries an 'environment' key. This channel was " +
+      "removed: configuration reaches the agent through subprocess env at " +
+      "spawn, never by mutating a running process.",
+    );
+  }
+  const idRefusal = rolloutIdRefusal(raw.rollout_id);
+  if (idRefusal) throw new ContractError(idRefusal);
+  const deadlineTs = Number(raw.deadline_ts);
+  if (!Number.isFinite(deadlineTs)) {
+    throw new ContractError("RolloutRequest deadline_ts must be a number");
+  }
+  const leaseExpiresTs = raw.lease_expires_ts;
+  const metadata = isObject(raw.metadata) ? raw.metadata : {};
   return {
-    rolloutId: String(rolloutId),
+    rolloutId: raw.rollout_id,
     turnInput: String(raw.turn_input ?? ""),
-    llmUrl: raw.llm_url ?? null,
-    apiKey: raw.api_key ?? null,
-    artifactsDir: raw.artifacts_dir ?? null,
-    deadlineTs: Number(raw.deadline_ts ?? 0) || 0,
+    llmUrl: String(raw.llm_url ?? ""),
+    apiKey: String(raw.api_key ?? ""),
+    artifactsDir: String(raw.artifacts_dir ?? ""),
+    deadlineTs,
     leaseToken: raw.lease_token ?? null,
     leaseExpiresTs: leaseExpiresTs !== null && leaseExpiresTs !== undefined
       && Number.isFinite(Number(leaseExpiresTs))
       ? Number(leaseExpiresTs)
       : null,
-    metadata: raw.metadata && typeof raw.metadata === "object"
-      && !Array.isArray(raw.metadata)
-      ? raw.metadata
-      : {},
+    metadata,
     // The task this rollout was handed, by the id it was claimed under -- for
     // a task the customer registered, THEIR id (Python: `current_task_id()`).
-    // Only a safe opaque id; anything else is absent, never rewritten.
-    taskId: raw.metadata && typeof raw.metadata === "object"
-      && !Array.isArray(raw.metadata)
-      ? productionIdentifier(raw.metadata.task_id)
-      : null,
+    // Only one the control plane's own task-id rule accepts; anything else
+    // is absent, never rewritten.
+    taskId: productionTaskIdentifier(metadata.task_id),
   };
 }
 
@@ -709,25 +821,71 @@ export function rolloutOutputToWire(output) {
   return wire;
 }
 
+/** Keys that carry a machine-readable status: `contract.py _STATUS_KEYS`. */
+const STATUS_KEYS = new Set(["status_code", "status", "http_status", "code", "statusCode"]);
+/** An HTTP status spelled in prose: `contract.py _HTTP_IN_TEXT`. */
+const HTTP_IN_TEXT = /\bHTTP\s*\d{3}\b/gi;
+
 /**
- * An `unknown` outcome must carry NO status and NO body.
+ * Remove machine-readable status from a tool result body: the Python SDK's
+ * `contract._scrub_status`, rule for rule. A string that parses as JSON is
+ * scrubbed as the value it holds and re-serialised; any other string loses
+ * every `HTTP nnn`. An object loses its status keys, and its string values
+ * their `HTTP nnn` (trimmed); a list is scrubbed item by item. Everything
+ * else is kept. The human-readable content survives, so the trajectory reads
+ * the same to a judge; only a status a scorer could mistake for an outcome
+ * goes.
+ */
+export function scrubStatus(output) {
+  if (typeof output === "string") {
+    let body;
+    try {
+      body = JSON.parse(output);
+    } catch {
+      return output.replace(HTTP_IN_TEXT, "");
+    }
+    const scrubbed = scrubStatus(body);
+    return typeof scrubbed === "string" ? scrubbed : JSON.stringify(scrubbed);
+  }
+  if (Array.isArray(output)) return output.map(scrubStatus);
+  if (isObject(output)) {
+    const out = {};
+    for (const [key, value] of Object.entries(output)) {
+      if (STATUS_KEYS.has(key)) continue;
+      out[key] = typeof value === "string"
+        ? value.replace(HTTP_IN_TEXT, "").trim()
+        : scrubStatus(value);
+    }
+    return out;
+  }
+  return output;
+}
+
+/**
+ * An `unknown` outcome must carry NO status, in the field or in the body.
  *
- * `contract.py:189-193` scrubs both so a scorer cannot recover a verdict from
- * the envelope of a call whose result we never saw. Leaving a status_code on
- * an `unknown` would let a reward function read success out of a field that
- * only describes the transport.
+ * `contract.py ToolCallOutcome.__post_init__` sets `status_code` to None and
+ * runs `output` through `_scrub_status`, so a scorer cannot recover a verdict
+ * from the envelope of a call whose result we never saw. This used to scrub only
+ * `body` and `response` -- fields no record here carries -- and leave
+ * `output`, the one that does, untouched.
  */
 function scrubToolCall(call) {
   const out = { ...call };
+  if ("environment" in out) {
+    // `contract.py` refuses this outright: the environment is the control
+    // plane's fact about the rollout, not the agent's to assert.
+    throw new ContractError("tool call may not carry an 'environment' field");
+  }
   if (out.outcome === "unknown") {
     out.status_code = null;
+    if (out.output !== undefined && out.output !== null) {
+      out.output = scrubStatus(out.output);
+    }
+    // Not contract keys, and never written by this SDK's recorder; a caller
+    // that put a raw response on a call loses it rather than carrying it.
     delete out.body;
     delete out.response;
-  }
-  if ("environment" in out) {
-    // `contract.py:253-258` refuses this outright: the environment is the
-    // control plane's fact about the rollout, not the agent's to assert.
-    throw new ContractError("tool call may not carry an 'environment' field");
   }
   return out;
 }

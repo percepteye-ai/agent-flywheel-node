@@ -22,7 +22,7 @@ import { toWire } from "./trajectory.js";
  * @param {{write: Function}} deps.writer
  * @param {string|null} [deps.mode] the PLUGIN-CONFIG mode (`config.mode`).
  *   Resolved through `mode.js`, the one seam that knows the precedence --
- *   config, then `PERCEPTEYE_AGENT_MODE`, then training. Reading the
+ *   config, then `PERCEPTEYE_AGENT_MODE`, then production. Reading the
  *   environment alone here once stamped every production tool span with a
  *   rollout id whenever the mode came from the plugin config, and a consumer
  *   that drops self-emitted spans dropped all of them.
@@ -97,9 +97,9 @@ export function createRecorder({
           : undefined,
         entity_ids,
       }), {
-        // The WHOLE host context, with the run id resolved. Ignored by the
-        // default writer (a rollout has one directory); used by production
-        // capture, which routes the record to its turn by `runId` and also
+        // The WHOLE host context, with the run id resolved. Training routes
+        // the record by its session to that session's rollout's trajectory
+        // (index.js); production capture routes it to its turn by `runId` and also
         // records the conversation and task the context names. Handing it
         // only `{runId}` left that half reading fields that were never there.
         ...ctx,
