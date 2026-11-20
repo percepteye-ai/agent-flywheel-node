@@ -7,8 +7,9 @@
  * (`~/.percepteye/credentials.json` when PERCEPTEYE_HOME is unset), a file only
  * its owner can read (0600), in a directory only its owner can enter (0700),
  * and that is replaced, never edited in place. Every read-modify-write holds
- * a lock file beside it (`LOCK_FILENAME`), so two logins at once cannot lose
- * one another's key. The Python SDK reads and writes the same file in the
+ * a lock file beside it (`LOCK_FILENAME`, the Python SDK's too), so two
+ * logins at once -- from either SDK -- cannot lose one another's key. The
+ * Python SDK reads and writes the same file in the
  * same format (`agent_flywheel/credentials.py`), so a key stored by either is
  * found by both; that package's `tests/test_credentials_parity.py` drives
  * this module and compares.
@@ -39,16 +40,17 @@ import { percepteyeHome } from "./session.js";
 
 export const CREDENTIALS_FILENAME = "credentials.json";
 /**
- * The lock every read-modify-write of the file holds: created exclusively
- * (O_EXCL), removed when the write is done, and taken over once it is older
- * than `LOCK_STALE_MS` -- a process killed mid-write leaves one behind.
+ * The lock every read-modify-write of the file holds, by ONE protocol both
+ * SDKs implement (the Python SDK's `credentials._locked`): created
+ * exclusively (O_EXCL), holding the writer's pid and the time it was taken,
+ * removed when the write is done, and taken over once it is older than
+ * `LOCK_STALE_MS` -- a process killed mid-write leaves one behind.
  *
- * NOT the Python SDK's `credentials.json.lock`: that one is an flock()ed file
- * that stays on disk, so an exclusive create of the same name would wait on it
- * forever. The two SDKs' locks are separate files; each serialises its own
- * logins, and the write stays atomic either way.
+ * ONE FILE FOR BOTH SDKs. Each used to hold a lock of its own (Python an
+ * flock on this name, this package `credentials.json.node-lock`), so a Python
+ * and a Node login at once never excluded each other and one key was lost.
  */
-export const LOCK_FILENAME = `${CREDENTIALS_FILENAME}.node-lock`;
+export const LOCK_FILENAME = `${CREDENTIALS_FILENAME}.lock`;
 /** A lock older than this was left by a process that died holding it. */
 export const LOCK_STALE_MS = 30_000;
 /** How long a writer waits for another one before saying so. */
@@ -246,7 +248,7 @@ function locked(path, fn, { now = Date.now } = {}) {
   for (;;) {
     try {
       const fd = openSync(lock, "wx", 0o600);
-      try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
+      try { writeSync(fd, `${process.pid} ${Date.now()}\n`); } finally { closeSync(fd); }
       break;
     } catch (err) {
       if (err?.code !== "EEXIST") {
@@ -258,8 +260,12 @@ function locked(path, fn, { now = Date.now } = {}) {
     if (age > LOCK_STALE_MS) {
       // Left by a process that died mid-write. Moved aside rather than
       // unlinked, so two writers taking it over at once cannot both win: only
-      // one rename of the same name succeeds.
-      try { renameSync(lock, `${lock}.stale-${randomBytes(4).toString("hex")}`); } catch { /* lost the race */ }
+      // one rename of the same name succeeds. Then removed.
+      const aside = `${lock}.stale-${randomBytes(4).toString("hex")}`;
+      try {
+        renameSync(lock, aside);
+        unlinkSync(aside);
+      } catch { /* lost the race */ }
       continue;
     }
     if (now() >= giveUp) {
