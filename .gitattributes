@@ -1,0 +1,5 @@
+# Every text file is checked out with LF on every platform. The fixtures are
+# pinned by digest and shared byte-for-byte with the Python SDK, and tests read
+# workflow files with line-anchored patterns: a Windows checkout's CRLF broke
+# both (the Windows CI leg's first run).
+* text=auto eol=lf

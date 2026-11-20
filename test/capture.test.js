@@ -1058,7 +1058,7 @@ describe("where capture lands", () => {
     assert.equal(captureRoot({ PERCEPTEYE_CAPTURE_DIR: "/x" }), "/x");
     // Keyed by agent (`pathSegment`, the outbox's rule): two agents sharing
     // one home never share one root. Mutation: drop the agent segment -> red.
-    assert.equal(captureRoot({ PERCEPTEYE_HOME: "/h" }, "acme"), "/h/captured/acme");
+    assert.equal(captureRoot({ PERCEPTEYE_HOME: "/h" }, "acme"), join("/h", "captured", "acme"));
     assert.notEqual(captureRoot({ PERCEPTEYE_HOME: "/h" }, "a"),
                     captureRoot({ PERCEPTEYE_HOME: "/h" }, "b"));
   });

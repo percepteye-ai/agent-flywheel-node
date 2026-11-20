@@ -61,7 +61,7 @@ import "./support/home.js";
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
@@ -120,7 +120,9 @@ const ASSET_EXTENSIONS = [
  */
 function publishedFiles() {
   const out = execFileSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf8" });
-  const paths = out.split("\0").filter(Boolean).filter((p) => !HERE.endsWith(p));
+  // git names files with "/" on every platform; HERE uses the OS separator.
+  const self = relative(ROOT, HERE).split(sep).join("/");
+  const paths = out.split("\0").filter(Boolean).filter((p) => p !== self);
   assert.ok(paths.length, "git ls-files returned nothing — this scan would pass vacuously");
   return paths;
 }
@@ -139,8 +141,10 @@ function textOf(relPath) {
 function packedFiles() {
   let raw;
   try {
+    // On Windows `npm` is npm.cmd, which Node only runs through a shell.
     raw = execFileSync("npm", ["pack", "--dry-run", "--json"], {
       cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      shell: process.platform === "win32",
     });
   } catch (err) {
     assert.fail(
