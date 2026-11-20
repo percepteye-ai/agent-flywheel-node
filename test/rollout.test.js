@@ -999,6 +999,31 @@ describe("the claim / deliver / report loop", () => {
     assert.equal(d.onBeforeAgentRun({}, { sessionKey: "s1", runId: "run-2" }), undefined);
   });
 
+  it("hands back at once a rollout claimed after its session ended", async () => {
+    // ND-H5. session_end arrived while claim(1) was long-polling: it found
+    // nothing in flight, and the rollout was then tracked -- a heartbeat
+    // renewing a lease for a session that would never run it.
+    let answer;
+    const tx = fakeTransport({
+      claim: () => new Promise((resolve) => { answer = resolve; }),
+    });
+    tx.heartbeat = async () => {};
+    const sent = [];
+    const d = createRolloutDriver({
+      env: testEnv(), transport: tx,
+      enqueue: async (i) => { sent.push(i); return { enqueued: true }; },
+    });
+    const started = d.onSessionStart({ sessionKey: "s1" });
+    await new Promise((r) => setImmediate(r));
+    await d.onSessionEnd({ sessionKey: "s1", reason: "closed" });
+    answer({ rollouts: [{ rolloutId: "r-orphan", turnInput: "x", leaseToken: "lt" }] });
+    assert.equal(await started, null);
+    assert.deepEqual(sent, []);
+    assert.equal(tx.calls.abandon[0]?.[0].rolloutId, "r-orphan");
+    assert.equal(d.inFlight.size, 0);
+    assert.equal(d.heartbeats.size, 0, "no lease is renewed for it");
+  });
+
   it("hands back a rollout claimed past its deadline, in both lanes' one claim seam", async () => {
     const tx = fakeTransport({
       claim: async () => ({ rollouts: [{

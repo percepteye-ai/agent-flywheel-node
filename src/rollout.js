@@ -315,6 +315,13 @@ export function createRolloutDriver({
    * first left to lapse.
    */
   const claiming = new Set();
+  /**
+   * Sessions that ENDED while a claim for them was in flight. The claim
+   * checks after its await: a session that ended in between (the long poll
+   * can take a while) gets no rollout -- the claimed one goes straight back.
+   * Kept only while that claim is, so it is bounded by `claiming`.
+   */
+  const endedWhileClaiming = new Set();
   /** sessionKey -> the timer that stops its rollout at `deadlineTs`. */
   const deadlines = new Map();
   let warnedMissingModelCallCount = false;
@@ -728,6 +735,7 @@ export function createRolloutDriver({
       return await claimAndDeliver(sessionKey);
     } finally {
       claiming.delete(sessionKey);
+      endedWhileClaiming.delete(sessionKey);
     }
   }
 
@@ -797,6 +805,18 @@ export function createRolloutDriver({
     }
     const rollout = claimed?.rollouts?.[0];
     if (!rollout) return null;
+    if (endedWhileClaiming.has(sessionKey)) {
+      // THE SESSION ENDED WHILE THIS WAS BEING CLAIMED. `onSessionEnd` found
+      // nothing in flight to give back, so tracking it now would start a
+      // heartbeat renewing a lease for a session that will never run it --
+      // forever. It goes back at once, and nothing is started.
+      await giveBack(
+        sessionKey, rollout, "entrypoint_error",
+        "the session ended while the rollout was being claimed, so it was " +
+        "never delivered",
+      );
+      return null;
+    }
 
     const text = taskText(rollout);
     // Checked BEFORE sending, because over the ceiling the host returns
@@ -1055,6 +1075,7 @@ export function createRolloutDriver({
     const sessionKey = event?.sessionKey ?? event?.sessionId;
     const rollout = sessionKey ? inFlight.get(sessionKey) : null;
     if (sessionKey) {
+      if (claiming.has(sessionKey)) endedWhileClaiming.add(sessionKey);
       activeRuns.delete(sessionKey);
       blockNextRun.delete(sessionKey);
       revokedRuns.delete(sessionKey);
