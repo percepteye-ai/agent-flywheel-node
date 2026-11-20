@@ -82,7 +82,11 @@ function overHttp(routes) {
   const fetchImpl = async (url, init) => {
     const key = `${init.method} ${new URL(url).pathname}`;
     seen.push(key);
-    let answer = routes[key] ?? [200, {}];
+    // The verdict read answers the grant these uploaders were given: an
+    // empty 200 there is an ANSWERED no (transport.js), and an answered no
+    // now stops uploading (ND-C6) -- which these tests do not test.
+    let answer = routes[key] ?? (key === "GET /agents/a1/capture"
+      ? [200, { capture: { turns: true, model_content: true } }] : [200, {}]);
     if (typeof answer === "function") answer = answer(JSON.parse(init.body));
     const [status, body] = answer;
     return new Response(JSON.stringify(body), {

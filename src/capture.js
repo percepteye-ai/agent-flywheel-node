@@ -937,8 +937,21 @@ export function createTurnUploader({
   transport, agentId, root, logger = null, flushEvery = FLUSH_EVERY,
   answersExpected = true,
   maxOutcomesWhileUnknown = OUTCOME_MAX_KEPT_UNANSWERED,
+  awaitAnnouncedVerdict = false,
 }) {
   let since = 0;
+  // Whether the startup verdict (`announce`) has been recorded. Until it has,
+  // a flush does not re-ask: on a first start the agent row may not exist
+  // yet (registration is still in flight), and the answer to "may I upload?"
+  // would be "not registered" -- an ANSWERED no that turned
+  // `reportOutcome` into a no-op for the life of the process. The startup
+  // chain asks once the row exists. `registerTurnCapture` sets this; a
+  // standalone uploader has no startup chain and re-asks from the first flush.
+  let announced = !awaitAnnouncedVerdict;
+  // Bumped by every change of the consent state, so a verdict read that was
+  // overtaken while in flight -- a 403 arrived meanwhile -- is not applied
+  // over the fresher answer (`setVerdict(v, {since})`).
+  let epoch = 0;
   let inFlight = false;
   let mayUpload = false;
   let refusal = null;
@@ -1035,50 +1048,61 @@ export function createTurnUploader({
    * consent -- for turns, or for model content on an agent already uploading
    * turns -- long after this process started, and nothing else would tell it:
    * until this existed a Node install learned a grant only by restarting.
-   * Turn upload is only ever turned ON here (a blip that answers nothing must
-   * not revoke it; the intake's 403 does that, in `refuseUpload`); model
-   * content follows any verdict the control plane actually GAVE, both ways.
+   * Both tiers follow any verdict the control plane actually GAVE, both ways:
+   * an ANSWERED no goes through `refuseUpload`, the one place uploading is
+   * turned off, so neither tier is still on when the flush that asked goes
+   * on to upload. A read that answered nothing (a blip, `answered: false`)
+   * changes nothing: it must never revoke what was granted.
    */
   async function recheck() {
     if (typeof transport?.captureCurrent !== "function") return;
+    const asked = epoch;
     let v;
     try {
       v = captureVerdict(await transport.captureCurrent(agentId));
     } catch {
       return;
     }
-    if (v.mayUpload) {
-      mayUpload = true;
-      refusal = null;
-      consentRefused = false;
-    } else if (v.answered) {
-      refusal = v.reason;
-      consentRefused = true;
+    // Overtaken while in flight (a 403 meanwhile): the fresher answer stands.
+    if (asked !== epoch || !v.answered) return;
+    if (!v.mayUpload) {
+      refuseUpload(v.reason);
+      return;
     }
-    if (v.answered) {
-      mayCaptureModelContent = v.mayCaptureModelContent && mayUpload;
-      modelContentReason = mayCaptureModelContent ? null : v.modelContentReason;
-    }
+    mayUpload = true;
+    refusal = null;
+    consentRefused = false;
+    mayCaptureModelContent = v.mayCaptureModelContent;
+    modelContentReason = mayCaptureModelContent ? null : v.modelContentReason;
+    epoch += 1;
   }
 
   /**
-   * The intake terminally refused these turns. Stop sending, say why.
+   * The control plane said NO: the intake's 403, or an answered verdict
+   * re-read by `recheck`. Stop sending, say why.
    *
    * THE PYTHON SDK'S `_refuse_upload`, and the one place `mayUpload` turns
    * false after it was true. A trace rides on a turn, so a refused turn
    * refuses its model content too: from here on no run records what its model
-   * saw, until `recheck` reads a verdict that grants it again.
+   * saw, until `recheck` reads a verdict that grants it again. Said when it
+   * changes something -- uploading stops, or the no is new -- not on every
+   * flush that re-reads the same no.
    */
   function refuseUpload(reason) {
+    const wasUploading = mayUpload;
+    const news = wasUploading || !consentRefused || refusal !== reason;
     mayUpload = false;
     refusal = reason;
     consentRefused = true;
     mayCaptureModelContent = false;
     modelContentReason = reason;
+    epoch += 1;
+    if (!news) return;
     logger?.warn?.(
       `[agent-flywheel] the control plane refused this agent's captured ` +
-      `turns and uploading has stopped: ${reason} The turns stay on disk, ` +
-      `and uploading resumes on its own if capture is enabled again.`);
+      `turns and ${wasUploading ? "uploading has stopped" : "nothing is uploaded"}: ` +
+      `${reason} The turns stay on disk, and uploading resumes on its own if ` +
+      `capture is enabled again.`);
   }
 
   /**
@@ -1644,7 +1668,7 @@ export function createTurnUploader({
   async function flushTurns({ includeUnanswered = false, settleMs = 0 } = {}) {
     // Asked while either tier is still NO, and not at all once both are
     // yes: one read per flush, the Python SDK's cadence.
-    if (!mayUpload || !mayCaptureModelContent) await recheck();
+    if (announced && (!mayUpload || !mayCaptureModelContent)) await recheck();
     if (!mayUpload) return { sent: 0, notPermitted: true };
     const turns = pending({
       includeUnanswered,
@@ -1689,8 +1713,17 @@ export function createTurnUploader({
     get modelContentReason() { return modelContentReason; },
     /** Whether this host delivers `agent_end`, i.e. whether answers arrive. */
     get answersExpected() { return answersExpected; },
-    /** Record the control plane's verdict. Until this runs, nothing uploads. */
-    setVerdict(v) {
+    /** How many times the consent state has changed: `setVerdict`'s `since`. */
+    get verdictEpoch() { return epoch; },
+    /**
+     * Record the control plane's verdict. Until this runs, nothing uploads.
+     * `since`, when given, is `verdictEpoch` as it was when the verdict was
+     * ASKED: a verdict overtaken meanwhile (a 403 arrived) is not applied.
+     */
+    setVerdict(v, { since = null } = {}) {
+      announced = true;
+      if (since !== null && since !== epoch) return;
+      epoch += 1;
       mayUpload = Boolean(v?.mayUpload);
       refusal = v?.reason ?? null;
       // An answered no; `captureVerdict`'s `answered: false` is no answer.
@@ -1822,6 +1855,9 @@ export function registerTurnCapture(api, {
       transport = makeTransport(config);
       uploader = createTurnUploader({
         transport, agentId: config.agentId, root, logger, answersExpected,
+        // The startup chain reads the verdict once the agent is registered;
+        // a flush before it must not ask first and read "not registered".
+        awaitAnnouncedVerdict: true,
       });
       // Model content is RECORDED only while the control plane says it may be
       // uploaded -- asked of the uploader, which holds the one live verdict.
@@ -2141,11 +2177,15 @@ function enrol({ transport, config, pluginId, logger = null, declaration = null 
  * the honest state, for the reasons `enrol()` gives.
  */
 export function announce({ transport, uploader, config, pluginId, logger }) {
+  // The consent state as it stood when this read was ASKED: an answer the
+  // intake gave meanwhile (a 403) is fresher, and this one does not
+  // overwrite it.
+  const since = uploader.verdictEpoch ?? null;
   return Promise.resolve()
     .then(() => transport.captureCurrent(config.agentId))
     .then((response) => {
       const v = captureVerdict(response);
-      uploader.setVerdict(v);
+      uploader.setVerdict(v, { since });
       logger?.info?.(v.mayUpload
         ? `[${pluginId}] production capture is ENABLED for '${config.agentId}'; ` +
           `turns upload every ${FLUSH_EVERY} turns and at shutdown.`
@@ -2156,7 +2196,12 @@ export function announce({ transport, uploader, config, pluginId, logger }) {
       logger?.info?.(
         `[${pluginId}] could not read the production-capture verdict ` +
         `(${err?.message ?? err}); nothing is uploaded and turns stay on disk.`);
-      return { mayUpload: false, reason: String(err?.message ?? err) };
+      const v = {
+        mayUpload: false, reason: String(err?.message ?? err), answered: false,
+      };
+      // UNANSWERED, not no: the flushes may now ask again themselves.
+      uploader.setVerdict?.(v, { since });
+      return v;
     });
 }
 
