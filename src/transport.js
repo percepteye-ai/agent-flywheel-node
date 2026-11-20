@@ -16,6 +16,7 @@
  */
 import { createHash } from "node:crypto";
 
+import { pythonJson } from "./declaration.js";
 import { TransportError } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
@@ -80,16 +81,7 @@ import {
  * fixture.
  */
 function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(", ")}]`;
-  if (value && typeof value === "object") {
-    const body = Object.keys(value).sort()
-      .map((k) => `${pyStr(k)}: ${stableStringify(value[k])}`)
-      .join(", ");
-    return `{${body}}`;
-  }
-  if (typeof value === "string") return pyStr(value);
-  if (value === undefined) return "null";
-  return JSON.stringify(value);
+  return pythonJson(value, { sortKeys: true });
 }
 
 /**
@@ -104,19 +96,6 @@ function bodyDigest(value) {
     .update(stableStringify(value))
     .digest("hex")
     .slice(0, 32);
-}
-
-/** Everything `ensure_ascii=True` escapes and `JSON.stringify` does not. */
-const NON_ASCII = new RegExp("[\\u007f-\\uffff]", "g");
-
-/** One string, escaped the way `json.dumps(ensure_ascii=True)` escapes it. */
-function pyStr(s) {
-  // JSON.stringify already escapes quotes, backslashes and control characters
-  // exactly as Python does; only the non-ASCII codepoints must be folded down.
-  return JSON.stringify(s).replace(
-    NON_ASCII,
-    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
 }
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
@@ -168,7 +147,11 @@ export function urlSegment(value, what = "identifier") {
   if (SEGMENT_CONTROL.test(value)) {
     throw new ContractError(`${what} must not contain a control character`);
   }
-  if (value.length > MAX_URL_SEGMENT_CHARS) {
+  // Counted in CODE POINTS, as Python's len() counts them: an astral
+  // character is two UTF-16 units, so `.length` refused an id of 129 emoji
+  // that the Python SDK's `_path_segment` takes.
+  if (value.length > MAX_URL_SEGMENT_CHARS
+      && [...value].length > MAX_URL_SEGMENT_CHARS) {
     throw new ContractError(
       `${what} must be at most ${MAX_URL_SEGMENT_CHARS} characters`,
     );

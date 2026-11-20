@@ -105,6 +105,10 @@ describe("claiming is replayable through its key", () => {
     assert.equal(calls.length, 0, "a request was made for an id that is not a segment");
     assert.equal(urlSegment("x".repeat(256)), "x".repeat(256));
     assert.equal(urlSegment("it's (a)*!"), "it%27s%20%28a%29%2A%21");
+    // Counted in code points, as Python's len() counts them. Mutation: back
+    // to `.length` (UTF-16 units) -> 129 emoji are refused, red.
+    assert.ok(urlSegment("\u{1F600}".repeat(256)));
+    assert.throws(() => urlSegment("\u{1F600}".repeat(257)), ContractError);
   });
 
   it("puts the agent id in the capture read's path with the same rule (ND-M7)", async () => {

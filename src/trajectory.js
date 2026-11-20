@@ -18,7 +18,7 @@
 import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { reportedOutcome } from "./wire.js";
+import { parseJsonWithConstants, reportedOutcome, toolCallToWire } from "./wire.js";
 
 export const TRAJECTORY_DIR_ENV = "PERCEPTEYE_TRAJECTORY_DIR";
 export const TOOL_CALLS_FILENAME = "tool_calls.jsonl";
@@ -158,36 +158,19 @@ export function readTrajectory(dir) {
       const row = JSON.parse(line);
       // The reader the Python end uses builds each row with REQUIRED
       // subscripts and counts anything else as malformed. Mirror that: a row
-      // missing either field is not a tool call, it is corruption.
-      if (row && typeof row === "object" && row.name && row.outcome) calls.push(row);
-      else malformed += 1;
+      // missing either field is not a tool call, it is corruption -- and so
+      // is one the contract refuses (`toolCallToWire`: Python's
+      // `ToolCallOutcome`), which also scrubs an `unknown` call's status.
+      if (row && typeof row === "object" && row.name && row.outcome) {
+        calls.push(toolCallToWire(row));
+      } else {
+        malformed += 1;
+      }
     } catch {
       malformed += 1;
     }
   }
   return { calls, malformed };
-}
-
-/**
- * `outcome.json`'s text as a value. JSON, and the three constants a Python
- * writer emits for a non-finite number -- `NaN`, `Infinity`, `-Infinity` --
- * read as `null`, which is how `JSON.stringify` spells them too. Python's own
- * reader takes those constants, so refusing them here would make one file a
- * grade under the Python runner and nothing under this one; the Python
- * reader maps them to None for the same reason. Throws on anything else that
- * is not JSON.
- */
-function parseOutcome(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Strings are matched first and kept, so a constant's name inside one is
-    // left alone.
-    return JSON.parse(text.replace(
-      /"(?:[^"\\]|\\.)*"|-?\bInfinity\b|\bNaN\b/g,
-      (found) => (found[0] === '"' ? found : "null"),
-    ));
-  }
 }
 
 /**
@@ -205,7 +188,7 @@ export function takeReportedOutcome(dir) {
   const path = join(dir, OUTCOME_FILENAME);
   let data = null;
   try {
-    data = parseOutcome(readFileSync(path, "utf8"));
+    data = parseJsonWithConstants(readFileSync(path, "utf8"));
   } catch {
     /* absent, unreadable or not JSON: the episode stated nothing */
   }

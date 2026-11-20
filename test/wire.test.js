@@ -147,7 +147,9 @@ describe("an unknown outcome asserts nothing", () => {
         { name: "d", outcome: "ok", status_code: null, output: { status: 200 } },
       ],
     });
-    assert.deepEqual(wire.tool_calls[0].output, { ok: "OK", nested: [{ note: "n" }] });
+    // The string value is scrubbed as every string is, and no longer trimmed
+    // as a side effect (changed with the Python SDK's PY-H13: it was "OK").
+    assert.deepEqual(wire.tool_calls[0].output, { ok: " OK", nested: [{ note: "n" }] });
     assert.equal(wire.tool_calls[1].output, "got  back");
     assert.deepEqual(JSON.parse(wire.tool_calls[2].output), { msg: "fine" });
     // An OBSERVED outcome's output is evidence and is left exactly as it was.

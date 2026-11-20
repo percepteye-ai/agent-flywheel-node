@@ -116,10 +116,38 @@ export function jsonType(v) {
   }
 }
 
-/** Python's `json.dumps(str)`: `JSON.stringify` with non-ASCII escaped. */
-function jsonAscii(text) {
-  return JSON.stringify(text).replace(/[\u0080-\uffff]/g,
+/**
+ * Python's `json.dumps(str)`: `JSON.stringify` with everything
+ * `ensure_ascii=True` escapes and `JSON.stringify` does not -- every code
+ * unit from U+007F up (Python escapes DEL too) -- folded to `\\uXXXX`.
+ * JSON.stringify already escapes quotes, backslashes, control characters and
+ * lone surrogates exactly as Python does. ONE copy: the idempotency key
+ * (`transport.js`) and the status scrub (`wire.js`) use it too.
+ */
+export function jsonAscii(text) {
+  return JSON.stringify(text).replace(/[\u007f-\uffff]/g,
     (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * `json.dumps(value)` -- or `json.dumps(value, sort_keys=True)` with
+ * `sortKeys` -- in JavaScript, for strings, booleans, nulls and integers:
+ * Python's ", " and ": " separators and `ensure_ascii` escaping
+ * (`jsonAscii`). A non-integral number is the one gap (`transport.js`
+ * `stableStringify` names it: `JSON.parse` has already erased 12.0 into 12).
+ */
+export function pythonJson(value, { sortKeys = false } = {}) {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => pythonJson(v, { sortKeys })).join(", ")}]`;
+  }
+  if (value && typeof value === "object") {
+    const keys = sortKeys ? Object.keys(value).sort() : Object.keys(value);
+    return `{${keys.map((k) => `${jsonAscii(k)}: ${pythonJson(value[k], { sortKeys })}`)
+      .join(", ")}}`;
+  }
+  if (typeof value === "string") return jsonAscii(value);
+  if (value === undefined) return "null";
+  return JSON.stringify(value);
 }
 
 /** Key names as a JSON array, sorted by code point, as Python renders them. */

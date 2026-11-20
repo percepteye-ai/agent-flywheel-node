@@ -8,7 +8,8 @@
  * `x-contract-version`, because two copies of a contract with no mechanism
  * keeping them in sync is not a contract.
  */
-import { jsonType } from "./declaration.js";
+import { jsonType, pythonJson } from "./declaration.js";
+import { IDENTITY_FIELDS } from "./evidence.js";
 import { isLowerSha256 } from "./execution-identity.js";
 
 export const CONTRACT_VERSION = "flywheel/1";
@@ -771,7 +772,7 @@ export function rolloutOutputToWire(output) {
     if (!Array.isArray(output.toolCalls)) {
       throw new ContractError("tool_calls must be an array or null");
     }
-    wire.tool_calls = output.toolCalls.map(scrubToolCall);
+    wire.tool_calls = output.toolCalls.map(toolCallToWire);
   }
   // ALWAYS SENT, even at zero. Non-zero forbids the training grade, so a
   // reader must be able to tell "none omitted" from "the field was missing".
@@ -784,6 +785,15 @@ export function rolloutOutputToWire(output) {
       );
     }
     wire.llm_call_count = output.llmCallCount;
+  }
+
+  // A boolean is not a reward and NaN or infinity are not JSON: the first
+  // would train as 1/0, the second is refused by the control plane as the
+  // whole report. `contract.py RolloutOutput.to_wire`'s refusal.
+  if (output.reward !== undefined && output.reward !== null
+      && !(typeof output.reward === "number" && Number.isFinite(output.reward))) {
+    throw new ContractError(
+      `reward must be a finite number or null, got ${String(output.reward)}`);
   }
 
   for (const [key, value] of [
@@ -821,40 +831,70 @@ export function rolloutOutputToWire(output) {
   return wire;
 }
 
-/** Keys that carry a machine-readable status: `contract.py _STATUS_KEYS`. */
-const STATUS_KEYS = new Set(["status_code", "status", "http_status", "code", "statusCode"]);
-/** An HTTP status spelled in prose: `contract.py _HTTP_IN_TEXT`. */
-const HTTP_IN_TEXT = /\bHTTP\s*\d{3}\b/gi;
+/** Keys that carry a machine-readable status: `contract.py _STATUS_KEYS`,
+ *  compared lowercased, so `Status`, `STATUS_CODE` and `statusCode` are all
+ *  found -- a body's own spelling is the server's choice, not ours. */
+const STATUS_KEYS = new Set(["status_code", "status", "http_status", "code", "statuscode"]);
+/**
+ * An HTTP status spelled in text -- `HTTP 200`, and the status line's own
+ * spelling, `HTTP/1.1 200`, `HTTP/2 200`: `contract.py _HTTP_IN_TEXT`, the
+ * same pattern character for character. ASCII classes only (`[0-9]`, the
+ * six ASCII spaces), so Python's `re` and ECMA-262 match the same strings.
+ */
+const HTTP_IN_TEXT = /\bHTTP(?:\/[0-9](?:\.[0-9])?)?[\t\n\v\f\r ]*[0-9]{3}\b/gi;
+
+/**
+ * JSON text as a value, with the three constants Python's `json` reads and
+ * writes for a non-finite number -- `NaN`, `Infinity`, `-Infinity` -- read
+ * as `null` (how `JSON.stringify` spells them, and how the Python SDK's
+ * readers map them). Throws on anything else that is not JSON. Strings are
+ * matched first and kept, so a constant's name inside one is left alone.
+ */
+export function parseJsonWithConstants(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return JSON.parse(text.replace(
+      /"(?:[^"\\]|\\.)*"|-?\bInfinity\b|\bNaN\b/g,
+      (found) => (found[0] === '"' ? found : "null"),
+    ));
+  }
+}
 
 /**
  * Remove machine-readable status from a tool result body: the Python SDK's
- * `contract._scrub_status`, rule for rule. A string that parses as JSON is
- * scrubbed as the value it holds and re-serialised; any other string loses
- * every `HTTP nnn`. An object loses its status keys, and its string values
- * their `HTTP nnn` (trimmed); a list is scrubbed item by item. Everything
- * else is kept. The human-readable content survives, so the trajectory reads
- * the same to a judge; only a status a scorer could mistake for an outcome
- * goes.
+ * `contract._scrub_status`, rule for rule.
+ *
+ * EVERY STRING IS READ THE SAME WAY, wherever it sits: one that parses as a
+ * JSON object or array is scrubbed as that body and written back as JSON --
+ * an object's `{"body": "{\"status_code\": 200}"}` included, which used to
+ * keep its status -- and any other (prose, or a JSON scalar) loses its
+ * `HTTP 200` / `HTTP/1.1 200`. An object loses every status key, compared
+ * lowercased; a list is scrubbed item by item. Everything else is kept.
+ *
+ * WRITTEN BACK AS PYTHON WRITES IT (`pythonJson`: `json.dumps`'s ", " and
+ * ": ", non-ASCII escaped), so both SDKs send the same bytes for the same
+ * body -- except where `JSON.parse` has already lost what Python keeps: a
+ * float's spelling (12.0 reads as 12), an integer past 2^53, and the order
+ * of integer-like keys (an object lists them first).
  */
 export function scrubStatus(output) {
   if (typeof output === "string") {
-    let body;
+    let body = null;
     try {
-      body = JSON.parse(output);
+      body = parseJsonWithConstants(output);
     } catch {
-      return output.replace(HTTP_IN_TEXT, "");
+      body = null;
     }
-    const scrubbed = scrubStatus(body);
-    return typeof scrubbed === "string" ? scrubbed : JSON.stringify(scrubbed);
+    if (body !== null && typeof body === "object") return pythonJson(scrubStatus(body));
+    return output.replace(HTTP_IN_TEXT, "");
   }
   if (Array.isArray(output)) return output.map(scrubStatus);
   if (isObject(output)) {
     const out = {};
     for (const [key, value] of Object.entries(output)) {
-      if (STATUS_KEYS.has(key)) continue;
-      out[key] = typeof value === "string"
-        ? value.replace(HTTP_IN_TEXT, "").trim()
-        : scrubStatus(value);
+      if (STATUS_KEYS.has(String(key).toLowerCase())) continue;
+      out[key] = scrubStatus(value);
     }
     return out;
   }
@@ -862,20 +902,68 @@ export function scrubStatus(output) {
 }
 
 /**
- * An `unknown` outcome must carry NO status, in the field or in the body.
- *
- * `contract.py ToolCallOutcome.__post_init__` sets `status_code` to None and
- * runs `output` through `_scrub_status`, so a scorer cannot recover a verdict
- * from the envelope of a call whose result we never saw. This used to scrub only
- * `body` and `response` -- fields no record here carries -- and leave
- * `output`, the one that does, untouched.
+ * A tool call's `entity_ids` under the field names they were validated as:
+ * each key trimmed and lowercased, which must be a high-entropy identity
+ * field (`IDENTITY_FIELDS`), each value a non-empty string, and no field
+ * named twice in two spellings. `contract.py ToolCallOutcome`'s rule: the
+ * schema's key enum is lowercase, so `{"ID": ...}` was sent and refused
+ * there. Throws `ContractError` naming what is wrong.
  */
-function scrubToolCall(call) {
+function entityIdsToWire(entityIds) {
+  if (!isObject(entityIds)) {
+    throw new ContractError(
+      `tool call entity_ids must be an object, got ${jsonType(entityIds)}`);
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(entityIds)) {
+    const name = String(key).trim().toLowerCase();
+    if (!IDENTITY_FIELDS.has(name)) {
+      throw new ContractError(
+        `tool call entity_ids key ${JSON.stringify(key)} is not a high-entropy ` +
+        `identity field (${[...IDENTITY_FIELDS].join(", ")})`);
+    }
+    if (typeof value !== "string" || !value.trim()) {
+      throw new ContractError(
+        `tool call entity_ids[${JSON.stringify(key)}] must be a non-empty string`);
+    }
+    if (Object.hasOwn(out, name)) {
+      throw new ContractError(
+        `tool call entity_ids names the identity field ${JSON.stringify(name)} ` +
+        `twice (${JSON.stringify(key)} and another spelling)`);
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * One recorded tool call as the wire carries it, or a `ContractError`: what
+ * `contract.py ToolCallOutcome` makes of a record. ONE RULE FOR EVERY PATH a
+ * tool call leaves by -- `readTrajectory` (production turns and rollouts
+ * alike, where a refused row is counted malformed, as Python's
+ * `Trajectory.read` counts it) and `rolloutOutputToWire`.
+ *
+ * An `unknown` outcome carries NO status, in the field or in the body:
+ * `status_code` is null and `output` goes through `scrubStatus`, so a scorer
+ * cannot recover a verdict from the envelope of a call whose result was
+ * never seen. `entity_ids` leave under their canonical names
+ * (`entityIdsToWire`) and are never scrubbed: an identity claims nothing
+ * about the outcome.
+ */
+export function toolCallToWire(call) {
+  if (!isObject(call)) {
+    throw new ContractError(`a tool call must be an object, got ${jsonType(call)}`);
+  }
   const out = { ...call };
   if ("environment" in out) {
     // `contract.py` refuses this outright: the environment is the control
     // plane's fact about the rollout, not the agent's to assert.
     throw new ContractError("tool call may not carry an 'environment' field");
+  }
+  if (out.entity_ids !== undefined && out.entity_ids !== null) {
+    const ids = entityIdsToWire(out.entity_ids);
+    if (Object.keys(ids).length) out.entity_ids = ids;
+    else delete out.entity_ids;
   }
   if (out.outcome === "unknown") {
     out.status_code = null;
