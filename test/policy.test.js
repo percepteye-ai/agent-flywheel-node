@@ -150,6 +150,20 @@ const productionConfig = (over = {}, env = {}) =>
   resolveConfig({ apiKey: "pefw_x", ...over }, env);
 
 
+
+/** Waits for the startup policy read to land, bounded by TIME rather than by a
+ * count of event-loop turns: startup does more async work than it did
+ * (capture's disk I/O is fs.promises), and a fixed 40 turns ran out on a slow
+ * CI runner before the read landed. */
+async function untilServing(out, ms = 5_000) {
+  // setImmediate and performance.now(): tests that mock setTimeout and Date
+  // (the cadence tests) use this too, and a mocked timer never fires.
+  const until = performance.now() + ms;
+  while (!out.serving.resolved && performance.now() < until) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
 describe("promptDecision — the pair check, cause by cause", () => {
   it("applies an approved bundle whose halves agree", () => {
     const d = promptDecision(APPROVED);
@@ -1332,9 +1346,7 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
       const out = register(api, { apiKey: SECRET }, {
         PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
       });
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true);
       assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID })?.apiKey,
         SECRET, "the gateway at the configured control plane's address takes the key");
@@ -1588,9 +1600,7 @@ describe("both halves re-read on a hook, at most once per ttl_s, never on a time
       const out = register(api, { apiKey: "pefw_x" }, {
         PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
       });
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the startup read never completed");
       assert.equal(reads("/policy/current"), 1);
       assert.ok(api.hooks.length > 2, "the capture lane's hooks are subscribed too");
@@ -1716,9 +1726,7 @@ describe("mode decides it, structurally", () => {
       assert.ok(api.hook(MODEL_HOOK_NAME), `${MODEL_HOOK_NAME} must be subscribed`);
       assert.equal(api.providers.length, 1);
 
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the startup read never completed");
       assert.deepEqual(
         api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN),
@@ -1847,9 +1855,7 @@ describe("mode decides it, structurally", () => {
         "to be rate-limited before the agent has served a turn",
       );
       releaseRegistration();
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the read must still happen after");
       assert.equal(out.serving.appliedPrompt, APPROVED.text);
     } finally {
