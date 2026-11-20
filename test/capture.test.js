@@ -491,16 +491,21 @@ function hostApi({ allowConversationAccess = false } = {}) {
   };
 }
 
-/** Let a not-awaited cadence flush run to completion. */
-async function settle() {
-  for (let i = 0; i < 5; i += 1) {
-    await new Promise((r) => setImmediate(r));
+/** Let a not-awaited cadence flush run to completion: it yields to the
+ * event loop and reads the disk asynchronously, so give it real turns. */
+async function settle(until = null) {
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise((r) => setTimeout(r, 4));
+    if (until?.()) return;
   }
 }
 
-/** Backdate a turn directory past the settle window: it stopped changing. */
+/** Backdate a turn past the settle window: it stopped changing. Every file
+ * in it, not only the directory -- an append moves a file's mtime and not its
+ * directory's, so the settle window reads the newest file. */
 function age(dir) {
   const t = new Date(Date.now() - UNANSWERED_SETTLE_MS - 60_000);
+  for (const name of readdirSync(dir)) utimesSync(join(dir, name), t, t);
   utimesSync(dir, t, t);
   return dir;
 }
@@ -544,7 +549,7 @@ describe("the cadence hangs off a hook the host actually delivers", () => {
     for (let i = 0; i < FLUSH_EVERY; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi", sessionKey: "c" }, {});
     }
-    await settle();
+    await settle(() => tr.sent.length > 0);
     assert.deepEqual(tr.sent.map((t) => t.turn_id), ["earlier"],
       "FLUSH_EVERY user messages did not trigger an upload; the cadence is " +
       "still waiting on a hook this host does not deliver");
@@ -585,7 +590,7 @@ describe("the cadence hangs off a hook the host actually delivers", () => {
     for (let i = 0; i < FLUSH_EVERY; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi" }, {});
     }
-    await settle();
+    await settle(() => tr.sent.length > 0);
     assert.deepEqual(tr.sent.map((t) => t.turn_id), ["quiet"],
       "the cadence fired but sent nothing: every turn is unanswered here");
     assert.equal(tr.sent[0].final_text, null);

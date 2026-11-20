@@ -43,6 +43,7 @@ import {
   openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync,
   writeSync,
 } from "node:fs";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import { readTrajectory } from "./trajectory.js";
@@ -51,7 +52,7 @@ import {
   OBSERVATION_FILENAME, endRecord, newSpanId, newTraceId, observationFromLines,
   operationRecord, renderTurnTrace, traceRecord,
 } from "./genai-otlp.js";
-import { isLowerSha256 } from "./execution-identity.js";
+import { compareStrings, isLowerSha256 } from "./execution-identity.js";
 import {
   ContractError, productionIdentifier, productionTurnIdentifier,
 } from "./wire.js";
@@ -564,32 +565,142 @@ export function turnWire(dir, { turnIndex = 0, modelContentAgent = null } = {}) 
 }
 
 /**
- * Every turn directory under `root`, oldest first.
+ * Every turn directory under `root`, least recently written first: `mtime`
+ * is the DIRECTORY's, which says when a file was last created in it --
+ * retention's "most recently written". Not the order of a conversation: that
+ * is when each turn STARTED (`turnStartedAt`).
  *
- * ORDERED BY MTIME, which is the ordering Python derives `turn_index` from.
- * Both ends must agree, because the control plane indexes on
- * `(org, agent, conversation_id, turn_index)` and a conversation whose turns
- * all claim index 0 cannot be ordered at all.
+ * Directories only, never through a symlink: a link in the capture root is
+ * not a turn this package wrote, and following it read -- and uploaded, and
+ * pruned -- whatever it pointed at. Ties broken by code point
+ * (`compareStrings`), Python's order, never by locale.
  */
 export function listTurnDirs(root) {
-  let names;
+  let entries;
   try {
-    names = readdirSync(root);
+    entries = readdirSync(root, { withFileTypes: true });
   } catch {
     return [];
   }
   const dirs = [];
-  for (const name of names) {
-    const path = join(root, name);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const path = join(root, entry.name);
     try {
-      const st = statSync(path);
-      if (st.isDirectory()) dirs.push({ path, name, mtime: st.mtimeMs });
+      dirs.push({ path, name: entry.name, mtime: statSync(path).mtimeMs });
     } catch {
       // Vanished between listing and stat: a concurrent prune. Not an error.
     }
   }
-  dirs.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+  dirs.sort((a, b) => a.mtime - b.mtime || compareStrings(a.name, b.name));
   return dirs;
+}
+
+/**
+ * When this turn STARTED, for ordering its conversation: the Python SDK's
+ * `_started_at`, rule for rule. THE `conversation_id` FILE'S mtime, written
+ * once when the turn is first bound (`recordConversationId`), NOT the
+ * directory's -- a directory's mtime moves whenever a file is created in it,
+ * and a turn creates files long after it began (its answer, its first tool
+ * call), so ordering by it put a turn answered late AFTER the turn that
+ * followed it. Falls back to the directory's mtime, then 0.
+ */
+export function turnStartedAt(path) {
+  try {
+    return statSync(join(path, CONVERSATION_ID_FILENAME)).mtimeMs;
+  } catch { /* none */ }
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** `turnStartedAt`, asynchronously, for the flush path. */
+async function turnStartedAtAsync(path) {
+  try {
+    return (await stat(join(path, CONVERSATION_ID_FILENAME))).mtimeMs;
+  } catch { /* none */ }
+  try {
+    return (await stat(path)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** The conversation order: start, then turn id by code point. */
+const byStart = (a, b) => a.startedAt - b.startedAt || compareStrings(a.name, b.name);
+
+/**
+ * Every turn under `root` as `{name, path, conversationId, startedAt}`, in
+ * the order they started -- ONE LISTING, read with `fs.promises` a bounded
+ * number at a time, for the flush. It used to be a synchronous listing PER
+ * TURN (`turnIndexOf` inside the pending loop), O(turns x turns) blocking
+ * syscalls on the event loop the customer's agent is serving from: 15.6 s at
+ * 5,000 turns. Directories only, never through a symlink.
+ */
+export async function scanTurns(root) {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const dirs = entries.filter((e) => e.isDirectory());
+  const out = [];
+  for (let i = 0; i < dirs.length; i += 64) {
+    out.push(...await Promise.all(dirs.slice(i, i + 64).map(async (e) => {
+      const path = join(root, e.name);
+      let conversationId = null;
+      try {
+        const raw = await readFile(join(path, CONVERSATION_ID_FILENAME), "utf8");
+        conversationId = productionIdentifier(raw) === raw ? raw : null;
+      } catch { /* none */ }
+      return {
+        name: e.name, path, conversationId,
+        startedAt: await turnStartedAtAsync(path),
+      };
+    })));
+  }
+  return out.sort(byStart);
+}
+
+/**
+ * Each turn's position within its conversation, from one `scanTurns`
+ * listing: a Map of turn name to index. A turn with no conversation is not
+ * in it (its index is 0 and is not sent).
+ */
+export function turnIndices(turns) {
+  const next = new Map();
+  const index = new Map();
+  for (const t of [...turns].sort(byStart)) {
+    if (!t.conversationId) continue;
+    const i = next.get(t.conversationId) ?? 0;
+    index.set(t.name, i);
+    next.set(t.conversationId, i + 1);
+  }
+  return index;
+}
+
+/**
+ * When anything in this turn was last WRITTEN: the newest mtime of the files
+ * in its directory, or of the directory itself. Appending to a file -- every
+ * tool call after the first -- moves that file's mtime and NOT the
+ * directory's, so the directory alone said a turn still being worked was
+ * quiet. Asynchronous: it is asked on the flush path. 0 when unreadable.
+ */
+export async function lastWrittenAt(path) {
+  let newest = 0;
+  try {
+    newest = (await stat(path)).mtimeMs;
+    for (const name of await readdir(path)) {
+      try {
+        const m = (await stat(join(path, name))).mtimeMs;
+        if (m > newest) newest = m;
+      } catch { /* vanished */ }
+    }
+  } catch { /* unreadable */ }
+  return newest;
 }
 
 /**
@@ -599,12 +710,16 @@ export function listTurnDirs(root) {
  * being uploaded now, so a turn sent in a later batch keeps the position it
  * actually had. A counter held in memory would restart at zero on every
  * process restart -- and every turn landing at index 0 is precisely what the
- * control plane's index exists to prevent.
+ * control plane's index exists to prevent. Ordered by when each turn STARTED
+ * (`turnStartedAt`), the Python SDK's `_turn_index`. Synchronous, for one
+ * turn; the flush computes every turn's at once (`scanTurns`, `turnIndices`).
  */
 export function turnIndexOf(root, dirName, conversationId) {
   if (!conversationId) return 0;
   const siblings = listTurnDirs(root)
-    .filter((d) => readConversationId(d.path) === conversationId);
+    .filter((d) => readConversationId(d.path) === conversationId)
+    .map((d) => ({ ...d, startedAt: turnStartedAt(d.path) }))
+    .sort(byStart);
   const i = siblings.findIndex((d) => d.name === dirName);
   return i < 0 ? 0 : i;
 }

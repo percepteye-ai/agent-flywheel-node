@@ -59,11 +59,14 @@
  * inventing the user's message from the model's prompt would be manufacturing
  * the one field we cannot observe.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
-  statSync, writeFileSync,
+  statSync, unlinkSync, writeFileSync,
 } from "node:fs";
+import {
+  mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 
 import { GET_A_KEY } from "./config.js";
@@ -94,12 +97,44 @@ import { recordTurnFeedbackSpan } from "./tracing.js";
 import { TOOL_CALLS_FILENAME } from "./trajectory.js";
 import {
   CONVERSATION_ID_FILENAME, TURNS_FILENAME,
-  listTurnDirs, readConversationId, readModelBoundary, readTaskId,
-  recordConversationId,
+  lastWrittenAt, listTurnDirs, readConversationId, readModelBoundary,
+  readTaskId, recordConversationId,
   recordModelBoundary, recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
-  turnDir, turnIndexOf, turnWire,
+  scanTurns, turnDir, turnIndices, turnWire,
 } from "./turns.js";
+
+/**
+ * Replace `path` with `data` atomically: a unique temp file (pid + random)
+ * renamed over it, so a reader -- or a second process -- sees the old bytes
+ * or the new, never a truncated file, and two writers never share one temp
+ * name (`${path}.tmp` was fixed). Throws; callers decide what a failure costs.
+ */
+function replaceFile(path, data) {
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, data, "utf8");
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* never written */ }
+    throw err;
+  }
+}
+
+/** `replaceFile`, off the event loop, for the flush path. */
+async function replaceFileAsync(path, data) {
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmp, data, "utf8");
+    await rename(tmp, path);
+  } catch (err) {
+    try { await unlink(tmp); } catch { /* never written */ }
+    throw err;
+  }
+}
+
+/** Give the event loop a turn: what was waiting runs before what follows. */
+const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Turns between automatic upload attempts. The Python SDK's `_FLUSH_EVERY`. */
 export const FLUSH_EVERY = 32;
@@ -216,7 +251,7 @@ export function pruneTurns({
         const here = new Set(entries.map((e) => e.name).filter((n) => !gone.has(n)));
         const kept = readFileSync(index, "utf8").split("\n")
           .map((l) => l.trim()).filter((id) => id && here.has(id)).sort();
-        writeFileSync(index, kept.map((id) => `${id}\n`).join(""), "utf8");
+        replaceFile(index, kept.map((id) => `${id}\n`).join(""));
       }
     } catch { /* the index is a cache of what was sent; a resend is deduped */ }
   }
@@ -244,10 +279,18 @@ export const UNANSWERED_SETTLE_MS = 5 * 60_000;
  * Which turns have already been sent.
  *
  * A FILE AT THE ROOT, never inside a turn directory. Writing a marker into a
- * turn's own directory bumps that directory's MTIME -- and mtime is the
- * ordering key for `turn_index`. Uploading would have silently reordered every
- * conversation it touched. The Python SDK carries the same file for the same
- * reason; this is not a coincidence to be tidied away.
+ * turn's own directory bumps that directory's MTIME -- which retention reads
+ * as "most recently written", and which `turn_index` was once ordered by --
+ * so uploading would have reordered what it touched. The Python SDK carries
+ * the same file for the same reason; this is not a coincidence to be tidied
+ * away.
+ *
+ * Rewritten whole and renamed into place (`replaceFile`): a reader never
+ * sees it half-written. The flush marks it off the event loop (a synchronous
+ * write measured stalls of 230ms under disk contention); flushes never
+ * overlap, and retention's trim interleaving with a mark costs at most the
+ * ids of turns already deleted, which the next trim drops. A write lost
+ * across processes costs a resend, which the intake dedupes.
  */
 export const UPLOADED_INDEX = ".uploaded";
 
@@ -952,7 +995,11 @@ export function createTurnUploader({
   // overtaken while in flight -- a 403 arrived meanwhile -- is not applied
   // over the fresher answer (`setVerdict(v, {since})`).
   let epoch = 0;
+  // A flush in flight, and the one rerun asked for meanwhile (`flush`).
   let inFlight = false;
+  let rerunOptions = null;
+  let rerun = null;
+  let resolveRerun = null;
   let mayUpload = false;
   let refusal = null;
   // Whether the control plane SAID NO -- an answered verdict, or the intake's
@@ -977,25 +1024,33 @@ export function createTurnUploader({
   // report, so it is said once (`warnWholeBatchRefusal`).
   const batchRefusalSaid = new Map();
 
+  const idsOf = (text) => new Set(
+    text.split("\n").map((l) => l.trim()).filter(Boolean));
+
   function uploadedIds() {
     try {
-      return new Set(
-        readFileSync(join(root, UPLOADED_INDEX), "utf8")
-          .split("\n").map((l) => l.trim()).filter(Boolean),
-      );
+      return idsOf(readFileSync(join(root, UPLOADED_INDEX), "utf8"));
     } catch {
       return new Set();
     }
   }
 
-  function markUploaded(ids) {
+  /** `uploadedIds`, off the event loop, for the flush. */
+  async function uploadedIdsAsync() {
+    try {
+      return idsOf(await readFile(join(root, UPLOADED_INDEX), "utf8"));
+    } catch {
+      return new Set();
+    }
+  }
+
+  async function markUploaded(ids) {
     if (!ids.length) return;
     try {
-      mkdirSync(root, { recursive: true });
-      const all = uploadedIds();
+      await mkdir(root, { recursive: true });
+      const all = await uploadedIdsAsync();
       for (const id of ids) all.add(id);
-      writeFileSync(join(root, UPLOADED_INDEX),
-                    [...all].join("\n") + "\n", "utf8");
+      await replaceFileAsync(join(root, UPLOADED_INDEX), [...all].join("\n") + "\n");
     } catch {
       // A marker we could not write means the turn is retried next flush. The
       // intake dedupes on turn_id, so a resend is answered as a duplicate --
@@ -1005,23 +1060,33 @@ export function createTurnUploader({
   }
 
   /**
-   * Collect the turns worth sending right now.
+   * Collect the turns worth sending right now, in the order they started.
    *
-   * `quietBefore` is an mtime cutoff applied ONLY to unanswered turns: a turn
-   * touched more recently than that may still be accruing tool calls, and
-   * sending it now would mark it uploaded before it finished being written.
-   * `null` means send them regardless, which is what shutdown wants.
+   * `quietBefore` is a cutoff applied ONLY to unanswered turns, against the
+   * newest file written in the turn (`lastWrittenAt`): a turn written more
+   * recently than that may still be accruing tool calls, and sending it now
+   * would mark it uploaded before it finished being written. `null` means
+   * send them regardless, which is what shutdown wants.
+   *
+   * OFF THE HOOK'S PATH. The first thing it does is yield, so the hook that
+   * kicked the flush has returned before anything is listed; then ONE
+   * listing (`scanTurns`, `fs.promises`) gives every turn's index at once,
+   * and the turns are read a few at a time between yields.
    */
-  function pending({ includeUnanswered, quietBefore = null }) {
-    const already = uploadedIds();
+  async function pending({ includeUnanswered, quietBefore = null }) {
+    await yieldToLoop();
+    const turns = await scanTurns(root);
+    const index = turnIndices(turns);
+    const already = await uploadedIdsAsync();
     const out = [];
-    for (const d of listTurnDirs(root)) {
-      if (already.has(d.name)) continue;
+    let read = 0;
+    for (const t of turns) {
+      if (already.has(t.name)) continue;
+      if (++read % 8 === 0) await yieldToLoop();
       let wire;
       try {
-        const cid = readConversationId(d.path);
-        wire = turnWire(d.path, {
-          turnIndex: cid ? turnIndexOf(root, d.name, cid) : 0,
+        wire = turnWire(t.path, {
+          turnIndex: index.get(t.name) ?? 0,
           // Model content rides only while the control plane says it may.
           modelContentAgent: mayCaptureModelContent ? agentId : null,
         });
@@ -1033,7 +1098,9 @@ export function createTurnUploader({
       if (!wire) continue;
       if (wire.final_text === null) {
         if (!includeUnanswered) continue;
-        if (quietBefore !== null && d.mtime > quietBefore) continue;
+        if (quietBefore !== null && await lastWrittenAt(t.path) > quietBefore) {
+          continue;
+        }
       }
       out.push(wire);
     }
@@ -1163,8 +1230,7 @@ export function createTurnUploader({
     const path = outcomeFile(root, wire.outcome_id);
     try {
       mkdirSync(root, { recursive: true });
-      writeFileSync(`${path}.tmp`, sortedJson(wire), "utf8");
-      renameSync(`${path}.tmp`, path);
+      replaceFile(path, sortedJson(wire));
     } catch {
       // Capture costs the observation, never the caller.
       return null;
@@ -1196,8 +1262,7 @@ export function createTurnUploader({
     const path = feedbackFile(root, wire.feedback_id);
     try {
       mkdirSync(root, { recursive: true });
-      writeFileSync(`${path}.tmp`, sortedJson(wire), "utf8");
-      renameSync(`${path}.tmp`, path);
+      replaceFile(path, sortedJson(wire));
     } catch {
       // Capture costs the observation, never the caller.
       return null;
@@ -1232,11 +1297,11 @@ export function createTurnUploader({
    * (still on disk), `feedbackDropped`.
    */
   async function flushFeedback() {
-    const age = (path) => {
-      try { return statSync(path).mtimeMs; } catch { return 0; }
+    const age = async (path) => {
+      try { return (await stat(path)).mtimeMs; } catch { return 0; }
     };
-    const files = queuedFiles(FEEDBACK_FILE_PREFIX)
-      .map((path) => [age(path), path])
+    const files = (await Promise.all((await queuedFilesAsync(FEEDBACK_FILE_PREFIX))
+      .map(async (path) => [await age(path), path])))
       .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
     const now = Date.now();
     const stale = files.filter(([at]) => now - at > OUTCOME_MAX_AGE_MS);
@@ -1244,13 +1309,13 @@ export function createTurnUploader({
     const excess = Math.max(fresh.length - OUTCOME_MAX_KEPT_UNANSWERED, 0);
     let dropped = 0;
     for (const [, path] of [...stale, ...fresh.slice(0, excess)]) {
-      try { rmSync(path); dropped += 1; } catch { /* kept */ }
+      try { await rm(path); dropped += 1; } catch { /* kept */ }
     }
     const waiting = [];
     for (const [, path] of fresh.slice(excess)) {
       try {
         waiting.push({ path, wire: turnFeedback(
-          JSON.parse(readFileSync(path, "utf8"))) });
+          JSON.parse(await readFile(path, "utf8"))) });
       } catch {
         // Unreadable or not ours to send; one file costs that file.
       }
@@ -1296,14 +1361,25 @@ export function createTurnUploader({
       `more is sent by this process.`);
   }
 
-  /** The files with this prefix waiting in the capture root, in name order. */
+  /** The files with this prefix waiting in the capture root, in name order:
+   *  regular files only (a dirent is never followed through a symlink). */
+  const queued = (entries, prefix) => entries
+    .filter((e) => e.isFile() && e.name.startsWith(prefix)
+      && e.name.endsWith(OUTCOME_FILE_SUFFIX))
+    .map((e) => e.name).sort().map((name) => join(root, name));
+
   function queuedFiles(prefix) {
     try {
-      return readdirSync(root).filter((n) =>
-        n.startsWith(prefix) && n.endsWith(OUTCOME_FILE_SUFFIX))
-        .sort().map((name) => join(root, name)).filter((path) => {
-          try { return statSync(path).isFile(); } catch { return false; }
-        });
+      return queued(readdirSync(root, { withFileTypes: true }), prefix);
+    } catch {
+      return [];
+    }
+  }
+
+  /** `queuedFiles`, off the event loop, for the flush. */
+  async function queuedFilesAsync(prefix) {
+    try {
+      return queued(await readdir(root, { withFileTypes: true }), prefix);
     } catch {
       return [];
     }
@@ -1373,13 +1449,13 @@ export function createTurnUploader({
    * kept while the answer was unknown -- or after a refusal -- never expired.
    * The Python SDK's `_expire_outcomes`.
    */
-  function expireOutcomes() {
+  async function expireOutcomes() {
     const kept = [];
     let expired = 0;
-    for (const path of outcomeFiles()) {
+    for (const path of await queuedFilesAsync(OUTCOME_FILE_PREFIX)) {
       try {
-        if (Date.now() - statSync(path).mtimeMs > OUTCOME_MAX_AGE_MS) {
-          rmSync(path, { force: true });
+        if (Date.now() - (await stat(path)).mtimeMs > OUTCOME_MAX_AGE_MS) {
+          await rm(path, { force: true });
           expired += 1;
           continue;
         }
@@ -1413,7 +1489,7 @@ export function createTurnUploader({
     const waiting = [];
     for (const path of files) {
       try {
-        const wire = productionOutcome(JSON.parse(readFileSync(path, "utf8")));
+        const wire = productionOutcome(JSON.parse(await readFile(path, "utf8")));
         if (!episodesOnly || namesOnlyAnEpisode(wire)) waiting.push({ path, wire });
       } catch {
         // Unreadable or not ours to send; one file costs that file.
@@ -1486,9 +1562,9 @@ export function createTurnUploader({
     }
     const count = (group) => group.reduce((n, b) => n + b.length, 0);
     const left = () => queue.reduce((n, group) => n + count(group), 0);
-    const forget = (batch) => {
+    const forget = async (batch) => {
       for (const { path } of batch) {
-        try { rmSync(path, { force: true }); } catch { /* resent; deduped */ }
+        try { await rm(path, { force: true }); } catch { /* resent; deduped */ }
       }
     };
     let sent = 0;
@@ -1535,7 +1611,7 @@ export function createTurnUploader({
           const status = err?.statusCode ?? null;
           if (onAbsent !== null && routeAbsent(status)) {
             const gone = [...batch, ...beside, ...queue.flat(2)];
-            forget(gone);
+            await forget(gone);
             absent += gone.length;
             queue.length = 0;
             onAbsent(String(err?.message ?? err));
@@ -1561,7 +1637,7 @@ export function createTurnUploader({
           failed += batch.length;
           continue;
         }
-        forget(batch);
+        await forget(batch);
         const named = refusedByName(reply, kind).slice(0, batch.length);
         byName.push(...named);
         noteless.push(...notesNotStored(reply, kind));
@@ -1579,7 +1655,7 @@ export function createTurnUploader({
       const split = [];
       for (const { batch, status, cause } of refused) {
         if (batch.length === 1) {
-          forget(batch);
+          await forget(batch);
           dropped.push(outcomeRefusedForSize(status)
             ? `${cause} (${kind.one} of ${outcomeWireBytes(batch[0].wire)} ` +
               `bytes, too large to send even alone)`
@@ -1641,23 +1717,54 @@ export function createTurnUploader({
    * (`expireOutcomes`): an outcome kept while the answer is unknown, or
    * after a refusal, is bounded like any other.
    */
-  async function flush(options = {}) {
-    if (inFlight) return { sent: 0, skipped: true };
-    inFlight = true;
-    try {
-      const counts = await flushTurns(options);
-      const waiting = expireOutcomes();
-      if (mayUpload && waiting.length) {
-        Object.assign(counts, await flushOutcomes(waiting));
-      } else if (waiting.length && !episodeOutcomesRefused) {
-        Object.assign(
-          counts, await flushOutcomes(waiting, { episodesOnly: true }));
-      }
-      Object.assign(counts, await flushFeedback());
-      return counts;
-    } finally {
-      inFlight = false;
+  function flush(options = {}) {
+    if (inFlight) {
+      // ONE COALESCED RERUN after the pass in flight, never a dropped call:
+      // what was written meanwhile -- a reported outcome, a turn, the
+      // shutdown's last chance -- is sent by it. Every caller arriving
+      // meanwhile shares it, with the widest of their options.
+      rerunOptions = rerunOptions === null ? { ...options } : {
+        includeUnanswered: Boolean(rerunOptions.includeUnanswered
+          || options.includeUnanswered),
+        settleMs: Math.min(rerunOptions.settleMs ?? 0, options.settleMs ?? 0),
+      };
+      rerun ??= new Promise((resolve) => { resolveRerun = resolve; });
+      return rerun;
     }
+    inFlight = true;
+    return drive(options);
+  }
+
+  /** One pass, then the coalesced rerun if one was asked for meanwhile;
+   *  `inFlight` stays held across the hand-over. */
+  async function drive(options) {
+    try {
+      return await flushOnce(options);
+    } finally {
+      if (rerunOptions !== null) {
+        const next = rerunOptions;
+        const resolve = resolveRerun;
+        rerunOptions = null;
+        rerun = null;
+        resolveRerun = null;
+        drive(next).then(resolve, () => resolve({ sent: 0 }));
+      } else {
+        inFlight = false;
+      }
+    }
+  }
+
+  async function flushOnce(options) {
+    const counts = await flushTurns(options);
+    const waiting = await expireOutcomes();
+    if (mayUpload && waiting.length) {
+      Object.assign(counts, await flushOutcomes(waiting));
+    } else if (waiting.length && !episodeOutcomesRefused) {
+      Object.assign(
+        counts, await flushOutcomes(waiting, { episodesOnly: true }));
+    }
+    Object.assign(counts, await flushFeedback());
+    return counts;
   }
 
   /**
@@ -1670,7 +1777,7 @@ export function createTurnUploader({
     // yes: one read per flush, the Python SDK's cadence.
     if (announced && (!mayUpload || !mayCaptureModelContent)) await recheck();
     if (!mayUpload) return { sent: 0, notPermitted: true };
-    const turns = pending({
+    const turns = await pending({
       includeUnanswered,
       quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
     });
@@ -1696,7 +1803,7 @@ export function createTurnUploader({
           `they stay on disk and are retried: ${err?.message ?? err}`);
         continue;
       }
-      markUploaded(chunk.map((t) => t.turn_id));
+      await markUploaded(chunk.map((t) => t.turn_id));
       sent += chunk.length;
       noteModelContentRefusal(reply);
     }
@@ -1758,6 +1865,13 @@ export function createTurnUploader({
     reportTurnFeedback,
   };
 }
+
+/**
+ * How long `gateway_stop` waits for its last flush. The Python SDK's
+ * `_CLOSE_FLUSH_GRACE_S`: a stop must not hang on an unresponsive control
+ * plane, and a turn not sent now is still on disk for the next process.
+ */
+export const SHUTDOWN_FLUSH_GRACE_MS = 5_000;
 
 export const MESSAGE_RECEIVED = "message_received";
 export const AGENT_END = "agent_end";
@@ -1900,7 +2014,17 @@ export function registerTurnCapture(api, {
     api.on(GATEWAY_STOP, () => {
       // LAST CHANCE: nothing more is coming for anything after this, so every
       // unanswered turn goes regardless of how recently it was written.
-      uploader.flush({ includeUnanswered: true }).catch(() => {});
+      // RETURNED, so the host -- which awaits this hook -- waits for it, at
+      // most SHUTDOWN_FLUSH_GRACE_MS: an unreachable control plane must not
+      // keep a gateway from stopping, and what is not sent stays on disk.
+      // A flush already in flight gets this one as its coalesced rerun.
+      return Promise.race([
+        uploader.flush({ includeUnanswered: true }).catch(() => ({ sent: 0 })),
+        new Promise((resolve) => {
+          setTimeout(() => resolve({ sent: 0, timedOut: true }),
+                     SHUTDOWN_FLUSH_GRACE_MS).unref?.();
+        }),
+      ]);
     });
     // REGISTER, THEN ASK -- in that order, and the order is the point. The
     // verdict is computed FROM the agent row, so asking first, on a first
