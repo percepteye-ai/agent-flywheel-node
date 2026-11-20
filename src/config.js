@@ -143,19 +143,24 @@ export const CONFIG_SCHEMA = {
         "are opaque to the SDK; incomplete or invalid evidence emits no identity. " +
         "A startup observation enables pre-claim registration binding.",
     },
+    // NO `enum`: `mode.js` reads the value trimmed and in any case, and null
+    // or "" as unset, and an enum is exact and case-sensitive -- so the host
+    // refused `"Production"` and `null`, values the runtime takes, by failing
+    // the plugin load. A spelling `mode.js` does not know is degraded to
+    // production, loudly, by `register()` (index.js), as one in
+    // PERCEPTEYE_AGENT_MODE always was.
     mode: {
-      type: "string",
-      enum: [
-        "training", "train", "rollout", "rollouts", "fine-tuning",
-        "finetuning", "improving", "production", "prod", "serving",
-      ],
+      type: ["string", "null"],
       description:
         "training: this install claims rollouts and drives turns. " +
         "production: claims no rollout and starts no turn -- those hooks are " +
         "never registered -- but captures the turns you serve and applies " +
-        "the system prompt your control plane approved. Unset means " +
-        "PERCEPTEYE_AGENT_MODE, then training; a value here overrides the " +
-        "environment.",
+        "the system prompt and the model your control plane approved. Unset " +
+        "(or null, or empty) means PERCEPTEYE_AGENT_MODE, then production; a " +
+        "value here overrides the environment. Spellings, in any case: " +
+        "training, train, rollout, rollouts, fine-tuning, finetuning, " +
+        "improving, production, prod, serving. Any other value runs " +
+        "production mode and says so.",
     },
     introspect: {
       type: ["string", "boolean", "number", "null"],

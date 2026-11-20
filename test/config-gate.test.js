@@ -377,3 +377,23 @@ test("an empty config value is unset, so the environment's opt-out wins", () => 
   assert.equal(register(api, { capture: "" }, { PERCEPTEYE_CAPTURE: "0" }), null);
   assert.equal(api.hooks.length, 0);
 });
+
+test("the schema takes every mode the runtime reads, and says the default is production", () => {
+  // An enum is exact and case-sensitive, and the host fails the plugin load
+  // on a value its schema refuses -- so `"Production"` and `null`, which
+  // mode.js reads as production and as unset, cost the whole plugin.
+  const mode = CONFIG_SCHEMA.properties.mode;
+  assert.equal("enum" in mode, false);
+  assert.ok(mode.type.includes("string") && mode.type.includes("null"));
+  assert.match(mode.description, /then production/);
+  assert.doesNotMatch(mode.description, /then training/);
+  assert.match(mode.description, /the model/);
+  for (const value of [" Production ", "TRAINING", null, ""]) {
+    assert.doesNotThrow(() => resolveConfig({ mode: value }, {}), JSON.stringify(value));
+  }
+  assert.equal(resolveConfig({ mode: null }, {}).mode, PRODUCTION);
+  const manifest = JSON.parse(
+    readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  assert.match(manifest.description, /model your control plane has approved/);
+});

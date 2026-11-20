@@ -22,7 +22,7 @@ import { toWire } from "./trajectory.js";
  * @param {{write: Function}} deps.writer
  * @param {string|null} [deps.mode] the PLUGIN-CONFIG mode (`config.mode`).
  *   Resolved through `mode.js`, the one seam that knows the precedence --
- *   config, then `PERCEPTEYE_AGENT_MODE`, then training. Reading the
+ *   config, then `PERCEPTEYE_AGENT_MODE`, then production. Reading the
  *   environment alone here once stamped every production tool span with a
  *   rollout id whenever the mode came from the plugin config, and a consumer
  *   that drops self-emitted spans dropped all of them.
