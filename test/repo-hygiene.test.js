@@ -10,7 +10,7 @@
 import "./support/home.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
@@ -40,5 +40,29 @@ describe("the repository", () => {
     if (files === null) return t.skip("not a git checkout");
     const junk = files.filter((f) => f.split("/").pop() === ".DS_Store");
     assert.deepEqual(junk, [], `tracked: ${junk.join(", ")}`);
+  });
+});
+
+describe("the workflows (ND-M13)", () => {
+  const dir = join(ROOT, ".github", "workflows");
+  const files = readdirSync(dir).filter((f) => /\.ya?ml$/.test(f));
+
+  it("pin every action to a commit SHA, naming the version it was", () => {
+    const loose = [];
+    for (const f of files) {
+      for (const line of readFileSync(join(dir, f), "utf8").split("\n")) {
+        const m = /^\s*-?\s*uses:\s*(\S+)(.*)$/.exec(line);
+        if (!m || m[1].startsWith("./")) continue;
+        if (!/@[0-9a-f]{40}$/.test(m[1]) || !/#\s*v\d/.test(m[2])) loose.push(`${f}: ${line.trim()}`);
+      }
+    }
+    assert.ok(files.length > 0);
+    assert.deepEqual(loose, [], "an action is pinned to a movable tag");
+  });
+
+  it("grant ci.yml a read-only token and test on Windows", () => {
+    const ci = readFileSync(join(dir, "ci.yml"), "utf8");
+    assert.match(ci, /^permissions:\n {2}contents: read$/m);
+    assert.match(ci, /os: \[[^\]]*windows-latest[^\]]*\]/);
   });
 });

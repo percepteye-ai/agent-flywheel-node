@@ -8,6 +8,14 @@ on:
   # so the gate before a release is the gate before a merge -- not a copy of it.
   workflow_call:
 
+# Least privilege: nothing here writes to the repository. A workflow with no
+# block gets the repository's default token scope, which may be read-write.
+permissions:
+  contents: read
+
+# Actions are pinned to a full commit SHA, not a tag: a tag can be moved to
+# other code after review, a commit cannot. The tag it was resolved from is in
+# the trailing comment (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
 jobs:
   test:
     # A plugin runs inside somebody else's process on whatever Node they
@@ -27,15 +35,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Windows too: a customer's gateway can run there, and the login's
+        # browser hand-off, path handling and file modes differ on it.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: ["22", "24", "25"]
     # A backstop for a hang OUTSIDE a test, which the per-test timeout cannot
     # catch. In the repo this was split from, this job once sat for six minutes
     # and reported nothing until it was cancelled by hand.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
       # No `npm ci`: there is no lockfile because there are no dependencies,
@@ -55,8 +65,8 @@ jobs:
     # than discovered from a published tarball nobody can unpublish.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
       - name: the tarball carries what it claims

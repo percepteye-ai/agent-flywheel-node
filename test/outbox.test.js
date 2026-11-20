@@ -502,7 +502,7 @@ describe("the outbox directory", () => {
   it("is keyed by agent, so two installs cannot replay each other", () => {
     const env = { PERCEPTEYE_HOME: "/tmp/home" };
     assert.notEqual(outboxDir("alpha", env), outboxDir("beta", env));
-    assert.equal(outboxDir("alpha", env), "/tmp/home/outbox/alpha");
+    assert.equal(outboxDir("alpha", env), join("/tmp/home", "outbox", "alpha"));
     // `agentId` allows dots (config.js), so a filter that stripped them would
     // put two agents in one outbox -- which is what keying by agent is for.
     assert.notEqual(outboxDir("a.b", env), outboxDir("ab", env));

@@ -123,7 +123,8 @@ describe("the device flow", () => {
 
     const path = credentialsPath(env);
     assert.match(out, new RegExp(`saved to ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-    assert.equal(statSync(path).mode & 0o777, 0o600);
+    // Windows has no POSIX modes; the file is still the owner's there.
+    if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
     const doc = JSON.parse(readFileSync(path, "utf8"));
     assert.equal(doc.version, 1);
     assert.equal(doc.credentials.length, 1);
