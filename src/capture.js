@@ -145,7 +145,8 @@ export const BATCH_SIZE = 64;
 /**
  * Turns between automatic prunes when `retentionTurns` is set. The Python
  * SDK's `_PRUNE_EVERY`: one directory scan over many turns, so the ceiling is
- * `retentionTurns + PRUNE_EVERY`, not `retentionTurns` exactly.
+ * `retentionTurns + PRUNE_EVERY`, not `retentionTurns` exactly -- besides the
+ * turns still running, which are never pruned (`pruneTurns`'s `active`).
  */
 export const PRUNE_EVERY = 256;
 
@@ -206,13 +207,24 @@ function holdsARecord(path) {
  */
 export function pruneTurns({
   root, keepLast = null, olderThanS = null, uploaded = null, logger = null,
-  now = Date.now(),
+  now = Date.now(), active = null,
 } = {}) {
   if (keepLast === null && olderThanS === null) return 0;
+  // A count that is not a whole number of turns, or an age that is not a
+  // number of seconds, deletes NOTHING: `slice(NaN)` is `slice(0)`, which
+  // read `keepLast: NaN` as "keep none" and deleted every turn.
+  if (keepLast !== null && !(Number.isInteger(keepLast) && keepLast >= 0)) return 0;
+  if (olderThanS !== null
+      && !(typeof olderThanS === "number" && Number.isFinite(olderThanS)
+        && olderThanS >= 0)) return 0;
   // Newest first, so "keepLast" is a slice. With uploading on, the ones not
   // yet uploaded sort ahead of the ones that were, newest first within each.
+  // A turn still RUNNING (`active`, from the turn store) is never a
+  // candidate: at `retentionTurns: 0` the turn whose message just arrived
+  // was deleted before its tool calls and answer landed.
   const pendingFirst = (e) => (uploaded && !uploaded.has(e.name) ? 1 : 0);
   const entries = listTurnDirs(root)
+    .filter((e) => !active?.has(e.name))
     .sort((a, b) => pendingFirst(b) - pendingFirst(a) || b.mtime - a.mtime);
   const doomed = [];
   if (keepLast !== null) doomed.push(...entries.slice(Math.max(0, keepLast)));
@@ -248,7 +260,8 @@ export function pruneTurns({
     try {
       if (existsSync(index)) {
         const gone = new Set(victims.map((e) => e.name));
-        const here = new Set(entries.map((e) => e.name).filter((n) => !gone.has(n)));
+        const here = new Set(listTurnDirs(root).map((e) => e.name)
+          .filter((n) => !gone.has(n)));
         const kept = readFileSync(index, "utf8").split("\n")
           .map((l) => l.trim()).filter((id) => id && here.has(id)).sort();
         replaceFile(index, kept.map((id) => `${id}\n`).join(""));
@@ -509,6 +522,18 @@ const OUTCOMES = Object.freeze({
   one: "an outcome", results: "outcomes", id: "outcome_id",
   batchMax: PRODUCTION_OUTCOME_BATCH_MAX_ITEMS, send: "reportOutcomes",
 });
+/**
+ * The captured turns, through the same sender (`sendReports`): the intake's
+ * per-record results are `turns[].accepted`, and a batch is `BATCH_SIZE`.
+ * `stopOnBlip`: a transport failure or 5xx stops the flush -- a turn batch
+ * can carry megabytes of trace, and sending the next chunk to a control
+ * plane that just failed to answer the last costs a full retry ladder each.
+ */
+const TURNS = Object.freeze({
+  many: "captured turns", counted: "captured turn(s)",
+  one: "a turn", results: "turns", id: "turn_id",
+  batchMax: BATCH_SIZE, send: "reportTurns", stopOnBlip: true,
+});
 const FEEDBACK = Object.freeze({
   many: "per-turn feedback reports", counted: "per-turn feedback report(s)",
   one: "a feedback report", results: "feedback", id: "feedback_id",
@@ -615,6 +640,17 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
   // Invalid host ids are never cleaned into a different caller id. They get a
   // fresh safe id, retained only long enough to keep this run's hooks joined.
   const generatedTurnIds = new Map();
+  // THE TURNS STILL RUNNING, by when a hook last touched them: opened by
+  // their message, a model input or a tool call, closed by their answer.
+  // Retention never deletes one (`activeTurns`). Where the host drops
+  // `agent_end` no answer closes them, so a turn counts as running only
+  // within the settle window of its last hook; bounded like the maps above.
+  const running = new Map();
+  const touch = (turnId) => {
+    running.delete(turnId);
+    running.set(turnId, Date.now());
+    while (running.size > 4096) running.delete(running.keys().next().value);
+  };
   const turnIdFor = (value) => {
     const exact = safeTurnId(value);
     if (exact !== null) return exact;
@@ -650,6 +686,7 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
     const text = event?.content;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
+    touch(turnId);
     const conversationId = conversationIdOf(event, ctx);
     const taskId = taskIdOf(event, ctx);
     const dir = turnDir(root, turnId);
@@ -678,6 +715,7 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
     if (!mayRecordModelContent() || !inScope(event, ctx)) return false;
     const turnId = turnIdFor(event?.runId ?? ctx?.runId);
     if (turnId === null) return false;
+    touch(turnId);
     try {
       const prior = pendingInputs.get(turnId);
       // A SECOND llm_input in one run means the model saw a second prefix
@@ -714,6 +752,8 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
     const runId = event?.runId ?? ctx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return false;
+    // The answer closes the turn.
+    running.delete(turnId);
     const dir = turnDir(root, turnId);
     const conversationId = conversationIdOf(event, ctx);
     const taskId = taskIdOf(event, ctx);
@@ -753,6 +793,7 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
     const runId = callCtx?.runId;
     const turnId = turnIdFor(runId);
     if (turnId === null) return null;
+    touch(turnId);
     const dir = turnDir(root, turnId);
     const taskId = taskIdOf(null, callCtx);
     if (taskId) recordTaskId(dir, taskId);
@@ -778,9 +819,16 @@ export function createTurnCapture({ root, logger = null, servedAgent = null }) {
     mayRecordModelContent = typeof predicate === "function" ? predicate : () => false;
   }
 
+  /** The ids of the turns still running: touched within the settle window
+   *  and not yet answered. */
+  function activeTurns() {
+    const since = Date.now() - UNANSWERED_SETTLE_MS;
+    return new Set([...running].filter(([, at]) => at >= since).map(([id]) => id));
+  }
+
   return {
     root, onMessageReceived, onAgentEnd, onExecutionIdentity, onLlmInput,
-    gateModelContent, resolveToolDir,
+    gateModelContent, resolveToolDir, activeTurns,
   };
 }
 
@@ -807,10 +855,12 @@ export const FEEDBACK_FILE_PREFIX = ".feedback.";
  */
 export const OUTCOME_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
 /**
- * How many outcomes are kept while consent is still UNKNOWN (the verdict read
- * has not been answered yet). Bounded by count as well as age, because a week
- * of a busy agent's reports is not a small outbox; past it the oldest go, out
- * loud. The Python SDK's `_OUTCOME_MAX_KEPT_UNANSWERED`.
+ * How many outcomes are kept waiting: while consent is still UNKNOWN (the
+ * verdict read has not been answered yet), and while it is granted but they
+ * cannot be delivered. Bounded by count as well as age, because a week of a
+ * busy agent's reports is not a small outbox; past it the oldest go, out
+ * loud, naming which of the two it was. The Python SDK's
+ * `_OUTCOME_MAX_KEPT_UNANSWERED`.
  */
 export const OUTCOME_MAX_KEPT_UNANSWERED = 1000;
 
@@ -1207,8 +1257,9 @@ export function createTurnUploader({
    * agent that may not send it. While the answer is still UNKNOWN (the
    * verdict read failed on a blip) the outcome is kept, and the flush kicked
    * here asks again; it is sent once the answer is yes. At most
-   * `maxOutcomesWhileUnknown` are kept while it is unknown; past that the
-   * oldest are dropped, with a warning.
+   * `maxOutcomesWhileUnknown` are kept waiting -- while it is unknown, or
+   * while it is yes and they cannot be delivered; past that the oldest are
+   * dropped, with a warning naming which.
    *
    * EXCEPT AN OUTCOME THAT NAMES ONLY AN EPISODE (`namesOnlyAnEpisode`): it
    * carries nothing about the end users' traffic, so it is queued and sent
@@ -1235,9 +1286,10 @@ export function createTurnUploader({
       // Capture costs the observation, never the caller.
       return null;
     }
-    // Only an outcome consent is the question for waits on its answer; one
-    // naming only an episode is sent regardless.
-    if (!mayUpload && !namesOnlyAnEpisode(wire)) capUnansweredOutcomes();
+    // Bounded whether consent is unknown or granted: granted, the queue
+    // still grows for as long as uploads fail. One naming only an episode is
+    // not counted.
+    if (!namesOnlyAnEpisode(wire)) capUnansweredOutcomes();
     flush({
       includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
     }).catch(() => {});
@@ -1408,9 +1460,10 @@ export function createTurnUploader({
   }
 
   /**
-   * While consent is UNKNOWN, keep at most `maxOutcomesWhileUnknown` of the
-   * outcomes that wait on it: the oldest (by when they were written, then by
-   * name) go, with a warning naming that cause. An outcome that names only an
+   * Keep at most `maxOutcomesWhileUnknown` of the outcomes waiting -- on the
+   * consent answer, or (granted) on a control plane that is not taking them:
+   * the oldest (by when they were written, then by name) go, with a warning
+   * naming that cause. An outcome that names only an
    * episode (`namesOnlyAnEpisode`) does not wait on consent, so it is neither
    * counted nor dropped here. The Python SDK's `_cap_unanswered_outcomes`.
    */
@@ -1438,7 +1491,11 @@ export function createTurnUploader({
       try { rmSync(path); dropped += 1; } catch { /* kept */ }
     }
     if (dropped) {
-      logger?.warn?.(unansweredOutcomesDropped(dropped, maxOutcomesWhileUnknown));
+      logger?.warn?.(mayUpload
+        ? `[agent-flywheel] ${dropped} reported outcome(s) were dropped, ` +
+          `oldest first: they could not be delivered, and at most ` +
+          `${maxOutcomesWhileUnknown} outcomes wait for the control plane.`
+        : unansweredOutcomesDropped(dropped, maxOutcomesWhileUnknown));
     }
   }
 
@@ -1515,9 +1572,17 @@ export function createTurnUploader({
    * ONE SENDER FOR BOTH ROUTES. Feedback had its own, which read every final
    * 4xx as "the route is not there" and deleted the queue for it.
    *
-   * THE TURNS' RULES: an acknowledged batch is deleted; a 403 is the control
+   * ONE SENDER FOR ALL THREE: the captured turns go through it too (`TURNS`),
+   * where "deleted" means marked uploaded (`forgetBatch`) and each
+   * acknowledged reply is read (`onReply`).
+   *
+   * THE RULES: an acknowledged batch is deleted; a 403 is the control
    * plane's decision, so sending stops (`onRefusal` is told its words) and
-   * the reports stay; a blip leaves the batch for the next flush.
+   * the reports stay; a blip leaves the batch for the next flush, and for a
+   * kind that says `stopOnBlip` (turns) stops the flush.
+   *
+   * A BATCH OF ONE refused for anything but its size is kept, as a refusal
+   * of the batch: alone, the two cannot be told apart.
    *
    * A REPORT REFUSED BY NAME inside an acknowledged batch (`accepted: false`
    * -- a conflicting replay, an unknown episode) would be refused again: it
@@ -1552,7 +1617,9 @@ export function createTurnUploader({
    * route is ABSENT (`routeAbsent`): then everything waiting is dropped,
    * counted as dropped, and `onAbsent` is told the words.
    */
-  async function sendReports(waiting, kind, { onRefusal, onAbsent = null }) {
+  async function sendReports(waiting, kind, {
+    onRefusal, onAbsent = null, onReply = null, forgetBatch = null,
+  }) {
     // Every GROUP still to send, in order: a batch on its own, or the two
     // halves of one refused batch, which are tried together. A refused half's
     // own halves go back to the front.
@@ -1562,11 +1629,14 @@ export function createTurnUploader({
     }
     const count = (group) => group.reduce((n, b) => n + b.length, 0);
     const left = () => queue.reduce((n, group) => n + count(group), 0);
-    const forget = async (batch) => {
+    // What "done with these" means: a report's file is deleted; a turn is
+    // marked uploaded (`forgetBatch`), since the turn itself is the
+    // customer's capture and stays.
+    const forget = forgetBatch ?? (async (batch) => {
       for (const { path } of batch) {
         try { await rm(path, { force: true }); } catch { /* resent; deduped */ }
       }
-    };
+    });
     let sent = 0;
     let failed = 0;
     let absent = 0;
@@ -1634,9 +1704,19 @@ export function createTurnUploader({
               `later flush.`);
             break flushing;
           }
+          if (kind.stopOnBlip) {
+            failed += batch.length + untried + left();
+            queue.length = 0;
+            logger?.warn?.(
+              `[agent-flywheel] could not upload ${kind.many} ` +
+              `(${err?.message ?? err}); they stay on disk and are sent ` +
+              `again on a later flush.`);
+            break flushing;
+          }
           failed += batch.length;
           continue;
         }
+        if (onReply) onReply(reply);
         await forget(batch);
         const named = refusedByName(reply, kind).slice(0, batch.length);
         byName.push(...named);
@@ -1648,6 +1728,19 @@ export function createTurnUploader({
           && refused[0].cause === refused[1].cause
           && !outcomeRefusedForSize(refused[0].status)) {
         failed += refused[0].batch.length + refused[1].batch.length + left();
+        queue.length = 0;
+        warnWholeBatchRefusal(kind, refused[0].cause);
+        break;
+      }
+      // A BATCH OF ONE, refused not for its size, cannot tell a refusal of
+      // the record from a refusal of the batch -- a control plane on another
+      // contract minor refuses every batch alike, the last record of a flush
+      // included. So it is KEPT, as a whole-batch refusal is; the week's
+      // expiry still bounds it. Only a record isolated by the split, whose
+      // other half was taken, is known to be refused for itself.
+      if (!halves && refused.length === 1 && refused[0].batch.length === 1
+          && !outcomeRefusedForSize(refused[0].status)) {
+        failed += 1 + left();
         queue.length = 0;
         warnWholeBatchRefusal(kind, refused[0].cause);
         break;
@@ -1782,32 +1875,25 @@ export function createTurnUploader({
       quietBefore: settleMs > 0 ? Date.now() - settleMs : null,
     });
     if (!turns.length) return { sent: 0 };
-    let sent = 0;
-    for (let i = 0; i < turns.length; i += BATCH_SIZE) {
-      const chunk = turns.slice(i, i + BATCH_SIZE);
-      let reply;
-      try {
-        reply = await transport.reportTurns(agentId, chunk);
-      } catch (err) {
-        const refused = captureRefusal(err);
-        if (refused !== null) {
-          // NOT A TRANSPORT FAILURE. Stop, in the intake's own words, and
-          // leave the turns on disk; `recheck` picks consent back up.
-          refuseUpload(refused);
-          return { sent, notPermitted: true };
-        }
-        // Whole chunk unacknowledged: leave every marker unwritten so the
-        // next flush retries it.
-        logger?.warn?.(
-          `[agent-flywheel] could not upload ${chunk.length} captured turn(s); ` +
-          `they stay on disk and are retried: ${err?.message ?? err}`);
-        continue;
-      }
-      await markUploaded(chunk.map((t) => t.turn_id));
-      sent += chunk.length;
-      noteModelContentRefusal(reply);
-    }
-    return { sent };
+    // THE REPORTS' RULES (`sendReports`): a 403 stops sending, in the
+    // intake's own words; a batch refused for a record is split until the
+    // record stands alone and only it is dropped (marked sent, never resent);
+    // a turn the intake did not record (`accepted: false`) is dropped by
+    // name; a transport failure or 5xx stops the flush and every turn not
+    // acknowledged stays on disk. It used to be one chunk at a time: one
+    // oversized or invalid turn kept its whole chunk on disk on every flush,
+    // and an outage was tried chunk after chunk.
+    let refused = false;
+    const result = await sendReports(turns.map((wire) => ({ wire })), TURNS, {
+      onRefusal: (reason) => { refused = true; refuseUpload(reason); },
+      onReply: noteModelContentRefusal,
+      forgetBatch: (batch) => markUploaded(batch.map(({ wire }) => wire.turn_id)),
+    });
+    const counts = { sent: result.sent };
+    if (result.failed) counts.failed = result.failed;
+    if (result.dropped) counts.dropped = result.dropped;
+    if (refused) counts.notPermitted = true;
+    return counts;
   }
 
   return {
@@ -2087,6 +2173,7 @@ export function registerTurnCapture(api, {
       return pruneTurns({
         root, keepLast, olderThanS, logger,
         uploaded: uploader?.mayUpload ? uploader.uploadedIds() : null,
+        active: turns.activeTurns?.() ?? null,
       });
     } catch {
       return 0;

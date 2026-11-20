@@ -209,6 +209,9 @@ describe("the gateway prunes on its own only when asked", () => {
     wire(root, a, 20);
     for (let i = 0; i < 900; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi", sessionKey: "c" }, {});
+      // Answered, so finished: a turn still running is never pruned.
+      a.fire("agent_end", { runId: `r${i}`,
+        messages: [{ role: "assistant", content: "ok" }] }, { sessionKey: "c" });
       if (i % 64 === 0) await settle();
     }
     await settle();
