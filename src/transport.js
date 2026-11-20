@@ -1,6 +1,6 @@
 /**
- * Every control-plane call this package makes, and the one that must never be
- * replayed.
+ * Every control-plane call this package makes, and how each one is made safe
+ * to resend.
  *
  * NO COUNT IN THAT SENTENCE, deliberately. It used to open "the nine
  * control-plane calls" and went stale the moment `captureCurrent` was added --
@@ -136,17 +136,52 @@ export function quoteIdentifier(value) {
   );
 }
 
-/** One opaque, control-plane-authored rollout id as a safe URL segment. */
-function rolloutPath(rollout, suffix) {
-  const rolloutId = rollout?.rolloutId;
-  if (typeof rolloutId !== "string" || !rolloutId) {
-    throw new ContractError("rollout_id must be a non-empty string");
+/** Longest identifier `urlSegment` puts in a path. */
+export const MAX_URL_SEGMENT_CHARS = 256;
+const SEGMENT_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * ONE caller-supplied identifier as ONE URL path segment, or a
+ * `ContractError` naming why it cannot be one. THE ONE RULE for every
+ * identifier this package interpolates into a path -- a rollout id, an agent
+ * id, a run id -- and the Python SDK's rule, refusal for refusal: empty, `.`,
+ * `..`, a `/` or `\`, a control character, more than
+ * `MAX_URL_SEGMENT_CHARS` characters, or text that is not well-formed
+ * Unicode is refused; anything else is percent-encoded by `quoteIdentifier`.
+ *
+ * Refused rather than encoded, because encoding is not enough: `%2F` and
+ * `%2E%2E` are decoded back to a separator or a dot segment by the proxies
+ * and routers in front of the control plane, and a path that resolves
+ * somewhere else is a request to a different resource.
+ */
+export function urlSegment(value, what = "identifier") {
+  if (typeof value !== "string" || !value) {
+    throw new ContractError(`${what} must be a non-empty string`);
+  }
+  if (value === "." || value === "..") {
+    throw new ContractError(`${what} must not be "." or ".."`);
+  }
+  if (value.includes("/") || value.includes("\\")) {
+    throw new ContractError(`${what} must not contain "/" or "\\"`);
+  }
+  if (SEGMENT_CONTROL.test(value)) {
+    throw new ContractError(`${what} must not contain a control character`);
+  }
+  if (value.length > MAX_URL_SEGMENT_CHARS) {
+    throw new ContractError(
+      `${what} must be at most ${MAX_URL_SEGMENT_CHARS} characters`,
+    );
   }
   try {
-    return `/rollouts/${quoteIdentifier(rolloutId)}/${suffix}`;
+    return quoteIdentifier(value);
   } catch {
-    throw new ContractError("rollout_id contains invalid Unicode");
+    throw new ContractError(`${what} contains invalid Unicode`);
   }
+}
+
+/** One opaque, control-plane-authored rollout id as a safe URL segment. */
+function rolloutPath(rollout, suffix) {
+  return `/rollouts/${urlSegment(rollout?.rolloutId, "rollout_id")}/${suffix}`;
 }
 
 /**
@@ -359,7 +394,12 @@ export class AttachTransport {
    */
   async registerRulebook(rules) {
     const jsonBody = rulebookRequestToWire(rules);
-    const agent = quoteIdentifier(this.agentId);
+    let agent;
+    try {
+      agent = urlSegment(this.agentId, "agent_id");
+    } catch (err) {
+      return { receipt: null, refusal: rulebookRefusal(err) };
+    }
     let reply;
     try {
       reply = await this._c.request("POST", `/agents/${agent}/rulebook`, {
@@ -432,12 +472,18 @@ export class AttachTransport {
   /**
    * Claim up to `maxRollouts` rollouts. Returns `{rollouts, pollAfterMs}`.
    *
-   * CLAIMING IS NOT REPLAYABLE, and this is the one call in the package that
-   * turns ambiguous retries OFF. The control plane does not honour
-   * Idempotency-Key on this route, so resending a claim that MAY already have
-   * been processed leases a SECOND batch while the first is held by nobody --
-   * those rollouts then sit untouched until their leases lapse. Only a failure
-   * that provably never reached the server is retried.
+   * REPLAYABLE THROUGH ITS KEY. A resent claim that MAY already have been
+   * processed would lease a SECOND batch while the first is held by nobody --
+   * those rollouts would then sit untouched until their leases lapse. What
+   * prevents it is the Idempotency-Key: ONE fresh key per call, sent unchanged
+   * on every retry of that call, and the control plane answers a replay of a
+   * key with the batch it already leased under it (re-issuing each rollout's
+   * inference key) instead of leasing more. So an ambiguous failure -- a
+   * timeout, a connection reset -- is retried like any other.
+   *
+   * `pollAfterMs` is the server's own backoff: 0 is an answer ("poll again
+   * now") and is kept, a negative one is read as 0, and only an absent or
+   * non-numeric one falls back to 1000.
    */
   async claim(maxRollouts) {
     const jsonBody = {
@@ -453,12 +499,15 @@ export class AttachTransport {
       jsonBody,
       idempotencyKey: crypto.randomUUID(),
       timeoutMs: this.waitMs + 10_000,
-      retryIfAmbiguous: false,
     });
     const raw = body.rollouts || [];
+    const pollAfter = typeof body.poll_after_ms === "number"
+      && Number.isFinite(body.poll_after_ms)
+      ? Math.max(0, Math.trunc(body.poll_after_ms))
+      : 1000;
     return {
       rollouts: raw.map(rolloutRequestFromWire),
-      pollAfterMs: Number(body.poll_after_ms) || 1000,
+      pollAfterMs: pollAfter,
     };
   }
 
@@ -496,7 +545,7 @@ export class AttachTransport {
     let body;
     try {
       body = await this._c.request(
-        "GET", `/agents/${encodeURIComponent(agentId)}/capture`);
+        "GET", `/agents/${urlSegment(agentId, "agent_id")}/capture`);
     } catch (err) {
       if (err instanceof TransportError
           && CAPTURE_READ_REFUSALS.has(err.statusCode)) {
@@ -512,11 +561,10 @@ export class AttachTransport {
   /**
    * Upload a batch of captured PRODUCTION turns.
    *
-   * REPLAYABLE, unlike `claim`. The server keys each turn on
-   * (org, agent, turn_id) and answers an identical resubmission as a
-   * duplicate, so an ambiguous retry costs nothing -- whereas a replayed claim
-   * would lease a second piece of work. This therefore leaves the client's
-   * default retry behaviour ON.
+   * REPLAYABLE. The server keys each turn on (org, agent, turn_id) and
+   * answers an identical resubmission as a duplicate, so an ambiguous retry
+   * costs nothing. This therefore leaves the client's default retry
+   * behaviour ON.
    *
    * The idempotency key covers the BATCH, matching
    * `agent_flywheel.transport.report_turns`, so a network-level
