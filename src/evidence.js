@@ -58,6 +58,17 @@ function scalar(value) {
  * different values is dropped as ambiguous, because an ambiguous identity is
  * not an identity. Never throws: an unreadable body yields `{}`, which means
  * "no evidence" and therefore an abstention, never a failure.
+ *
+ * BOTH RULES HOLD ONLY WITHIN THE WALK'S BUDGET. The walk is depth-first and
+ * counts every value it visits, scalars included, against `MAX_NODES`; once
+ * that is spent nothing further is read. So in a body larger than the budget
+ * a shallow field after a large sibling is not seen at all
+ * (`{a: [2,100 numbers], b: {id}}` yields `{}`), and a field whose
+ * differing twin lies past the budget is reported as if unambiguous
+ * (`{items: [{id: "1"}, ...2,100 values, {id: "2"}]}` yields `{id: "1"}`).
+ * `key` is read like the others, at any length. Making the walk
+ * breadth-first, and refusing a field whose twin the budget cut off, is
+ * tracked with the Python SDK's `evidence.py` (wave 2: the two must agree).
  */
 export function extractEntityIds(output) {
   try {
