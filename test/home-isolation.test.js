@@ -90,3 +90,27 @@ describe("no test reaches the developer's home", () => {
     assert.equal(run.record, "{");
   });
 });
+
+describe("no test reaches the network", () => {
+  it("refuses the production control plane at once, as an unreachable network does", async () => {
+    const started = performance.now();
+    await assert.rejects(
+      fetch("https://launch.percepteye.ai/api/flywheel/v1/health"),
+      (err) => err instanceof TypeError && err.message === "fetch failed"
+        && /do not reach the network/.test(err.cause?.message),
+    );
+    assert.ok(performance.now() - started < 1000, "refused without dialing");
+  });
+
+  it("still reaches a fake control plane on loopback", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((_req, res) => res.end("ok"));
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/health`);
+      assert.equal(await res.text(), "ok");
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+});

@@ -32,6 +32,17 @@
  * A test that builds a driver, registers the plugin, or otherwise reaches a
  * path under the home passes `env: testEnv()` (or `testEnv({...})` merged with
  * its own variables), or an explicit `outbox`.
+ *
+ * NOR DOES A TEST REACH THE NETWORK. A test that registers the plugin without
+ * a control-plane URL dials the default, the PRODUCTION control plane: five
+ * files did -- `POST /agents` with a fake key among it -- and on a CI runner
+ * whose route there was slow, the outstanding request kept a test process
+ * alive past its 30 s file timeout with every one of its tests passed. So
+ * importing this module also replaces `fetch` with one that refuses any host
+ * but loopback at once, the way an unreachable network refuses it (a
+ * `TypeError("fetch failed")`). A test's fake control plane listens on
+ * loopback and is unaffected; a test that installs its own `fetch` stub
+ * replaces this one for as long as it holds it.
  */
 import os from "node:os";
 import { mkdtempSync } from "node:fs";
@@ -51,6 +62,23 @@ export function testEnv(extra = {}) {
 
 delete process.env.PERCEPTEYE_HOME;
 delete process.env.PERCEPTEYE_CAPTURE_DIR;
+
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+const realFetch = globalThis.fetch;
+/** Whether `input` (a URL, string or Request) names a loopback host. */
+export function isLoopback(input) {
+  try {
+    return LOOPBACK.has(new URL(input instanceof Request ? input.url : String(input)).hostname);
+  } catch {
+    return false;
+  }
+}
+globalThis.fetch = function offlineFetch(input, init) {
+  if (isLoopback(input)) return realFetch(input, init);
+  return Promise.reject(new TypeError("fetch failed", {
+    cause: new Error(`tests do not reach the network: ${String(input?.url ?? input)}`),
+  }));
+};
 
 const reached = [];
 let allowed = 0;

@@ -395,5 +395,6 @@ test("the schema takes every mode the runtime reads, and says the default is pro
   const manifest = JSON.parse(
     readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
   );
-  assert.match(manifest.description, /model your control plane has approved/);
+  // It must say the plugin APPLIES the approved model, not only observes.
+  assert.match(manifest.description, /apply the system prompt and model a person approved/);
 });

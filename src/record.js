@@ -17,6 +17,30 @@ import { recordToolCallSpan } from "./tracing.js";
 import { extractEntityIds } from "./evidence.js";
 import { toWire } from "./trajectory.js";
 
+const OUTCOMES = new Set(["ok", "failed", "unknown"]);
+
+/**
+ * The caller's own verdict on a call (`flywheel.js recordToolCall`), as the
+ * classifier's shape -- or null when none was stated, or it is not one of the
+ * three outcomes. A status outside 100..599 is not an HTTP status and is
+ * dropped, as the contract would refuse it.
+ */
+export function statedVerdict(stated) {
+  if (!stated || typeof stated !== "object" || !OUTCOMES.has(stated.outcome)) {
+    return null;
+  }
+  const code = stated.statusCode;
+  const verdict = {
+    outcome: stated.outcome,
+    status_code: Number.isInteger(code) && code >= 100 && code <= 599 ? code : null,
+  };
+  if (typeof stated.error === "string" && stated.error) verdict.error = stated.error;
+  if (typeof stated.errorClass === "string" && stated.errorClass) {
+    verdict.error_class = stated.errorClass;
+  }
+  return verdict;
+}
+
 /**
  * @param {object} deps
  * @param {{write: Function}} deps.writer
@@ -58,7 +82,14 @@ export function createRecorder({
       // an empty name outright. Nothing useful can be said about it.
       if (!name) return false;
 
-      const verdict = classify(name, event.error, event.result);
+      // A STATED VERDICT WINS. The framework API's `recordToolCall` is the
+      // caller saying what happened -- an HTTP 200 that was a permission
+      // denial is `failed` with status 200, which no reading of the result
+      // could know -- so it is taken as stated. Namespaced, so no host event
+      // field can be mistaken for one. Everything else is read from the
+      // result, as before.
+      const verdict = statedVerdict(event.percepteyeVerdict)
+        ?? classify(name, event.error, event.result);
       // Resolve the identity out of the result and let the result itself go.
       // The record carries who was written, never what the response said.
       const entity_ids = extractEntityIds(event.result);
@@ -77,7 +108,7 @@ export function createRecorder({
         // never happened.
         args: event.params,
         outcome: verdict.outcome,
-        status_code: null,
+        status_code: verdict.status_code ?? null,
         error: verdict.error,
         error_class: verdict.error_class,
         // Host-measured, so it includes queueing and approval waits that a

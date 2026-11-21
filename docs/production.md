@@ -5,7 +5,7 @@ Your production agent records the conversations it serves, sends them to us once
 ## Recording conversations
 
 <!-- lang -->
-In production mode the plugin records each turn your agent serves: the user's message, and every tool call and its outcome. With `hooks.allowConversationAccess: true` it also records the answer, and each run's model boundary from OpenClaw's own `llm_input` and `agent_end` events: the assembled system prompt, the history, the tool definitions, every model answer and every tool result. That is what we learn from, and the turn sends it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace. A run it cannot reconstruct faithfully records no model boundary rather than a guessed one: a second `llm_input` in one run, a prompt with images, or a message steered into a run while it was working. In DeepSeek Harness the plugin records tool outcomes only; to learn from such an agent, [push its OpenTelemetry traces](otlp.md).
+In production mode `fw.turn()` records each turn your agent serves: the user's message, every tool call and its outcome, and the answer. With an adapter (`@percepteye/agent-flywheel/ai-sdk` or `/langchain`) it also records the turn's model boundary: the system prompt, the history, the prompt and the tool definitions the model was sent. That is what we learn from, and the turn sends it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace. A turn it cannot reconstruct faithfully records no model boundary rather than a guessed one. As an OpenClaw plugin it records the same from the host's own `llm_input` and `agent_end` events, with `hooks.allowConversationAccess: true`; in DeepSeek Harness it records tool outcomes only, and to learn from such an agent, [push its OpenTelemetry traces](otlp.md).
 
 The recording hooks only observe. No hook can change a tool result, and a recording failure costs the record, never the turn.
 <!-- /lang -->
@@ -15,7 +15,7 @@ Two [permissions](dashboard.md#allow-us-to-learn-from-its-conversations) decide 
 ## When turns are sent
 
 <!-- lang -->
-Every 32 turns, without making any turn wait, the plugin sends what is waiting. When the gateway stops, the rest go too, including turns that never recorded an answer. A request carries at most 64 turns.
+Every 32 turns, without making any turn wait, the SDK sends what is waiting. On `fw.close()` (or when an OpenClaw gateway stops), the rest go too, including turns that never recorded an answer. A request carries at most 64 turns.
 <!-- /lang -->
 
 A turn that could not be sent stays on disk and goes with a later batch. Each batch carries an idempotency key, so a batch that arrives twice is stored once.
@@ -42,18 +42,18 @@ The SDK sends what your agent saw and said as it was; it masks nothing on your s
 ## What stays on your machine
 
 <!-- lang -->
-Every turn is a directory under `~/.percepteye/captured/<agentId>` (`PERCEPTEYE_CAPTURE_DIR`, or `$PERCEPTEYE_HOME/captured/<agentId>`), and uploading does not delete it. Only this agent's own turns are captured: a subagent's session, a cron session and another agent on the same host are not recorded, by the same rule that decides whom the approved prompt applies to, and each reason is logged once. Turns an earlier release wrote to `~/.percepteye/captured` itself, unkeyed by agent, stay there and are not uploaded, because they cannot be attributed to one agent; the plugin says so at startup. Nothing does unless you ask: `"retentionTurns": 50000` in the plugin's config keeps the most recent 50,000 turns, pruning every 256 turns, and turns already uploaded go before turns still waiting to be sent. A turn still running (unanswered, and touched in the last five minutes) is never pruned. `PERCEPTEYE_CAPTURE=0` records nothing at all.
+Every turn is a directory under `~/.percepteye/captured/<agentId>` (`PERCEPTEYE_CAPTURE_DIR`, or `$PERCEPTEYE_HOME/captured/<agentId>`), and uploading does not delete it. Only this agent's own turns are captured: the turns `fw.turn()` wraps, or, in OpenClaw, this agent's own sessions (never a subagent's, a cron session or another agent's on the same host). Turns an earlier release wrote to `~/.percepteye/captured` itself, unkeyed by agent, stay there and are not uploaded, because they cannot be attributed to one agent; the SDK says so at startup. Nothing does unless you ask: `retentionTurns: 50000` keeps the most recent 50,000 turns, pruning every 256 turns, and turns already uploaded go before turns still waiting to be sent. A turn still running (unanswered, and touched in the last five minutes) is never pruned. `PERCEPTEYE_CAPTURE=0` records nothing at all.
 <!-- /lang -->
 
 ## Run the approved version
 
 <!-- lang -->
-In production mode, with a key, the plugin applies both halves to this agent's own turns: the approved system prompt replaces the one your host assembled, and the approved model is served through a provider the plugin registers, `percepteye-flywheel`. It asks once, at startup, so restart the gateway to pick up a newly approved version.
+In production mode, with a key, each turn is handed both halves: `t.systemPrompt(yours)` returns the approved system prompt, and `t.model` is the approved model's endpoint. Use both, and the approved version runs. A newly approved prompt reaches the next turn; the model is read once, at startup, so restart to pick up a new one. As an OpenClaw plugin the SDK applies both itself: the prompt replaces the one your host assembled, and the model is served through a provider the plugin registers, `percepteye-flywheel`.
 
 - `PERCEPTEYE_APPLY_PROMPT=0` and `PERCEPTEYE_APPLY_MODEL=0` switch each half off.
-- The model half needs `hooks.allowConversationAccess: true`, and a host that accepts the plugin's provider.
-- Neither half is applied in training mode, or to a subagent, a scheduled turn, or another agent in the same gateway. Set `agentId` when the gateway runs more than one agent.
-- The plugin refuses a model whose address is a stored file (`gs://`, `s3://`, `file://`) rather than a running endpoint, and a prompt a person did not approve.
+- In OpenClaw, the model half needs `hooks.allowConversationAccess: true`, and a host that accepts the plugin's provider.
+- Neither half is applied in training mode. In OpenClaw neither reaches a subagent, a scheduled turn, or another agent in the same gateway; set `agentId` when the gateway runs more than one agent.
+- The SDK refuses a model whose address is a stored file (`gs://`, `s3://`, `file://`) rather than a running endpoint, and a prompt a person did not approve.
 - When only one half lands, the startup log warns and names which, because half of an approved pair is not what was tested.
 <!-- /lang -->
 

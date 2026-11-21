@@ -80,7 +80,7 @@
  */
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
-import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
+import { registerDescriber, DESCRIBE_HOOK_NAME, OPENCLAW_HOST } from "./describe.js";
 import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
 import { ControlPlaneClient } from "./http.js";
 import { AttachTransport, rulesNeverSent, sentence } from "./transport.js";
@@ -182,7 +182,22 @@ function declarationFor(config, logger) {
 }
 
 
-export function register(api, pluginConfig = {}, env = process.env) {
+/**
+ * Register the plugin's lanes on a host's plugin API: OpenClaw's, or the
+ * framework API's in-process host (`flywheel.js`).
+ *
+ * @param {object} api the host's plugin API (`on`, `config`, `logger`,
+ *   `registerProvider`, ...)
+ * @param {object} [pluginConfig] the plugin's settings; `api.pluginConfig`
+ *   when empty
+ * @param {object} [env] the environment the settings are read from
+ * @param {object} [host] what a host that is not OpenClaw supplies:
+ *   `startTurn`/`cancel`, how it starts and stops a rollout's turn (the
+ *   OpenClaw lane uses its cron seam), and `entrypoint`/`framework`, what it
+ *   registers as. Omitted, this is the OpenClaw plugin.
+ * @returns {object|null} the lanes' handle, or null when nothing registered
+ */
+export function register(api, pluginConfig = {}, env = process.env, host = {}) {
   if (typeof api?.on !== "function") return null;
 
   const logger = api.logger ?? api.runtime?.logger ?? null;
@@ -324,6 +339,13 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // What the operator says this agent is (see declaration.js), and whether
   // they consented to saying anything at all.
   const declaration = declarationFor(config, logger);
+  // WHO IS REGISTERING: this plugin in OpenClaw, unless a host that is not
+  // OpenClaw (the framework API, flywheel.js) names itself. Every lane that
+  // tells the control plane what this agent is reads this one value.
+  const hostIdentity = {
+    entrypoint: host?.entrypoint ?? OPENCLAW_HOST.entrypoint,
+    framework: host?.framework ?? OPENCLAW_HOST.framework,
+  };
   const tracker = createExecutionIdentityTracker({
     // Refused discovery authors no identity: the Python SDK authors none when
     // PERCEPTEYE_INTROSPECT is off. (The describer below may still write
@@ -332,6 +354,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     executionSnapshot: config.introspect ? config.executionSnapshot : null,
     mode: config.mode,
     agentId: config.agentId,
+    framework: hostIdentity.framework,
   });
   if (config.executionSnapshot !== null && !config.introspect) {
     logger?.warn?.(
@@ -462,6 +485,11 @@ export function register(api, pluginConfig = {}, env = process.env) {
           : null,
         executionIdentity,
         declaration,
+        // Only the framework host supplies these (flywheel.js); OpenClaw
+        // starts rollout turns through its cron seam.
+        startTurn: host?.startTurn ?? null,
+        cancel: host?.cancel ?? null,
+        hostIdentity,
       });
     } catch (err) {
       logger?.warn?.(
@@ -490,7 +518,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // inputs is a second answer that drifts the moment a cause is added.
     const conversationAccess = conversationAccessGranted(api, PLUGIN_ID);
     capture = registerTurnCapture(api, {
-      config, turns, pluginId: PLUGIN_ID, logger, env, declaration,
+      config, turns, pluginId: PLUGIN_ID, logger, env, declaration, hostIdentity,
     });
     // THE LAST MILE. `capture` owns the one control-plane client, so this
     // reuses it rather than building a second against the same key -- and
@@ -532,6 +560,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // Python reflection cannot cross a process and a language boundary.
   const describer = registerDescriber(api, {
     logger,
+    framework: hostIdentity.framework,
     // Identity rides the same observer hook but is independent of description
     // persistence: it must work in production, where the trajectory env var
     // is normally absent and the describer writes nothing.
@@ -617,3 +646,9 @@ export default {
   configSchema: CONFIG_SCHEMA,
   register,
 };
+
+// THE FRAMEWORK API: the same lanes, for an agent with no plugin host -- the
+// Vercel AI SDK, LangChain.js, Mastra, the OpenAI SDK, plain code.
+export {
+  currentTurn, flywheel, recordToolCall, ToolCallBlocked,
+} from "./flywheel.js";

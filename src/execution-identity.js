@@ -501,6 +501,10 @@ export function createExecutionIdentityTracker({
   executionSnapshot = null,
   mode,
   agentId,
+  // The host the snapshot was taken in: OpenClaw for the plugin, the
+  // customer's framework under the framework API. Part of the digest, so it
+  // must name the real one.
+  framework = "openclaw",
 } = {}) {
   const normalized = normalizeExecutionSnapshot(executionSnapshot);
   const byContext = new Map();
@@ -528,7 +532,7 @@ export function createExecutionIdentityTracker({
         contract_version: CONTRACT_VERSION,
         entrypoint: {
           kind: "host_plugin",
-          framework: "openclaw",
+          framework,
           agent_id: agentId,
           adapter: normalized.snapshot.adapterName,
         },
