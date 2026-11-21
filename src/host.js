@@ -16,7 +16,7 @@
  * which task a host event belongs to) and the one model-boundary capture
  * shares with both (where a run starts in the host's transcript).
  */
-import { productionIdentifier } from "./wire.js";
+import { productionIdentifier, productionTaskIdentifier } from "./wire.js";
 
 /**
  * Does the host permit this plugin the CONVERSATION hooks?
@@ -47,9 +47,13 @@ export function conversationIdOf(event, ctx) {
   return productionIdentifier(event?.sessionKey ?? ctx?.sessionKey);
 }
 
-/** The caller-authored task/case id a host event carries, or `null`. */
+/**
+ * The caller-authored task/case id a host event carries, or `null` -- also
+ * when it is one the control plane's task-id rule refuses (`wire.js
+ * productionTaskIdentifier`), which is omitted rather than sent.
+ */
 export function taskIdOf(event, ctx) {
-  return productionIdentifier(
+  return productionTaskIdentifier(
     event?.taskId ?? event?.task_id ?? ctx?.taskId ?? ctx?.task_id,
   );
 }

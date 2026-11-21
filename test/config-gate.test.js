@@ -192,6 +192,12 @@ test("the transport calls no route the control plane does not serve", async () =
     "POST /rollouts/{id}/result",
     "POST /rollouts/{id}/abandon",
     "POST /turns",
+    // How a production turn turned out (reward robustness M6, 2026-11-10):
+    // Mission Control's `report_outcomes`, beside `POST /turns`.
+    "POST /outcomes",
+    // What the user did with one turn of an episode (2026-11-17): Mission
+    // Control's `report_turn_feedback`, beside `POST /outcomes`.
+    "POST /turn-feedback",
     "GET /rollouts/{id}",
     "GET /rollouts",
     "GET /policy/current",
@@ -349,4 +355,45 @@ test("production is NOT inert without a trajectory dir, and the description no l
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("an empty config value is unset, so the environment's opt-out wins", () => {
+  for (const blank of ["", "  ", null, undefined]) {
+    const config = resolveConfig(
+      { capture: blank, applyPrompt: blank, applyModel: blank },
+      { PERCEPTEYE_CAPTURE: "0", PERCEPTEYE_APPLY_PROMPT: "0", PERCEPTEYE_APPLY_MODEL: "0" },
+    );
+    assert.equal(config.captureEnabled, false, `capture=${JSON.stringify(blank)}`);
+    assert.equal(config.applyPromptEnabled, false, `applyPrompt=${JSON.stringify(blank)}`);
+    assert.equal(config.applyModelEnabled, false, `applyModel=${JSON.stringify(blank)}`);
+  }
+  // And with nothing in the environment either, the default is still on.
+  assert.equal(resolveConfig({ capture: "" }, {}).captureEnabled, true);
+  // A value that IS set still outranks the environment.
+  assert.equal(
+    resolveConfig({ capture: "on" }, { PERCEPTEYE_CAPTURE: "0" }).captureEnabled, true,
+  );
+  const api = fakeApi();
+  assert.equal(register(api, { capture: "" }, { PERCEPTEYE_CAPTURE: "0" }), null);
+  assert.equal(api.hooks.length, 0);
+});
+
+test("the schema takes every mode the runtime reads, and says the default is production", () => {
+  // An enum is exact and case-sensitive, and the host fails the plugin load
+  // on a value its schema refuses -- so `"Production"` and `null`, which
+  // mode.js reads as production and as unset, cost the whole plugin.
+  const mode = CONFIG_SCHEMA.properties.mode;
+  assert.equal("enum" in mode, false);
+  assert.ok(mode.type.includes("string") && mode.type.includes("null"));
+  assert.match(mode.description, /then production/);
+  assert.doesNotMatch(mode.description, /then training/);
+  assert.match(mode.description, /the model/);
+  for (const value of [" Production ", "TRAINING", null, ""]) {
+    assert.doesNotThrow(() => resolveConfig({ mode: value }, {}), JSON.stringify(value));
+  }
+  assert.equal(resolveConfig({ mode: null }, {}).mode, PRODUCTION);
+  const manifest = JSON.parse(
+    readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  assert.match(manifest.description, /model your control plane has approved/);
 });

@@ -70,8 +70,12 @@ import { newSpanId } from "./genai-otlp.js";
 import { lastUserIndex } from "./host.js";
 
 /** OpenClaw's provider ids, as the GenAI conventions name them. Anything else
- * is passed through verbatim: the attribute is an open enum. */
-const PROVIDERS = {
+ * is passed through verbatim: the attribute is an open enum.
+ *
+ * A MAP, not an object literal: the id is the host's string, and indexing a
+ * plain object by `constructor`, `toString` or `__proto__` answers with
+ * `Object.prototype`'s member instead of "not one of ours". */
+const PROVIDERS = new Map(Object.entries({
   openai: "openai",
   "openai-codex": "openai",
   "azure-openai-responses": "azure.ai.openai",
@@ -86,15 +90,15 @@ const PROVIDERS = {
   deepseek: "deepseek",
   cohere: "cohere",
   perplexity: "perplexity",
-};
+}));
 
 /** pi-ai's stop reasons, as a native finish reason and as the conventions'
- * output-message finish_reason. */
-const FINISH = {
+ * output-message finish_reason. A Map for the reason `PROVIDERS` is one. */
+const FINISH = new Map(Object.entries({
   stop: "stop",
   toolUse: "tool_call",
   length: "length",
-};
+}));
 
 const text = (v) => (typeof v === "string" && v ? v : null);
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -106,7 +110,7 @@ function msToNanos(ms) {
 
 function providerName(value) {
   const id = text(value);
-  return id ? (PROVIDERS[id] ?? id) : null;
+  return id ? (PROVIDERS.get(id) ?? id) : null;
 }
 
 class Refused extends Error {}
@@ -360,7 +364,7 @@ export function operationsFromRun(first, messages, endAt) {
         const hasCalls = output.parts.some((p) => p.type === "tool_call");
         op.output_messages = [{
           ...output,
-          finish_reason: hasCalls ? "tool_call" : (FINISH[stop] ?? "stop"),
+          finish_reason: hasCalls ? "tool_call" : (FINISH.get(stop) ?? "stop"),
         }];
         if (stop) op.finish_reasons = [stop];
         for (const part of output.parts) {

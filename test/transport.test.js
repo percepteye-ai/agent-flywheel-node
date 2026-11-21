@@ -10,7 +10,9 @@ import {
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { describe, it } from "node:test";
-import { AttachTransport } from "../src/transport.js";
+import { ControlPlaneClient } from "../src/http.js";
+import { AttachTransport, urlSegment } from "../src/transport.js";
+import { ContractError } from "../src/wire.js";
 import { TOOL_CALLS_FILENAME } from "../src/trajectory.js";
 import {
   MAX_TEXT_CHARS, readTurnText, recordTurnText, turnWire,
@@ -34,14 +36,32 @@ const t = (bodies) => {
   return { tx: new AttachTransport(r.client, { agentId: "my-agent" }), calls: r.calls };
 };
 
-describe("claiming is not replayable", () => {
-  it("turns ambiguous retries OFF for /rollouts/claim", async () => {
-    // The control plane does not honour Idempotency-Key on this route, so a
-    // resend that MAY have been processed leases a SECOND batch while the
-    // first is held by nobody. transport.py:134-139 records the incident.
-    const { tx, calls } = t({ "/rollouts/claim": { rollouts: [] } });
+describe("claiming is replayable through its key", () => {
+  it("resends an ambiguous claim under the SAME Idempotency-Key (ND-H1)", async () => {
+    // The control plane answers a replayed claim key with the batch it
+    // already leased under it (rollouts.py `claim`), so an ambiguous failure
+    // is retried -- under the one key, never a fresh one per attempt, which
+    // would lease a second batch while the first is held by nobody. This used
+    // to turn ambiguous retries OFF on a docstring saying the key was ignored.
+    const seen = [];
+    const fetchImpl = async (url, init) => {
+      seen.push(init.headers["Idempotency-Key"]);
+      if (seen.length === 1) {
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      }
+      return new Response('{"rollouts": [], "poll_after_ms": 0}', { status: 200 });
+    };
+    const tx = new AttachTransport(
+      new ControlPlaneClient("https://cp.test", "pefw_k", { fetchImpl }),
+      { agentId: "my-agent", waitMs: 0 },
+    );
+    const { pollAfterMs } = await tx.claim(1);
+    assert.equal(seen.length, 2, "an ambiguous claim failure was not retried");
+    assert.match(seen[0], /^[0-9a-f-]{36}$/);
+    assert.equal(seen[1], seen[0], "a retry of one claim minted a second key");
+    assert.equal(pollAfterMs, 0);
     await tx.claim(1);
-    assert.equal(calls[0].retryIfAmbiguous, false);
+    assert.notEqual(seen[2], seen[0], "two claims shared one key");
   });
 
   it("leaves ambiguous retries ON for the replayable result call", async () => {
@@ -56,19 +76,46 @@ describe("claiming is not replayable", () => {
 
   it("encodes opaque rollout ids in paths and hashes them in headers", async () => {
     const { tx, calls } = t();
-    const rollout = { rolloutId: "case/a?b% c\n", leaseToken: "lease" };
+    const rollout = { rolloutId: "case?a#b% c!", leaseToken: "lease" };
     await tx.heartbeat(rollout);
     await tx.report(rollout, { finalText: "done" });
     await tx.abandon(rollout, { reason: "cancelled" });
     assert.deepEqual(calls.map((call) => call.path), [
-      "/rollouts/case%2Fa%3Fb%25%20c%0A/heartbeat",
-      "/rollouts/case%2Fa%3Fb%25%20c%0A/result",
-      "/rollouts/case%2Fa%3Fb%25%20c%0A/abandon",
+      "/rollouts/case%3Fa%23b%25%20c%21/heartbeat",
+      "/rollouts/case%3Fa%23b%25%20c%21/result",
+      "/rollouts/case%3Fa%23b%25%20c%21/abandon",
     ]);
     for (const call of calls.slice(1)) {
       assert.match(call.idempotencyKey, /^(result|abandon)-[0-9a-f]{64}$/);
-      assert.equal(call.idempotencyKey.includes("\n"), false);
     }
+  });
+
+  it("refuses an id that cannot be ONE path segment, before any request (ND-M7)", async () => {
+    // Encoding alone is not enough: %2F and %2E%2E are decoded back into a
+    // separator or a dot segment by what sits in front of the control plane.
+    // The rule is the Python SDK's, and every path this package builds uses it.
+    const { tx, calls } = t();
+    const refused = ["", ".", "..", "a/b", "a\\b", "a\nb", "a\u0085b", "\ud800",
+      "x".repeat(257)];
+    for (const rolloutId of refused) {
+      await assert.rejects(async () => tx.report({ rolloutId }, { finalText: "x" }),
+        ContractError, JSON.stringify(rolloutId));
+      assert.throws(() => urlSegment(rolloutId), ContractError);
+    }
+    assert.equal(calls.length, 0, "a request was made for an id that is not a segment");
+    assert.equal(urlSegment("x".repeat(256)), "x".repeat(256));
+    assert.equal(urlSegment("it's (a)*!"), "it%27s%20%28a%29%2A%21");
+    // Counted in code points, as Python's len() counts them. Mutation: back
+    // to `.length` (UTF-16 units) -> 129 emoji are refused, red.
+    assert.ok(urlSegment("\u{1F600}".repeat(256)));
+    assert.throws(() => urlSegment("\u{1F600}".repeat(257)), ContractError);
+  });
+
+  it("puts the agent id in the capture read's path with the same rule (ND-M7)", async () => {
+    const { tx, calls } = t({ "/agents/a%28b%29/capture": { capture: { turns: true } } });
+    await tx.captureCurrent("a(b)");
+    assert.equal(calls[0].path, "/agents/a%28b%29/capture",
+      "the capture read quoted its segment differently from every other path");
   });
 
   it("carries the current lease outside the agent-authored result body", async () => {
@@ -119,7 +166,10 @@ describe("claiming is not replayable", () => {
   it("parses rollouts through the wire contract", async () => {
     const { tx } = t({
       "/rollouts/claim": {
-        rollouts: [{ rollout_id: "r9", turn_input: "go", deadline_ts: 5 }],
+        rollouts: [{
+          rollout_id: "r9", turn_input: "go", llm_url: "https://gw/r9",
+          api_key: "k", artifacts_dir: "rollouts/r9", deadline_ts: 5,
+        }],
         poll_after_ms: 2500,
       },
     });
@@ -127,6 +177,14 @@ describe("claiming is not replayable", () => {
     assert.equal(rollouts[0].rolloutId, "r9");
     assert.equal(rollouts[0].turnInput, "go");
     assert.equal(pollAfterMs, 2500);
+  });
+
+  it("keeps a poll_after_ms of 0 and reads a negative one as 0 (ND-M7)", async () => {
+    for (const [given, expected] of [[0, 0], [-5, 0], [250.7, 250], ["soon", 1000],
+      [null, 1000], [Number.NaN, 1000]]) {
+      const { tx } = t({ "/rollouts/claim": { rollouts: [], poll_after_ms: given } });
+      assert.equal((await tx.claim(1)).pollAfterMs, expected, String(given));
+    }
   });
 
   it("an empty queue is a normal answer, not an error", async () => {

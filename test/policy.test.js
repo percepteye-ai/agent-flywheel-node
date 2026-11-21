@@ -42,6 +42,7 @@ import { register, PLUGIN_ID } from "../src/index.js";
 import { resolveConfig } from "../src/config.js";
 import { resolveServedAgent } from "../src/scope.js";
 import {
+  ENDPOINT_KEY_CREDENTIAL, ENDPOINT_KEY_ORIGIN,
   FLYWHEEL_KEY_CREDENTIAL, FLYWHEEL_KEY_ENV, controlPlaneOrigin,
   MODEL_HOOK_NAME, MODEL_OFF_REASON, NO_KEY_REASON, PROMPT_HOOK_NAME,
   PROMPT_OFF_REASON, PROVIDER_ID, PROVIDER_TRANSPORT_API,
@@ -148,6 +149,20 @@ const hostApi = (overrides = {}) => {
 const productionConfig = (over = {}, env = {}) =>
   resolveConfig({ apiKey: "pefw_x", ...over }, env);
 
+
+
+/** Waits for the startup policy read to land, bounded by TIME rather than by a
+ * count of event-loop turns: startup does more async work than it did
+ * (capture's disk I/O is fs.promises), and a fixed 40 turns ran out on a slow
+ * CI runner before the read landed. */
+async function untilServing(out, ms = 5_000) {
+  // setImmediate and performance.now(): tests that mock setTimeout and Date
+  // (the cadence tests) use this too, and a mocked timer never fires.
+  const until = performance.now() + ms;
+  while (!out.serving.resolved && performance.now() < until) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
 
 describe("promptDecision — the pair check, cause by cause", () => {
   it("applies an approved bundle whose halves agree", () => {
@@ -332,7 +347,7 @@ describe("createPolicySource — a newer approved prompt reaches a running agent
   // is the best prompt found so far. Applying the startup answer forever ran
   // the first one forever.
   // The hook STARTS the re-read and does not wait for it; these let the
-  // in-flight reads finish without asking `refreshPrompt` (which would start
+  // in-flight reads finish without asking `refresh` (which would start
   // one itself, and hide a hook that never did).
   const settle = async () => {
     for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
@@ -448,20 +463,164 @@ describe("createPolicySource — a newer approved prompt reaches a running agent
     });
     await src.resolve(transport);
     clock.advance(5_000);
-    assert.equal(src.refreshPrompt(), null);
+    assert.equal(src.refresh(), null);
     clock.advance(PROMPT_REFRESH_MIN_MS);
-    assert.ok(src.refreshPrompt());
+    assert.ok(src.refresh());
   });
 
-  it("never re-reads when the prompt half is switched off", async () => {
+  it("never re-reads the PROMPT when the prompt half is switched off", async () => {
+    // The model half still follows /policy/current (see below), so the
+    // policy is re-read; the customer's prompt text never is.
     const { src, transport, clock } = setup(
       { policies: [g("g1"), g("g2")], prompts: [answer("FIRST", "g1")] },
       { applyPrompt: false },
     );
     await src.resolve(transport);
     clock.advance(61_000);
-    assert.equal(src.refreshPrompt(), null);
+    await src.refresh();
     assert.ok(!transport.calls.includes("prompt"));
+  });
+
+  it("never re-reads at all when both halves are switched off", async () => {
+    const { src, transport, clock } = setup(
+      { policies: [g("g1"), g("g2")], prompts: [answer("FIRST", "g1")] },
+      { applyPrompt: false, applyModel: false },
+    );
+    await src.resolve(transport);
+    clock.advance(61_000);
+    assert.equal(src.refresh(), null);
+    assert.deepEqual(transport.calls, ["policy"]);
+  });
+});
+
+describe("createPolicySource — the MODEL half follows later answers too", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
+  };
+  const setup = (policies, opts = {}) => {
+    let t = 1_000_000;
+    const clock = { now: () => t, advance: (ms) => { t += ms; } };
+    const transport = scriptedTransport({ policies, prompts: [APPROVED] });
+    const logger = fakeLogger();
+    const src = createPolicySource({
+      pluginId: PLUGIN_ID, logger, now: clock.now,
+      flywheelKey: "pefw_mine", controlPlaneUrl: CONTROL_PLANE_URL, ...opts,
+    });
+    return { src, transport, clock, logger };
+  };
+  const provider = { provider: PROVIDER_ID };
+
+  it("a withdrawal on a later tick clears the applied model (the real fixture)", async () => {
+    // `withdrawn: true, prompt_generation: null` is a MODEL withdrawal; the
+    // model used to be decided once and held for the life of the process.
+    const { src, transport, clock, logger } = setup([GATEWAY, WITHDRAWN]);
+    await src.resolve(transport);
+    assert.ok(src.appliedModel, "the gateway model is applied at startup");
+    assert.ok(src.handleModelResolve({}, TURN));
+    clock.advance(GATEWAY.ttl_s * 1000 + 1);
+    // Through the hook the host calls: it starts the re-read.
+    src.handleModelResolve({}, TURN);
+    await settle();
+    assert.equal(src.appliedModel, null);
+    assert.match(src.modelRefusal, /WITHDREW/);
+    assert.equal(src.handleModelResolve({}, TURN), undefined);
+    assert.equal(src.normalizeTransport(provider), undefined);
+    assert.equal(src.resolveSyntheticAuth(provider), undefined);
+    assert.match(logger.text(), /no longer applied: the control plane WITHDREW/);
+  });
+
+  it("an empty or failed re-read keeps the applied model", async () => {
+    const { src, transport, clock } = setup([SERVED, {}]);
+    await src.resolve(transport);
+    const before = src.appliedModel;
+    clock.advance(61_000);
+    await src.refresh();
+    assert.deepEqual(src.appliedModel, before);
+  });
+
+  it("a moved endpoint replaces the applied one from the next turn", async () => {
+    const moved = {
+      ...SERVED, endpoint: { base_url: "https://other.example/v1", model: "ckpt-9" },
+    };
+    const { src, transport, clock, logger } = setup([SERVED, moved]);
+    await src.resolve(transport);
+    clock.advance(61_000);
+    await src.refresh();
+    assert.equal(src.appliedModel.model, "ckpt-9");
+    assert.equal(src.normalizeTransport(provider).baseUrl, "https://other.example/v1");
+    assert.match(logger.text(), /now serves the model 'ckpt-9'/);
+  });
+
+  it("a model first served after startup is applied", async () => {
+    const { src, transport, clock } = setup([UNSERVED, SERVED]);
+    await src.resolve(transport);
+    assert.equal(src.appliedModel, null);
+    clock.advance(61_000);
+    await src.refresh();
+    assert.equal(src.appliedModel?.model, "ckpt-7");
+  });
+
+  it("re-reads for the model half when the prompt half is off", async () => {
+    const { src, transport, clock } = setup([GATEWAY, WITHDRAWN], { applyPrompt: false });
+    await src.resolve(transport);
+    clock.advance(GATEWAY.ttl_s * 1000 + 1);
+    src.handleModelResolve({}, TURN);
+    await settle();
+    assert.equal(src.appliedModel, null);
+    assert.ok(!transport.calls.includes("prompt"));
+  });
+});
+
+describe("the key the control plane SENT for an endpoint (endpoint.api_key)", () => {
+  const provider = { provider: PROVIDER_ID };
+  const withKey = (endpoint) => ({ ...SERVED, endpoint: { ...SERVED.endpoint, ...endpoint } });
+
+  it("is used for that endpoint, ahead of api_key_env, as the Python SDK ranks it", async () => {
+    // GATEWAY names PERCEPTEYE_API_KEY at the control plane's own origin, so
+    // without the sent key the flywheel key would be used.
+    const body = { ...GATEWAY, endpoint: { ...GATEWAY.endpoint, api_key: "vault-key" } };
+    const d = modelDecision(body, { controlPlaneUrl: CONTROL_PLANE_URL });
+    assert.equal(d.credential, ENDPOINT_KEY_CREDENTIAL);
+    assert.equal(d.endpointKey, "vault-key");
+    const src = createPolicySource({
+      pluginId: PLUGIN_ID, logger: fakeLogger(), flywheelKey: "pefw_mine",
+      controlPlaneUrl: CONTROL_PLANE_URL,
+    });
+    await src.resolve(fakeTransport({ policy: body }));
+    const auth = src.resolveSyntheticAuth(provider);
+    assert.equal(auth.apiKey, "vault-key");
+    assert.equal(auth.source, ENDPOINT_KEY_ORIGIN);
+    // Held in the closure: never on the applied model, never in a log line.
+    assert.equal(JSON.stringify(src.appliedModel).includes("vault-key"), false);
+    assert.equal(src.resolveSyntheticAuth({ provider: "openai" }), undefined);
+  });
+
+  it("is used for a provider endpoint the flywheel key may never go to", async () => {
+    const body = withKey({ api_key_env: "FIREWORKS_API_KEY", api_key: "fw-key" });
+    const logger = fakeLogger();
+    const src = createPolicySource({
+      pluginId: PLUGIN_ID, logger, flywheelKey: "pefw_mine",
+      controlPlaneUrl: CONTROL_PLANE_URL,
+    });
+    await src.resolve(fakeTransport({ policy: body }));
+    assert.equal(src.resolveSyntheticAuth(provider).apiKey, "fw-key");
+    assert.equal(logger.text().includes("fw-key"), false);
+  });
+
+  it("follows the endpoint: a later answer without a key stops sending it", async () => {
+    let t = 1_000_000;
+    const transport = scriptedTransport({
+      policies: [withKey({ api_key: "first" }), SERVED], prompts: [APPROVED],
+    });
+    const src = createPolicySource({
+      pluginId: PLUGIN_ID, logger: fakeLogger(), now: () => t,
+      flywheelKey: "pefw_mine", controlPlaneUrl: CONTROL_PLANE_URL,
+    });
+    await src.resolve(transport);
+    assert.equal(src.resolveSyntheticAuth(provider).apiKey, "first");
+    t += 61_000;
+    await src.refresh();
+    assert.equal(src.resolveSyntheticAuth(provider), undefined);
   });
 });
 
@@ -1187,9 +1346,7 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
       const out = register(api, { apiKey: SECRET }, {
         PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
       });
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true);
       assert.equal(api.providers[0].resolveSyntheticAuth({ provider: PROVIDER_ID })?.apiKey,
         SECRET, "the gateway at the configured control plane's address takes the key");
@@ -1354,19 +1511,18 @@ describe("gateway delivery — the flywheel key opens the endpoint the control p
 });
 
 
-describe("the model half is the startup answer; only the prompt half follows", () => {
-  // THE RECORDED DECISION (policy.js, "RESOLVED AT START; THE PROMPT FOLLOWS
-  // LATER APPROVALS"): the MODEL half's answer is held for the life of the
-  // process -- a moved address needs a restart on `serving_generation`, and
-  // the gateway's constant URL lets the control plane move the model behind
-  // it on its own side. The PROMPT half re-reads `/policy/current` from its
-  // own hook, at most once per `ttl_s`, and the prompt TEXT only when
-  // `prompt_generation` names a different approved prompt. No timer re-reads
+describe("both halves re-read on a hook, at most once per ttl_s, never on a timer", () => {
+  // THE RECORDED DECISION (policy.js, "RESOLVED AT START; BOTH HALVES FOLLOW
+  // LATER ANSWERS"): `/policy/current` is re-read from whichever hook runs
+  // first, at most once per `ttl_s`, and the prompt TEXT only when
+  // `prompt_generation` names a different approved prompt. The model half is
+  // re-decided on every re-read (it used to be held for the life of the
+  // process, which kept a withdrawn model applied). No timer re-reads
   // anything. This holds all three against a drift either way.
   const policyReadsAtMost = (calls, ticks) =>
     calls.filter((c) => c === "policy").length <= 1 + ticks;
 
-  it("re-reads /policy/current at most once per ttl_s, on the prompt hook, never on a timer", async (t) => {
+  it("re-reads /policy/current at most once per ttl_s, on a hook, never on a timer", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     const api = hostApi();
     const transport = fakeTransport({ policy: GATEWAY });
@@ -1386,11 +1542,12 @@ describe("the model half is the startup answer; only the prompt half follows", (
     await new Promise((r) => setImmediate(r));
     assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
       "a timer re-read /policy/current with no turn to serve");
-    // The MODEL hook never re-reads: only the prompt hook does.
+    // The MODEL hook re-reads too -- once, however often it runs in a window.
+    api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN);
     api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN);
     await new Promise((r) => setImmediate(r));
-    assert.equal(transport.calls.filter((c) => c === "policy").length, 1,
-      "the model hook re-read /policy/current");
+    assert.equal(transport.calls.filter((c) => c === "policy").length, 2,
+      "the model hook did not re-read /policy/current exactly once");
 
     for (let i = 0; i < 10; i += 1) {
       t.mock.timers.tick(ttlMs);
@@ -1401,13 +1558,13 @@ describe("the model half is the startup answer; only the prompt half follows", (
       api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN);
       await new Promise((r) => setImmediate(r));
     }
-    assert.ok(policyReadsAtMost(transport.calls, 10),
+    assert.ok(policyReadsAtMost(transport.calls, 11),
       `/policy/current was read more than once per ${GATEWAY.ttl_s}s: ${transport.calls}`);
     // GATEWAY names no served prompt, so the text is never re-read.
     assert.equal(transport.calls.filter((c) => c === "prompt").length, 1);
     assert.deepEqual(api.hook(MODEL_HOOK_NAME)({ prompt: "hi" }, TURN), {
       providerOverride: PROVIDER_ID, modelOverride: GATEWAY.endpoint.model,
-    }, "the startup answer is the MODEL answer for the life of the process");
+    }, "an unchanged answer keeps the same model");
   });
 
   it("holds the same cadence through the plugin's real entry point", async (t) => {
@@ -1443,9 +1600,7 @@ describe("the model half is the startup answer; only the prompt half follows", (
       const out = register(api, { apiKey: "pefw_x" }, {
         PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
       });
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the startup read never completed");
       assert.equal(reads("/policy/current"), 1);
       assert.ok(api.hooks.length > 2, "the capture lane's hooks are subscribed too");
@@ -1571,9 +1726,7 @@ describe("mode decides it, structurally", () => {
       assert.ok(api.hook(MODEL_HOOK_NAME), `${MODEL_HOOK_NAME} must be subscribed`);
       assert.equal(api.providers.length, 1);
 
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the startup read never completed");
       assert.deepEqual(
         api.hook(PROMPT_HOOK_NAME)({ prompt: "hi", messages: [] }, TURN),
@@ -1702,9 +1855,7 @@ describe("mode decides it, structurally", () => {
         "to be rate-limited before the agent has served a turn",
       );
       releaseRegistration();
-      for (let i = 0; i < 40 && !out.serving.resolved; i += 1) {
-        await new Promise((r) => setImmediate(r));
-      }
+      await untilServing(out);
       assert.equal(out.serving.resolved, true, "the read must still happen after");
       assert.equal(out.serving.appliedPrompt, APPROVED.text);
     } finally {

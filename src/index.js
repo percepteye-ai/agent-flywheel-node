@@ -38,8 +38,10 @@
  * writes unconditionally -- and what it understated was the recording of
  * somebody's END USERS' message text. The truth:
  *
- *   training    tool outcomes go to the rollout's PERCEPTEYE_TRAJECTORY_DIR.
- *               With the variable unset nothing is written.
+ *   training    a claimed rollout's tool outcomes go to its own directory,
+ *               $PERCEPTEYE_HOME/trajectories/<agentId>/<rolloutId>, and are
+ *               reported with its result, then removed. Any other call goes
+ *               to PERCEPTEYE_TRAJECTORY_DIR; with that unset it is not written.
  *   production  every served turn -- the user's message, the tool calls, and
  *               (with allowConversationAccess) the agent's answer -- is written
  *               under PERCEPTEYE_CAPTURE_DIR, default ~/.percepteye/captured,
@@ -64,11 +66,17 @@
  *
  * They are a certified PAIR, which is why they are applied together and why
  * applying one alone is reported as such. That is the last mile of the loop
- * this package exists to close, and the only thing here that changes what the
- * agent does rather than recording it. `policy.js` holds both decisions, the
- * pair check, the per-agent scope, and the two off switches --
- * `applyPrompt: false` / PERCEPTEYE_APPLY_PROMPT=0 and `applyModel: false` /
+ * this package exists to close. `policy.js` holds both decisions, the pair
+ * check, the per-agent scope, and the two off switches -- `applyPrompt:
+ * false` / PERCEPTEYE_APPLY_PROMPT=0 and `applyModel: false` /
  * PERCEPTEYE_APPLY_MODEL=0.
+ *
+ * WHAT TRAINING MODE CHANGES: the model a ROLLOUT samples. A session running
+ * a claimed rollout is pointed, through the same provider, at that rollout's
+ * own gateway (`rollout.llmUrl`) -- the checkpoint being trained, where its
+ * calls are captured and scored -- and back to the host's own model when the
+ * rollout ends (`rollout.js`, "WHERE A ROLLOUT SAMPLES"). No other session's
+ * model changes, and no approved prompt or model is applied in training.
  */
 import { createRecorder } from "./record.js";
 import { createWriter, TRAJECTORY_DIR_ENV } from "./trajectory.js";
@@ -76,25 +84,33 @@ import { registerDescriber, DESCRIBE_HOOK_NAME } from "./describe.js";
 import { CONFIG_SCHEMA, resolveConfig } from "./config.js";
 import { ControlPlaneClient } from "./http.js";
 import { AttachTransport, rulesNeverSent, sentence } from "./transport.js";
-import { PRODUCTION, TRAINING } from "./mode.js";
+import { PRODUCTION, resolveModeSource, TRAINING } from "./mode.js";
 import { ConfigurationError } from "./errors.js";
 import { registerRolloutDriver } from "./rollout.js";
 import { PENDING_ANSWER_REASON, registerServingPolicy } from "./policy.js";
 import { conversationAccessGranted } from "./host.js";
+import { resolveServedAgent } from "./scope.js";
 import {
   captureRoot, createTurnCapture, registerTurnCapture,
 } from "./capture.js";
 import {
   createExecutionIdentityTracker, withholdFingerprints,
 } from "./execution-identity.js";
-import { resolveDeclaration } from "./declaration.js";
+import { declarationDescribes, resolveDeclaration } from "./declaration.js";
 import {
-  CredentialsError, credentialsPath, loadStored, loginHint,
+  CredentialsError, credentialsPath, loadStored, loginHint, shellQuote,
 } from "./credentials.js";
 
 export const PLUGIN_ID = "agent-flywheel";
 export const HOOK_NAME = "after_tool_call";
 export { DESCRIBE_HOOK_NAME };
+// The outcome vocabulary and its named error, for a caller of
+// `capture.reportOutcome`, and the per-turn feedback vocabulary and its
+// error, for a caller of `capture.reportTurnFeedback` -- the Python package
+// exports the same four names.
+export {
+  InvalidFeedback, InvalidOutcome, PRODUCTION_OUTCOMES, TURN_FEEDBACK_SIGNALS,
+} from "./wire.js";
 
 /**
  * The operator's `describe`, validated -- or null, having said why.
@@ -205,10 +221,37 @@ export function register(api, pluginConfig = {}, env = process.env) {
     : (api.pluginConfig ?? {});
   let config;
   let degraded = null;
+  // ANY OTHER UNREADABLE SETTING -- an agentId that is not one -- has no
+  // safe value to degrade to: capturing or uploading under a name the
+  // operator did not give would file their turns under somebody else's
+  // agent. So nothing is registered, the plugin load still succeeds, and
+  // the line names the setting that has to change.
+  const refuse = (err) => {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] ${err.message}. Nothing is recorded or sent until this ` +
+      `is corrected in plugins.entries.${PLUGIN_ID}.config or the ` +
+      `environment; this install registers no hook.`,
+    );
+    return null;
+  };
+  const modeIsUnreadable = () => {
+    try {
+      resolveModeSource(supplied.mode, env);
+      return false;
+    } catch (err) {
+      if (err instanceof ConfigurationError) return true;
+      throw err;
+    }
+  };
   try {
     config = resolveConfig(supplied, env);
   } catch (err) {
     if (!(err instanceof ConfigurationError)) throw err;
+    // DEGRADED ONLY WHEN IT IS THE MODE THAT CANNOT BE READ. This used to
+    // assume every ConfigurationError was the mode's, retry unguarded, and
+    // fail the plugin load on an invalid agentId -- with a warning, had it
+    // got that far, blaming the mode.
+    if (!modeIsUnreadable()) return refuse(err);
     // AN UNREADABLE MODE DEGRADES TO PRODUCTION, LOUDLY. It does not throw
     // and it does not fall back to `training`, and both of those matter.
     //
@@ -225,12 +268,19 @@ export function register(api, pluginConfig = {}, env = process.env) {
     // side of a mode we could not read: the worst case is that this install
     // does less than intended, and says so.
     degraded = { ...supplied, mode: PRODUCTION };
-    config = resolveConfig(degraded, env);
+    try {
+      config = resolveConfig(degraded, env);
+    } catch (again) {
+      // The mode AND another setting are unreadable; the other one decides.
+      if (!(again instanceof ConfigurationError)) throw again;
+      return refuse(again);
+    }
     logger?.warn?.(
       `[${PLUGIN_ID}] ${err.message} Running in ${PRODUCTION} mode until ` +
       `this is corrected; no rollouts will be claimed. Note that production ` +
       `mode is not inert: it captures served turns and applies the approved ` +
-      `system prompt (PERCEPTEYE_CAPTURE=0 / PERCEPTEYE_APPLY_PROMPT=0).`,
+      `system prompt and model (PERCEPTEYE_CAPTURE=0 / ` +
+      `PERCEPTEYE_APPLY_PROMPT=0 / PERCEPTEYE_APPLY_MODEL=0).`,
     );
   }
   // THE KEY `npx @percepteye/agent-flywheel login` STORED, consulted only
@@ -250,7 +300,7 @@ export function register(api, pluginConfig = {}, env = process.env) {
       `[${PLUGIN_ID}] using the key stored for agent ` +
       `${JSON.stringify(config.agentId)} in ${credentialsPath(env)} (control ` +
       `plane ${config.controlPlaneUrl}). Run \`npx @percepteye/agent-flywheel ` +
-      `logout --agent-id ${config.agentId}\` to stop.`,
+      `logout --agent-id ${shellQuote(config.agentId)}\` to stop.`,
     );
   } else if (config.apiKey === null && config.storedKeyRefusal) {
     logger?.warn?.(
@@ -297,11 +347,13 @@ export function register(api, pluginConfig = {}, env = process.env) {
     );
   }
   // A DECLARED description is the customer's word, not an observation: it
-  // merges over what was observed and anchors no fingerprint, anywhere.
-  const executionIdentity = declaration === null
-    ? tracker
-    : withholdFingerprints(tracker);
-  if (declaration !== null && tracker.enabled) {
+  // merges over what was observed and anchors no fingerprint, anywhere. An
+  // `api_spec` alone describes nothing and withholds nothing.
+  const described = declarationDescribes(declaration);
+  const executionIdentity = described
+    ? withholdFingerprints(tracker)
+    : tracker;
+  if (described && tracker.enabled) {
     // Said, because an operator who configured an execution snapshot and then
     // added `describe` otherwise loses exact identity with no line anywhere.
     logger?.warn?.(
@@ -312,18 +364,34 @@ export function register(api, pluginConfig = {}, env = process.env) {
   // ── WHERE TOOL CALLS LAND, decided by mode ────────────────────────────
   //
   // In TRAINING mode a trajectory belongs to one ROLLOUT, and the rollout
-  // driver names the directory through PERCEPTEYE_TRAJECTORY_DIR. Unchanged.
+  // driver names its directory (`trajectoryDirFor`), one per rollout, by the
+  // session running it. It used to be PERCEPTEYE_TRAJECTORY_DIR alone --
+  // which nothing here sets, and which is one directory for the whole
+  // process -- and the driver read nothing back.
   //
   // In PRODUCTION mode there is no rollout: a trajectory belongs to one TURN,
   // so each call is routed to its own turn directory by `runId`. The env var
   // is not consulted there, because a single shared directory would merge
   // every end user's calls into one trajectory -- and `PERCEPTEYE_AGENT_MODE`
   // is the authority on which of the two this process is.
+  // Keyed by agent and scoped to its own runs (capture.js `captureRoot`,
+  // `createTurnCapture`), by the predicate the serving policy asks.
   const turns = config.mode === PRODUCTION
-    ? createTurnCapture({ root: captureRoot(env), logger })
+    ? createTurnCapture({
+      root: captureRoot(env, config.agentId), logger,
+      servedAgent: resolveServedAgent({
+        agentId: config.agentId, hostConfig: api?.config }),
+    })
     : null;
   const writer = createWriter({
-    resolveDir: turns ? turns.resolveToolDir : null,
+    // PRODUCTION: each call to its turn's directory. TRAINING: a call made
+    // in a session running a claimed rollout goes to THAT rollout's own
+    // trajectory, which `onAgentEnd` reads back and reports; any other call
+    // to PERCEPTEYE_TRAJECTORY_DIR, as before, when a harness sets it.
+    resolveDir: turns
+      ? turns.resolveToolDir
+      : (ctx) => rollouts?.trajectoryDirFor?.(ctx)
+        ?? process.env[TRAJECTORY_DIR_ENV] ?? null,
     onError: (err) => logger?.warn?.(
       `[${PLUGIN_ID}] trajectory write failed; tool outcomes are not being ` +
       `recorded for this run: ${err?.message ?? err}`,
@@ -505,6 +573,18 @@ export function register(api, pluginConfig = {}, env = process.env) {
   return {
     recorder, writer, describer, rollouts, capture, serving, executionIdentity,
     mode: config.mode,
+    // The Python SDK's `current_rollout_id()`: the id of the episode this
+    // host session is running, for application code to report its outcome
+    // against later (`reportOutcome(..., { episodeId })`). A host session,
+    // not an async context, is what a rollout belongs to here -- the host
+    // calls every hook and tool outside this plugin's call stack -- so it is
+    // asked with the same host context every hook is keyed by, through the
+    // driver's own `rolloutFor`. Null outside a rollout, in production mode,
+    // and once the rollout's run has ended.
+    currentRolloutId: (ctx) => {
+      const id = rollouts?.rolloutFor?.(ctx)?.rolloutId;
+      return typeof id === "string" && id ? id : null;
+    },
   };
 }
 

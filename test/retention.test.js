@@ -151,9 +151,14 @@ describe("retentionTurns", () => {
     assert.deepEqual(retentionTurnsFrom(null), { retentionTurns: null, refusal: null });
     assert.deepEqual(retentionTurnsFrom(0), { retentionTurns: 0, refusal: null });
     assert.deepEqual(retentionTurnsFrom(50_000), { retentionTurns: 50_000, refusal: null });
-    for (const bad of [-1, 2.5, "100", true, [], {}]) {
+    // A BigInt, a cyclic object and a prototype-less one are refused and
+    // named, never thrown out of register() (ND-M16). Mutation: back to
+    // JSON.stringify -> a TypeError, red.
+    const cyclic = {};
+    cyclic.self = cyclic;
+    for (const bad of [-1, 2.5, "100", true, [], {}, 5n, cyclic, Object.create(null)]) {
       const { retentionTurns, refusal } = retentionTurnsFrom(bad);
-      assert.equal(retentionTurns, null, `${JSON.stringify(bad)} was accepted`);
+      assert.equal(retentionTurns, null, `${typeof bad} was accepted`);
       assert.match(refusal, /retentionTurns must be a whole number of turns, 0 or more/);
     }
   });
@@ -209,6 +214,9 @@ describe("the gateway prunes on its own only when asked", () => {
     wire(root, a, 20);
     for (let i = 0; i < 900; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi", sessionKey: "c" }, {});
+      // Answered, so finished: a turn still running is never pruned.
+      a.fire("agent_end", { runId: `r${i}`,
+        messages: [{ role: "assistant", content: "ok" }] }, { sessionKey: "c" });
       if (i % 64 === 0) await settle();
     }
     await settle();

@@ -1,16 +1,18 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.31.0), case for case with the Python
+ * The customer API reads (contract 1.54.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { ConfigurationError } from "../src/errors.js";
+import { ConfigurationError, TransportError } from "../src/errors.js";
+import { ContractError } from "../src/wire.js";
 import {
-  ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CustomerApiClient, CustomerRefusal,
-  PROMPT_RUN_REFUSAL_CODES, RUN_LIST_REFUSAL_CODES, customerApiBase,
+  AGENT_REFUSAL_CODES, ATTACK_REFUSAL_CODES, CUSTOMER_CONTRACT_VERSION, CYBER_REFUSAL_CODES, CustomerApiClient,
+  CustomerContractTooOld, CustomerRefusal, PROMPT_RUN_REFUSAL_CODES, RUN_LIST_REFUSAL_CODES,
+  TRAINING_REFUSAL_CODES, customerApiBase,
 } from "../src/customer-api.js";
 
 function fake(status, body) {
@@ -25,8 +27,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.31.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.31.0");
+  it("pins contract 1.54.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.54.0");
     assert.deepEqual([...ATTACK_REFUSAL_CODES], [
       "attack_set_is_sealed",
       "attack_resistance_measuring",
@@ -38,19 +40,78 @@ describe("customer api", () => {
       "hillclimb_not_found",
       "round_not_found",
       "event_kind_is_the_platforms",
+      "attack_unmeasured_undisclosed",
     ]);
-    assert.deepEqual([...RUN_LIST_REFUSAL_CODES], ["launch_uri_outside_org", "run_page_too_deep"]);
+    assert.deepEqual([...CYBER_REFUSAL_CODES], [
+      "cyber_disabled", "cyber_training_disabled", "cyber_needs_training",
+      "cyber_no_training_entry", "cyber_lane_has_no_attack_reward",
+      "hillclimb_security_unknown", "cyber_attack_reward_not_comparable",
+    ]);
+    assert.deepEqual([...TRAINING_REFUSAL_CODES], [
+      "opsd_prompts_exceed_host", "opsd_recipe_tokenizer_hub_unavailable",
+      "opsd_recipe_tokenizer_refused", "opsd_recipe_tokenizer_platform_fault",
+      "opsd_teacher_preflight_no_evidence_decisions", "training_diverged_at_lr",
+      "training_unhealthy", "training_pool_cannot_train_objective",
+      "opsd_chosen_model_not_trainable", "hillclimb_base_model_invalid",
+      "base_model_unresolvable", "destination_algorithm_unsupported",
+      "provider_checkpoint_not_owned", "hillclimb_start_invalid",
+      "base_merge_failed", "authority_ruling_requires_org_admin",
+    ]);
+    assert.deepEqual([...RUN_LIST_REFUSAL_CODES], [
+      "launch_uri_outside_org", "run_page_too_deep",
+      "launch_input_requires_platform_operator",
+      "code_sandbox_not_configured", "code_sandbox_unreachable",
+    ]);
     assert.deepEqual([...PROMPT_RUN_REFUSAL_CODES], [
       "prompt_run_balance_too_small", "recorded_prompt_absent",
       "recorded_decisions_too_few", "recorded_prompt_mismatch",
+      "prompt_objective_unprepared", "prompt_evolution_refused",
+      "prompt_model_unreachable",
     ]);
+    assert.deepEqual([...AGENT_REFUSAL_CODES], [
+      "practice_rollouts_not_enabled", "practice_needs_a_training_process",
+      "model_content_capture_not_enabled", "flywheel_no_task_source",
+      "flywheel_product_undeclared", "invalid_flywheel_spec",
+    ]);
+  });
+
+  it("answers eligibility for a training location, and says so (1.50.0)", async () => {
+    const f = fake(200, { training_locations: {
+      answered_for: "platform_gpu", default: "platform_pool", options: [
+        { location: "platform_gpu", available: true, refusal: null, gpu_hosts: 2, gpu_hosts_free: 1 }] } });
+    const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", fetchImpl: f.fetchImpl, env: {} });
+    const e = await c.trainingEligibility({ agentId: "a1", trainingLocation: "platform_gpu" });
+    assert.equal(e.training_locations.options[0].gpu_hosts_free, 1);
+    assert.equal(new URL(f.calls[0].url).search, "?agent_id=a1&training_location=platform_gpu");
+  });
+
+  it("refuses an answer that is not for the asked location, as an older server gives", async () => {
+    for (const body of [
+      { prompt_optimization: {} },
+      { training_locations: null },
+      { training_locations: { answered_for: "platform_pool" } },
+      ["not", "an", "object"],
+    ]) {
+      const { fetchImpl } = fake(200, body);
+      const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", fetchImpl, env: {} });
+      await assert.rejects(c.trainingEligibility({ trainingLocation: "platform_gpu" }),
+        (e) => e instanceof CustomerContractTooOld && e instanceof ConfigurationError
+          && /customer contract 1\.50\.0/.test(e.message));
+    }
+  });
+
+  it("returns an older server's answer unchanged when no location is asked", async () => {
+    const f = fake(200, { prompt_optimization: { enabled: false } });
+    const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", fetchImpl: f.fetchImpl, env: {} });
+    assert.deepEqual(await c.trainingEligibility({ productId: "p" }), { prompt_optimization: { enabled: false } });
+    assert.equal(new URL(f.calls[0].url).search, "?product_id=p");
   });
 
   it("reads a run's attack resistance, and a refusal by its code", async () => {
     const ok = fake(200, { measurement: { state: "not_measured" } });
     const c = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: ok.fetchImpl });
-    assert.equal((await c.getHillclimbSecurity("r/1")).measurement.state, "not_measured");
-    assert.equal(ok.calls[0].url, "https://x.test/api/v2/hillclimbs/r%2F1/security");
+    assert.equal((await c.getHillclimbSecurity("r 1?")).measurement.state, "not_measured");
+    assert.equal(ok.calls[0].url, "https://x.test/api/v2/hillclimbs/r%201%3F/security");
     const no = fake(404, { detail: { code: "hillclimb_not_found", message: "no" } });
     const c2 = new CustomerApiClient({ apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl: no.fetchImpl });
     await assert.rejects(c2.getHillclimbSecurity("r2"), (e) => e instanceof CustomerRefusal && e.code === "hillclimb_not_found");
@@ -116,6 +177,11 @@ describe("customer api", () => {
     assert.equal(err.plainWords, "These traces hold no system message.");
     assert.equal(err.faultOwner, "customer");
     assert.equal(err.retryable, false);
+    assert.equal(err.detail, null);
+    const diverged = new CustomerRefusal(422, { detail: {
+      code: "training_diverged_at_lr", message: "m",
+      detail: { learning_rate: 2e-5, retry_learning_rate: 1e-5 } } });
+    assert.deepEqual(diverged.detail, { learning_rate: 2e-5, retry_learning_rate: 1e-5 });
     const noMsg = new CustomerRefusal(422, { detail: { code: "run_page_too_deep", message: "m", customer_words: "Use an earlier date." } });
     assert.equal(noMsg.plainWords, "Use an earlier date.");
     const bare = new CustomerRefusal(403, { detail: "Forbidden" });
@@ -161,9 +227,169 @@ describe("customer api", () => {
       hillclimb_not_found: 404,
       round_not_found: 404,
       event_kind_is_the_platforms: 403,
+      // 1.32.0 through 1.49.0: every code those bumps published but 1.40.0's
+      // three prompt_box_* codes (see PROMPT_RUN_REFUSAL_CODES).
+      opsd_prompts_exceed_host: 422,
+      opsd_recipe_tokenizer_hub_unavailable: 503,
+      opsd_recipe_tokenizer_refused: 422,
+      opsd_recipe_tokenizer_platform_fault: 503,
+      opsd_teacher_preflight_no_evidence_decisions: 409,
+      attack_unmeasured_undisclosed: 409,
+      training_diverged_at_lr: 422,
+      training_unhealthy: 422,
+      prompt_objective_unprepared: 500,
+      prompt_evolution_refused: 409,
+      prompt_model_unreachable: 422,
+      cyber_disabled: 503,
+      cyber_training_disabled: 503,
+      cyber_needs_training: 422,
+      cyber_no_training_entry: 422,
+      cyber_lane_has_no_attack_reward: 422,
+      hillclimb_security_unknown: 422,
+      training_pool_cannot_train_objective: 503,
+      cyber_attack_reward_not_comparable: 422,
+      opsd_chosen_model_not_trainable: 422,
+      hillclimb_base_model_invalid: 422,
+      // 1.51.0: the hillclimb door's refusals of an agent's switch, raised
+      // before 1.51.0 published them.
+      practice_rollouts_not_enabled: 422,
+      practice_needs_a_training_process: 422,
+      model_content_capture_not_enabled: 422,
+      flywheel_no_task_source: 422,
+      flywheel_product_undeclared: 422,
+      invalid_flywheel_spec: 422,
+      base_model_unresolvable: 422,
+      destination_algorithm_unsupported: 422,
+      provider_checkpoint_not_owned: 403,
+      // 1.51.0: a hill climb request naming an input only a platform operator
+      // may set. The other fourteen codes 1.51.0 added or published are
+      // answered by operations this SDK neither calls nor documents (a
+      // Decision's answer, eval-set comparisons and saves, observability
+      // sources, serving an artifact, a champion's rollback).
+      launch_input_requires_platform_operator: 403,
+      // 1.51.0: a coding agent's launch on a deployment with no isolated
+      // sandbox for its code, or one not answering.
+      code_sandbox_not_configured: 503,
+      code_sandbox_unreachable: 503,
+      // 1.52.0: a hill climb started from a model the organization already
+      // trained.
+      hillclimb_start_invalid: 422,
+      base_merge_failed: 502,
+      // 1.54.0: a ruling on the reward plan's Decision by anyone but an org
+      // admin.
+      authority_ruling_requires_org_admin: 403,
     };
-    assert.deepEqual([...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES].sort(), Object.keys(expected).sort());
+    const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
+      ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];
+    assert.equal(new Set(known).size, known.length, "a code is in two groups");
+    assert.deepEqual([...known].sort(), Object.keys(expected).sort());
     for (const [code, status] of Object.entries(expected)) assert.equal(published[code], status, code);
     assert.equal(doc["x-customer-contract-version"], CUSTOMER_CONTRACT_VERSION);
+  });
+});
+
+describe("the customer api's own source of truth", () => {
+  it("declares the contract version Mission Control's source declares (XR-2)", () => {
+    // Read from the control plane's customer_contract.py, not docs/openapi.json, which is
+    // generated and can lag it. A set PERCEPTEYE_CONTROL_PLANE_CHECKOUT is a
+    // promise (a release, docs/RELEASING.md), so a missing file fails; unset
+    // (every CI run, which cannot name a private checkout) only the shape is
+    // checked. The Python SDK's test_the_declared_contract_is_the_control_planes.
+    assert.match(CUSTOMER_CONTRACT_VERSION, /^1\.[0-9]+\.[0-9]+$/);
+    const checkout = process.env.PERCEPTEYE_CONTROL_PLANE_CHECKOUT;
+    if (!checkout) return;
+    // The control plane's package directory is found, not named: this file
+    // is published, and the open-source boundary forbids its internal paths.
+    const pkg = readdirSync(checkout, { withFileTypes: true }).find((e) => e.isDirectory()
+      && existsSync(join(checkout, e.name, "api", "customer_contract.py")));
+    assert.ok(pkg, `no */api/customer_contract.py under ${checkout}`);
+    const source = readFileSync(join(checkout, pkg.name, "api", "customer_contract.py"), "utf8");
+    const declared = /^CUSTOMER_CONTRACT_VERSION(?:: *Final)? *= *"([^"]+)"/m.exec(source);
+    assert.ok(declared, "the control plane declares no version");
+    assert.equal(declared[1], CUSTOMER_CONTRACT_VERSION);
+  });
+});
+
+describe("a read is bounded, retried and only ever JSON (ND-M8)", () => {
+  /** A fetch replaying `script` (status/body/headers, or an Error to throw). */
+  function scripted(script) {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      const next = script[Math.min(calls.length - 1, script.length - 1)];
+      if (next instanceof Error) throw next;
+      if (typeof next === "function") return next(init);
+      return new Response(next.body ?? null, { status: next.status, headers: next.headers ?? {} });
+    };
+    return { calls, fetchImpl };
+  }
+  const make = (fetchImpl, opts = {}) => new CustomerApiClient({
+    apiKey: KEY, baseUrl: "https://x.test/api/v2", env: {}, fetchImpl, ...opts });
+
+  it("retries a transient failure and returns the answer", async () => {
+    const reset = Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+    const f = scripted([reset, { status: 503, headers: { "retry-after": "0" } },
+      { status: 200, body: '{"runs": []}' }]);
+    assert.deepEqual(await make(f.fetchImpl).listRuns(), { runs: [] });
+    assert.equal(f.calls.length, 3);
+  });
+
+  it("does not retry the server's refusal", async () => {
+    const f = scripted([{ status: 404, body: '{"detail": {"code": "hillclimb_not_found"}}' }]);
+    await assert.rejects(make(f.fetchImpl).getHillclimbSecurity("r1"), CustomerRefusal);
+    assert.equal(f.calls.length, 1);
+  });
+
+  it("times out a read whose body stalls", async () => {
+    const stall = (init) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal.addEventListener("abort", () => controller.error(
+          Object.assign(new Error("aborted"), { name: "AbortError" })));
+      },
+    }), { status: 200 });
+    const f = scripted([stall]);
+    await assert.rejects(make(f.fetchImpl, { timeoutMs: 30 }).listRuns(), TransportError);
+  });
+
+  it("refuses an HTML 2xx and a redirect, and never follows one", async () => {
+    const html = scripted([{ status: 200, body: "<html>sign in</html>" }]);
+    await assert.rejects(make(html.fetchImpl).listRuns(),
+      (e) => e instanceof TransportError && /not JSON/.test(e.message) && e.statusCode === 200);
+    const moved = scripted([{ status: 302, headers: { location: "https://login.test/" } }]);
+    await assert.rejects(make(moved.fetchImpl).listRuns(),
+      (e) => e instanceof TransportError && e.statusCode === 302);
+    assert.equal(moved.calls.length, 1);
+    assert.equal(moved.calls[0].init.redirect, "manual");
+  });
+
+  it("refuses a run id that is not one path segment, before sending", async () => {
+    const f = scripted([{ status: 200, body: "{}" }]);
+    const c = make(f.fetchImpl);
+    for (const runId of ["..", ".", "", "a/b", undefined, null, "a\\b"]) {
+      await assert.rejects(c.getHillclimbSecurity(runId), ContractError, String(runId));
+    }
+    assert.equal(f.calls.length, 0);
+    await c.getHillclimbSecurity(42);
+    assert.equal(f.calls[0].url, "https://x.test/api/v2/hillclimbs/42/security");
+  });
+
+  it("refuses an empty or relative baseUrl", () => {
+    for (const baseUrl of ["", "  ", "/api/v2", "ftp://x.test/api/v2"]) {
+      assert.throws(() => new CustomerApiClient({ apiKey: KEY, baseUrl, env: {} }),
+        ConfigurationError, JSON.stringify(baseUrl));
+    }
+  });
+
+  it("keeps a 422 validation list readable", async () => {
+    const f = scripted([{ status: 422, body: JSON.stringify({ detail: [
+      { loc: ["query", "limit"], msg: "Input should be a valid integer", type: "int_parsing" },
+      { loc: ["query", "offset"], msg: "must be >= 0" },
+    ] }) }]);
+    await assert.rejects(make(f.fetchImpl).listRuns({ limit: "x" }), (e) => {
+      assert.ok(e instanceof CustomerRefusal);
+      assert.equal(e.message,
+        "HTTP 422: query.limit: Input should be a valid integer; query.offset: must be >= 0");
+      return true;
+    });
   });
 });

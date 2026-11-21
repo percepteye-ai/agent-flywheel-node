@@ -10,12 +10,14 @@
  */
 import "./support/home.js";
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+
+import { pythonFile } from "./support/python-sdk.js";
 
 import {
   RESPONSE_FORMAT_ATTR, SCOPE_NAME, contentJson, newSpanId, newTraceId,
-  observationFromLines, renderTurnTrace, requestedOutputFormat,
+  observationFromLines, operationRecord, renderTurnTrace, requestedOutputFormat,
 } from "../src/genai-otlp.js";
 
 const GOLDEN_URL = new URL("./fixtures/genai-capture-golden.json", import.meta.url);
@@ -64,10 +66,7 @@ describe("the golden both SDKs render", () => {
   }
 
   it("is the Python authority's golden, byte for byte", () => {
-    const sibling = [
-      "../../agent-flywheel/tests/fixtures/genai_capture_golden.json",
-      "../../percepteye-agent-flywheel/tests/fixtures/genai_capture_golden.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("tests/fixtures/genai_capture_golden.json");
     if (!sibling) return;
     assert.ok(readFileSync(sibling).equals(GOLDEN_BYTES),
       "test/fixtures/genai-capture-golden.json is not the Python SDK's golden");
@@ -228,5 +227,63 @@ describe("the requested output format", () => {
       { response_format: ["x"] }]) {
       assert.equal(requestedOutputFormat(request), null);
     }
+  });
+});
+
+describe("values the wire cannot carry (ND-M18)", () => {
+  const base = () => clone(GOLDEN.vectors[0].observation);
+  const render = (obs) => renderTurnTrace(obs, { agentName: "a" });
+
+  it("content JSON is always a string, null for undefined", () => {
+    // Mutation: drop `?? "null"` -> contentJson(undefined) is undefined, red.
+    assert.equal(contentJson(undefined), "null");
+    assert.equal(contentJson(() => 1), "null");
+    const obs = base();
+    const tool = obs.operations.find((op) => op.operation === "execute_tool");
+    tool.arguments = undefined;
+    const span = spans(render(obs)).find((sp) => sp.name.startsWith("execute_tool"));
+    assert.deepStrictEqual(attrs(span)["gen_ai.tool.call.arguments"], { stringValue: "null" });
+  });
+
+  it("refuses a time past uint64", () => {
+    // Mutation: drop the UINT64_MAX bound -> the trace renders, red.
+    const obs = base();
+    obs.end_time_unix_nano = "18446744073709551616";
+    assert.equal(render(obs), null);
+    obs.end_time_unix_nano = "18446744073709551615";
+    assert.notEqual(render(obs), null);
+  });
+
+  it("never renders a span that ends before it starts", () => {
+    // Mutation: drop notBefore -> end < start on the chat span, red.
+    const obs = base();
+    const chat = obs.operations.find((op) => op.operation === "chat");
+    chat.end_time_unix_nano = String(BigInt(chat.start_time_unix_nano) - 5n);
+    for (const sp of spans(render(obs))) {
+      assert.ok(BigInt(sp.endTimeUnixNano) >= BigInt(sp.startTimeUnixNano), sp.name);
+    }
+  });
+
+  it("keeps only the Gemini MIME key that was read", () => {
+    // Mutation: keep every MIME spelling -> both keys survive, red.
+    assert.deepStrictEqual(
+      requestedOutputFormat({ response_mime_type: "application/json",
+        responseMimeType: "text/plain", responseSchema: { type: "OBJECT" } }),
+      { response_mime_type: "application/json", responseSchema: { type: "OBJECT" } });
+  });
+});
+
+describe("recorded model content is always valid JSON", () => {
+  it("writes a non-finite number as null, as the Python SDK now does", () => {
+    // The Python SDK's test_a_non_finite_number_is_written_as_null_never_as_
+    // invalid_json: json.dumps wrote NaN/Infinity, which no JSON parser reads.
+    // Pinned here so the two stay one rule.
+    const value = { score: NaN, up: [Infinity, 1.5], down: [-Infinity] };
+    for (const line of [contentJson(value), operationRecord({ result: value })]) {
+      assert.ok(!/NaN|Infinity/.test(line), line);
+      JSON.parse(line);
+    }
+    assert.deepEqual(JSON.parse(contentJson(value)),
+      { score: null, up: [null, 1.5], down: [null] });
   });
 });

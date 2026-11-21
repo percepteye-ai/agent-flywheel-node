@@ -34,13 +34,17 @@ import { register, PLUGIN_ID } from "../src/index.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "percepteye-cap-"));
 
+/** The context an OpenClaw agent hook carries for the host's default agent
+ * (`buildAgentHookContext`): what capture's scope gate reads. */
+const HOST = Object.freeze({ agentId: "main" });
+
 /** Build a turn on disk the way the hooks would. */
 function makeTurn(root, runId, { task, answer, calls, conversation, taskId } = {}) {
   const cap = createTurnCapture({ root });
   if (task !== undefined) {
     cap.onMessageReceived({
       runId, content: task, sessionKey: conversation, taskId,
-    });
+    }, HOST);
   }
   if (calls) {
     const dir = turnDir(root, runId);
@@ -52,7 +56,7 @@ function makeTurn(root, runId, { task, answer, calls, conversation, taskId } = {
   if (answer !== undefined) {
     cap.onAgentEnd({
       runId, taskId, messages: [{ role: "assistant", content: answer }],
-    });
+    }, HOST);
   }
   return turnDir(root, runId);
 }
@@ -85,8 +89,8 @@ describe("the on-disk format is the Python SDK's", () => {
     // that was actually returned.
     const root = tmp();
     const cap = createTurnCapture({ root });
-    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "first" }] });
-    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "final" }] });
+    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "first" }] }, HOST);
+    cap.onAgentEnd({ runId: "r", messages: [{ role: "assistant", content: "final" }] }, HOST);
     assert.equal(readTurnText(turnDir(root, "r")).answer, "final");
   });
 
@@ -95,14 +99,14 @@ describe("the on-disk format is the Python SDK's", () => {
     // claims, and only the second is true here.
     const root = tmp();
     const cap = createTurnCapture({ root });
-    assert.equal(cap.onMessageReceived({ runId: "r", content: "   " }), false);
+    assert.equal(cap.onMessageReceived({ runId: "r", content: "   " }, HOST), false);
     assert.equal(readTurnText(turnDir(root, "r")), null);
   });
 
   it("truncates at the same point as the other end", () => {
     const root = tmp();
     const cap = createTurnCapture({ root });
-    cap.onMessageReceived({ runId: "r", content: "x".repeat(MAX_TEXT_CHARS + 500) });
+    cap.onMessageReceived({ runId: "r", content: "x".repeat(MAX_TEXT_CHARS + 500) }, HOST);
     assert.equal(readTurnText(turnDir(root, "r")).task.length, MAX_TEXT_CHARS);
   });
 
@@ -117,18 +121,18 @@ describe("the on-disk format is the Python SDK's", () => {
       assert.throws(() => turnDir(root, hostile), /production identifier/);
     }
     const cap = createTurnCapture({ root });
-    cap.onMessageReceived({ runId: "../../escape", content: "hi" });
+    cap.onMessageReceived({ runId: "../../escape", content: "hi" }, HOST);
     cap.onAgentEnd({
       runId: "../../escape",
       messages: [{ role: "assistant", content: "done" }],
-    });
+    }, HOST);
     const names = readdirSync(root);
     assert.equal(names.length, 1, "one invalid host run split across two ids");
     assert.match(names[0], /^t_[0-9a-f]{16}$/);
     assert.equal(turnWire(join(root, names[0])).final_text, "done");
 
     const opaque = "顧客 run #1";
-    cap.onMessageReceived({ runId: opaque, content: "hello" });
+    cap.onMessageReceived({ runId: opaque, content: "hello" }, HOST);
     assert.equal(turnWire(turnDir(root, opaque)).turn_id, opaque);
   });
 
@@ -229,7 +233,7 @@ describe("the wire shape", () => {
     const cap = createTurnCapture({ root });
     assert.equal(cap.onMessageReceived({
       runId: "r-task-only", content: "", task_id: "CASE-9",
-    }), true);
+    }, HOST), true);
     assert.deepEqual(turnWire(turnDir(root, "r-task-only")), {
       turn_id: "r-task-only",
       input_text: null,
@@ -487,16 +491,21 @@ function hostApi({ allowConversationAccess = false } = {}) {
   };
 }
 
-/** Let a not-awaited cadence flush run to completion. */
-async function settle() {
-  for (let i = 0; i < 5; i += 1) {
-    await new Promise((r) => setImmediate(r));
+/** Let a not-awaited cadence flush run to completion: it yields to the
+ * event loop and reads the disk asynchronously, so give it real turns. */
+async function settle(until = null) {
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise((r) => setTimeout(r, 4));
+    if (until?.()) return;
   }
 }
 
-/** Backdate a turn directory past the settle window: it stopped changing. */
+/** Backdate a turn past the settle window: it stopped changing. Every file
+ * in it, not only the directory -- an append moves a file's mtime and not its
+ * directory's, so the settle window reads the newest file. */
 function age(dir) {
   const t = new Date(Date.now() - UNANSWERED_SETTLE_MS - 60_000);
+  for (const name of readdirSync(dir)) utimesSync(join(dir, name), t, t);
   utimesSync(dir, t, t);
   return dir;
 }
@@ -540,7 +549,7 @@ describe("the cadence hangs off a hook the host actually delivers", () => {
     for (let i = 0; i < FLUSH_EVERY; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi", sessionKey: "c" }, {});
     }
-    await settle();
+    await settle(() => tr.sent.length > 0);
     assert.deepEqual(tr.sent.map((t) => t.turn_id), ["earlier"],
       "FLUSH_EVERY user messages did not trigger an upload; the cadence is " +
       "still waiting on a hook this host does not deliver");
@@ -581,7 +590,7 @@ describe("the cadence hangs off a hook the host actually delivers", () => {
     for (let i = 0; i < FLUSH_EVERY; i += 1) {
       a.fire("message_received", { runId: `r${i}`, content: "hi" }, {});
     }
-    await settle();
+    await settle(() => tr.sent.length > 0);
     assert.deepEqual(tr.sent.map((t) => t.turn_id), ["quiet"],
       "the cadence fired but sent nothing: every turn is unanswered here");
     assert.equal(tr.sent[0].final_text, null);
@@ -802,6 +811,18 @@ describe("the agent is registered, so an operator has something to enable", () =
     });
   });
 
+  it("sends the declared api_spec beside the description, never in it", async () => {
+    const tr = fakeTransport();
+    await wireCapture(tmp(), hostApi(), tr, {
+      declaration: resolveDeclaration({
+        api_spec: " https://api.acme.example/openapi.json " }),
+    });
+    const wire = tr.registered[0];
+    assert.equal(wire.api_spec, "https://api.acme.example/openapi.json");
+    // A spec alone describes nothing: the description is the undeclared null.
+    assert.equal(wire.discovered_agent, null);
+  });
+
   it("keeps discovered_agent LAST, so an undeclared registration is the old bytes", async () => {
     const tr = fakeTransport();
     await wireCapture(tmp(), hostApi(), tr);
@@ -933,8 +954,8 @@ describe("the production lane is wired", () => {
       PERCEPTEYE_AGENT_MODE: "production", PERCEPTEYE_CAPTURE_DIR: root,
     }));
     const tool = a.hooks.find((h) => h.name === "after_tool_call").fn;
-    tool({ toolName: "lookup", params: { id: 1 }, runId: "runA", result: "ok" }, {});
-    tool({ toolName: "lookup", params: { id: 2 }, runId: "runB", result: "ok" }, {});
+    tool({ toolName: "lookup", params: { id: 1 }, runId: "runA", result: "ok" }, HOST);
+    tool({ toolName: "lookup", params: { id: 2 }, runId: "runB", result: "ok" }, HOST);
     assert.ok(existsSync(join(root, "runA", "tool_calls.jsonl")));
     assert.ok(existsSync(join(root, "runB", "tool_calls.jsonl")));
   });
@@ -1035,7 +1056,11 @@ describe("reading the answer", () => {
 describe("where capture lands", () => {
   it("honours an explicit dir above the default", () => {
     assert.equal(captureRoot({ PERCEPTEYE_CAPTURE_DIR: "/x" }), "/x");
-    assert.match(captureRoot({ PERCEPTEYE_HOME: "/h" }), /^\/h\/captured$/);
+    // Keyed by agent (`pathSegment`, the outbox's rule): two agents sharing
+    // one home never share one root. Mutation: drop the agent segment -> red.
+    assert.equal(captureRoot({ PERCEPTEYE_HOME: "/h" }, "acme"), join("/h", "captured", "acme"));
+    assert.notEqual(captureRoot({ PERCEPTEYE_HOME: "/h" }, "a"),
+                    captureRoot({ PERCEPTEYE_HOME: "/h" }, "b"));
   });
 
 

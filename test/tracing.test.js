@@ -15,9 +15,11 @@
 import { testEnv } from "./support/home.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { pythonRoot } from "./support/python-sdk.js";
 
 import {
   MAX_ATTRIBUTE_CHARS,
@@ -127,6 +129,9 @@ describe("turn spans", () => {
       const s = t.spans[0];
       assert.equal(s.name, "chat");
       assert.equal(s.attributes["gen_ai.operation.name"], "chat");
+      // PLAIN TEXT, as the Python SDK writes it: the control plane's reader
+      // rebuilds a conversation from the two half-spans of a turn only in this
+      // form (spec arrays refuse every answer half content_capture_off).
       assert.equal(s.attributes["gen_ai.input.messages"], "book me tuesday");
       assert.equal(s.attributes["gen_ai.output.messages"], "booked");
       assert.equal(s.attributes["gen_ai.request.model"], "gpt-x");
@@ -145,8 +150,51 @@ describe("turn spans", () => {
   it("bounds turn content", () => {
     withTracer((t) => {
       recordTurnSpan({ outputText: "y".repeat(MAX_TURN_CHARS + 5000) });
-      assert.equal(
-        t.spans[0].attributes["gen_ai.output.messages"].length, MAX_TURN_CHARS);
+      assert.equal(t.spans[0].attributes["gen_ai.output.messages"].length, MAX_TURN_CHARS);
+    });
+  });
+
+  it("bounds by code point and never splits a surrogate pair", () => {
+    // Mutation: slice on UTF-16 units -> a lone surrogate / half the text, red.
+    withTracer((t) => {
+      recordTurnSpan({ inputText: "😀".repeat(MAX_TURN_CHARS + 3) });
+      const content = t.spans[0].attributes["gen_ai.input.messages"];
+      assert.equal([...content].length, MAX_TURN_CHARS);
+      assert.ok(content.isWellFormed());
+      recordToolCallSpan("x", "😀".repeat(MAX_ATTRIBUTE_CHARS + 1) , { outcome: "ok" });
+      const args = t.spans[1].attributes["gen_ai.tool.call.arguments"];
+      assert.ok(args.isWellFormed());
+      assert.equal([...args.replace("...[truncated]", "")].length, MAX_ATTRIBUTE_CHARS);
+    });
+  });
+
+  it("redacts every Flywheel key from the text it carries", () => {
+    // Mutation: drop redactKeys from cut -> the key reaches the exporter, red.
+    const key = `pefw_${"A".repeat(43)}`;
+    withTracer((t) => {
+      recordTurnSpan({ inputText: `my key is ${key}`, outputText: `ok ${key}` });
+      recordToolCallSpan("read", { token: key }, {
+        outcome: "failed", error: `bad ${key}` });
+      for (const span of t.spans) {
+        for (const value of Object.values(span.attributes)) {
+          assert.ok(!String(value).includes(key), String(value));
+        }
+        assert.ok(!String(span.status?.message ?? "").includes(key));
+      }
+      assert.match(t.spans[0].attributes["gen_ai.input.messages"], /pefw_\[REDACTED\]/);
+    });
+  });
+
+  it("keeps an id or a text of 0 rather than dropping it as falsy", () => {
+    // Mutation: back to `value && String(value)` -> the attributes vanish, red.
+    withTracer((t) => {
+      recordTurnSpan({ inputText: 0, turnId: 0, conversationId: 0 });
+      recordToolCallSpan("x", null, { outcome: "ok", toolCallId: 0, taskId: 0 });
+      assert.equal(t.spans.length, 2);
+      assert.equal(t.spans[0].attributes["percepteye.turn.id"], "0");
+      assert.equal(t.spans[0].attributes["percepteye.conversation.id"], "0");
+      assert.equal(t.spans[1].attributes["gen_ai.tool.call.id"], "0");
+      assert.equal(t.spans[1].attributes["percepteye.task.id"], "0");
     });
   });
 });
@@ -163,14 +211,16 @@ describe("absence of the optional dependency", () => {
 });
 
 describe("parity with the Python SDK", () => {
-  const PY = "../../percepteye-agent-flywheel/src/agent_flywheel/tracing.py";
-
   it("uses the same span names and attribute keys", (t) => {
-    if (!existsSync(new URL(PY, import.meta.url))) {
+    // The one locator (`support/python-sdk.js`), not a sibling path of its
+    // own: that path skipped in every worktree even with
+    // PERCEPTEYE_PYTHON_SDK set.
+    if (!pythonRoot) {
       t.skip("python sdk checkout not present");
       return;
     }
-    const py = readFileSync(new URL(PY, import.meta.url), "utf8");
+    const py = readFileSync(
+      new URL("src/agent_flywheel/tracing.py", pythonRoot), "utf8");
     // Every key this package emits must appear in the Python module. A
     // customer swapping packages must not see their attribute names change.
     for (const key of [
@@ -234,8 +284,9 @@ describe("the projection is actually WIRED, not merely present", () => {
       assert.equal(t.spans.length, 2);
       // The ASK and the ANSWER land on the convention's two different keys —
       // that ordering is what the ingest reads back as a conversation.
-      assert.equal(t.spans[0].attributes["gen_ai.input.messages"], "book me tuesday");
-      assert.equal(t.spans[1].attributes["gen_ai.output.messages"], "booked");
+      const content = (span, key) => span.attributes[key];
+      assert.equal(content(t.spans[0], "gen_ai.input.messages"), "book me tuesday");
+      assert.equal(content(t.spans[1], "gen_ai.output.messages"), "booked");
       assert.equal(t.spans[0].attributes["percepteye.conversation.id"], "conv_1");
     } finally {
       __resetTracerForTests();
@@ -402,6 +453,7 @@ describe("the plugin wires the rollout driver to the recorder", () => {
       config: { plugins: { entries: {
         [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
       session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+      registerProvider: () => {},
       logger: { info() {}, warn() {} },
     };
     const t = fakeTracer();

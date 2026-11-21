@@ -7,12 +7,15 @@
  */
 import "./support/home.js";
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+
+import { pythonFile } from "./support/python-sdk.js";
 import {
   CONTRACT_VERSION, ContractError, RULEBOOK_RECEIPT_KEYS,
   RULEBOOK_RECEIPT_STATUSES, WIRE_KEYS, rolloutOutputToWire,
-  rolloutRequestFromWire, rulebookRequestToWire,
+  rolloutRequestFromWire, rulebookRequestToWire, productionOutcome,
+  turnFeedback, productionIdentifier, productionTurnIdentifier,
 } from "../src/wire.js";
 
 const schema = JSON.parse(
@@ -37,12 +40,7 @@ describe("the vendored schema IS the contract", () => {
   });
 
   it("matches the Python authority for both production-turn definitions", () => {
-    // The Python checkout beside this one: `agent-flywheel` is what a clone
-    // of the repo is called, the prefixed name what older checkouts carry.
-    const sibling = [
-      "../../agent-flywheel/schema/flywheel-1.json",
-      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("schema/flywheel-1.json");
     assert.ok(schema.$defs.ProductionTurn);
     assert.ok(schema.$defs.ProductionTurnBatch);
     if (!sibling) return;
@@ -60,10 +58,7 @@ describe("the vendored schema IS the contract", () => {
     // The two SDKs ship in unison: one contract file, vendored twice. Equal
     // definitions in a different order or spelling are already two files a
     // reviewer has to diff by hand, so the bytes are what is held equal.
-    const sibling = [
-      "../../agent-flywheel/schema/flywheel-1.json",
-      "../../percepteye-agent-flywheel/schema/flywheel-1.json",
-    ].map((rel) => new URL(rel, import.meta.url)).find(existsSync);
+    const sibling = pythonFile("schema/flywheel-1.json");
     if (!sibling) return;
     assert.equal(
       readFileSync(new URL("../schema/flywheel-1.json", import.meta.url), "utf8"),
@@ -140,6 +135,27 @@ describe("an unknown outcome asserts nothing", () => {
     assert.equal("body" in wire.tool_calls[0], false);
   });
 
+  it("scrubs a status out of an unknown call's output, as contract.py _scrub_status does", () => {
+    const wire = rolloutOutputToWire({
+      finalText: "x",
+      toolCalls: [
+        { name: "a", outcome: "unknown", status_code: null,
+          output: { status: 200, statusCode: 201, ok: "HTTP 200 OK", nested: [{ code: 7, note: "n" }] } },
+        { name: "b", outcome: "unknown", status_code: null, output: "got HTTP 404 back" },
+        { name: "c", outcome: "unknown", status_code: null,
+          output: JSON.stringify({ http_status: 500, msg: "fine" }) },
+        { name: "d", outcome: "ok", status_code: null, output: { status: 200 } },
+      ],
+    });
+    // The string value is scrubbed as every string is, and no longer trimmed
+    // as a side effect (changed with the Python SDK's PY-H13: it was "OK").
+    assert.deepEqual(wire.tool_calls[0].output, { ok: " OK", nested: [{ note: "n" }] });
+    assert.equal(wire.tool_calls[1].output, "got  back");
+    assert.deepEqual(JSON.parse(wire.tool_calls[2].output), { msg: "fine" });
+    // An OBSERVED outcome's output is evidence and is left exactly as it was.
+    assert.deepEqual(wire.tool_calls[3].output, { status: 200 });
+  });
+
   it("leaves a known outcome's status_code alone", () => {
     const wire = rolloutOutputToWire({
       finalText: "x",
@@ -184,14 +200,18 @@ describe("the closed key set", () => {
 });
 
 describe("reading a claimed rollout", () => {
+  /** Every field `RolloutRequest.from_wire` requires, plus `extra`. */
+  const claimed = (extra = {}) => ({
+    rollout_id: "r1", turn_input: "do it", llm_url: "https://gw/v1",
+    api_key: "rk", artifacts_dir: "rollouts/r1", deadline_ts: 123.5, ...extra,
+  });
+
   it("keeps the server's field names", () => {
-    const r = rolloutRequestFromWire({
-      rollout_id: "r1", turn_input: "do it", llm_url: "https://gw/v1",
-      deadline_ts: 123.5, lease_token: "lt",
-    });
+    const r = rolloutRequestFromWire(claimed({ lease_token: "lt" }));
     assert.equal(r.rolloutId, "r1");
     assert.equal(r.turnInput, "do it");
     assert.equal(r.llmUrl, "https://gw/v1");
+    assert.equal(r.apiKey, "rk");
     assert.equal(r.deadlineTs, 123.5);
     assert.equal(r.leaseToken, "lt");
   });
@@ -200,28 +220,215 @@ describe("reading a claimed rollout", () => {
     assert.throws(() => rolloutRequestFromWire({ turn_input: "x" }), ContractError);
   });
 
+  it("refuses a payload missing any field the Python SDK requires, naming it", () => {
+    // A rollout with no llm_url/api_key has no gateway to sample through, so
+    // it could only ever run on the host's own model -- not the checkpoint
+    // being trained. contract.py RolloutRequest.from_wire refuses it too.
+    for (const key of [
+      "rollout_id", "turn_input", "llm_url", "api_key", "artifacts_dir", "deadline_ts",
+    ]) {
+      const raw = claimed();
+      delete raw[key];
+      assert.throws(
+        () => rolloutRequestFromWire(raw),
+        new RegExp(`missing required field\\(s\\): \\['${key}'\\]`),
+      );
+    }
+  });
+
+  it("refuses an 'environment' key, as contract.py does", () => {
+    assert.throws(
+      () => rolloutRequestFromWire(claimed({ environment: { A: "1" } })),
+      /carries an 'environment' key/,
+    );
+  });
+
+  it("refuses a rollout id that is not one path segment, by its cause", () => {
+    for (const [id, cause] of [
+      ["", /must not be empty/], [".", /dot segment/], ["..", /dot segment/],
+      ["a/b", /path separator/], ["a\\b", /path separator/],
+      ["a\nb", /control character/], ["a\u0085b", /control character/],
+      ["\ud800", /well-formed/], ["x".repeat(257), /at most 256 characters, got 257/],
+      [7, /must be a string, got number/],
+    ]) {
+      assert.throws(() => rolloutRequestFromWire(claimed({ rollout_id: id })), cause);
+    }
+    assert.equal(
+      rolloutRequestFromWire(claimed({ rollout_id: "😀".repeat(256) })).rolloutId,
+      "😀".repeat(256),
+    );
+  });
+
   it("keeps the granted lease clock and metadata for the worker", () => {
-    const request = rolloutRequestFromWire({
-      rollout_id: "r1",
-      turn_input: "do it",
+    const request = rolloutRequestFromWire(claimed({
       deadline_ts: 999,
       lease_token: "lease-1",
       lease_expires_ts: 123.5,
       metadata: { suite: "held-out" },
-    });
+    }));
     assert.equal(request.leaseExpiresTs, 123.5);
     assert.deepEqual(request.metadata, { suite: "held-out" });
   });
 
   it("names the task the rollout was claimed for (Python: current_task_id)", () => {
-    const named = rolloutRequestFromWire({
-      rollout_id: "r1", metadata: { task_id: "banking_knowledge:task_017" },
-    });
+    const named = rolloutRequestFromWire(
+      claimed({ metadata: { task_id: "banking_knowledge:task_017" } }),
+    );
     assert.equal(named.taskId, "banking_knowledge:task_017");
-    assert.equal(rolloutRequestFromWire({ rollout_id: "r1" }).taskId, null);
+    assert.equal(rolloutRequestFromWire(claimed()).taskId, null);
     assert.equal(
-      rolloutRequestFromWire({ rollout_id: "r1", metadata: { task_id: "a\nb" } }).taskId,
+      rolloutRequestFromWire(claimed({ metadata: { task_id: "a\nb" } })).taskId,
       null,
     );
+    // The control plane's printable rule, not only the shared grammar.
+    assert.equal(
+      rolloutRequestFromWire(claimed({ metadata: { task_id: "case\u200b1" } })).taskId,
+      null,
+    );
+  });
+});
+
+describe("checks, termination and seeds", () => {
+  it("reach the wire in the schema's words", async () => {
+    const {
+      CHECK_ESTABLISHES, CHECK_STATUSES, MAX_REPORTED_CHECKS, TERMINATION_CLASSES,
+    } = await import("../src/wire.js");
+    const wire = rolloutOutputToWire({
+      finalText: "x",
+      checks: [
+        { id: "db_state", status: "measured", value: 1, required: true,
+          establishes: "state_reached" },
+        { id: "judge", status: "unavailable" },
+      ],
+      termination: { class: "turn_limit", detail: "40 turns" },
+      seeds: { environment: 7, sampling: "s-3" },
+    });
+    assert.deepEqual(wire.checks, [
+      { id: "db_state", status: "measured", value: 1, required: true,
+        establishes: "state_reached" },
+      { id: "judge", status: "unavailable" },
+    ]);
+    assert.deepEqual(wire.termination, { class: "turn_limit", detail: "40 turns" });
+    assert.deepEqual(wire.seeds, { environment: 7, sampling: "s-3" });
+
+    const defs = schema.$defs;
+    assert.deepEqual(defs.ReportedCheck.properties.status.enum, [...CHECK_STATUSES]);
+    assert.deepEqual(
+      defs.ReportedCheck.properties.establishes.enum.filter((e) => e !== null),
+      [...CHECK_ESTABLISHES],
+    );
+    assert.deepEqual(defs.ReportedTermination.properties.class.enum, [...TERMINATION_CLASSES]);
+    assert.equal(defs.RolloutOutput.properties.checks.maxItems, MAX_REPORTED_CHECKS);
+  });
+
+  it("an agent that states none of them sends none of them", () => {
+    const wire = rolloutOutputToWire({ finalText: "x", checks: [], seeds: {} });
+    for (const key of ["checks", "termination", "seeds"]) {
+      assert.equal(key in wire, false);
+    }
+  });
+
+  for (const [output, named] of [
+    [{ checks: [{ id: "a", status: "passed" }] }, /checks\[0\]\.status/],
+    [{ checks: [{ id: "", status: "measured" }] }, /checks\[0\]\.id/],
+    [{ checks: [{ id: "a", status: "error", value: 0 }] }, /only a measured check has a value/],
+    [{ checks: [{ id: "a", status: "measured", value: true }] }, /checks\[0\]\.value/],
+    [{ checks: [{ id: "a", status: "measured", value: NaN }] }, /checks\[0\]\.value/],
+    [{ checks: [{ id: "a", status: "measured", establishes: "won" }] }, /checks\[0\]\.establishes/],
+    [{ checks: [{ id: "a", status: "measured", source: "human_label" }] }, /unknown key/],
+    [{ termination: { class: "gave_up" } }, /termination\.class/],
+    [{ termination: { class: "time_limit", corroborated_by: "mission_control_gateway" } }, /unknown key/],
+    [{ termination: { class: "time_limit", attributed_to: "platform" } }, /unknown key/],
+    [{ seeds: { environment: 1.5 } }, /seeds\.environment/],
+    [{ seeds: { sampling: true } }, /seeds\.sampling/],
+    [{ seeds: { environment: 2 ** 53 } }, /seeds\.environment/],
+    [{ seeds: { environment: NaN } }, /seeds\.environment/],
+    [{ seeds: { sampling: "s".repeat(129) } }, /seeds\.sampling/],
+    [{ seeds: { sampling: "" } }, /seeds\.sampling/],
+  ]) {
+    it(`refuses ${JSON.stringify(output).slice(0, 70)} by name`, () => {
+      assert.throws(
+        () => rolloutOutputToWire({ finalText: "x", ...output }),
+        (err) => err instanceof ContractError && named.test(err.message),
+      );
+    });
+  }
+
+  const rows = (n) => Array.from({ length: n }, (_, i) => (
+    { id: String(i), status: "measured", value: i }));
+
+  it("keeps the first checks a report carries and says how many it left", async () => {
+    // One check too many used to refuse the list whole, so the episode lost
+    // every check it ran. The first MAX_REPORTED_CHECKS are sent and the
+    // report states the rest as `checks_dropped`, the field the stored
+    // episode keeps. Mirrors `test_contract.py`.
+    const { MAX_REPORTED_CHECKS } = await import("../src/wire.js");
+    const checks = rows(MAX_REPORTED_CHECKS + 3);
+    const wire = rolloutOutputToWire({ finalText: "x", checks });
+    assert.deepEqual(wire.checks.map((r) => r.id),
+      checks.slice(0, MAX_REPORTED_CHECKS).map((r) => r.id));
+    assert.equal(wire.checks_dropped, 3);
+    // A count the output already carries is added to, never replaced.
+    assert.equal(
+      rolloutOutputToWire({ finalText: "x", checks, checksDropped: 4 }).checks_dropped, 7);
+    const declared = schema.$defs.RolloutOutput.properties.checks_dropped;
+    assert.deepEqual([declared.type, declared.minimum], ["integer", 1]);
+  });
+
+  for (const dropped of [0, -1, true, "3", null, 1.5]) {
+    it(`a report with nothing dropped does not say so (${JSON.stringify(dropped)})`, () => {
+      const wire = rolloutOutputToWire({
+        finalText: "x", checks: [{ id: "a", status: "measured" }],
+        checksDropped: dropped,
+      });
+      assert.equal("checks_dropped" in wire, false);
+    });
+  }
+
+  it("does not read a row past the limit", async () => {
+    const { MAX_REPORTED_CHECKS, checksOverLimit, checksToWire } =
+      await import("../src/wire.js");
+    const checks = [...rows(MAX_REPORTED_CHECKS), { id: "", status: "?" }];
+    assert.equal(checksToWire(checks).length, MAX_REPORTED_CHECKS);
+    assert.equal(checksOverLimit(checks), 1);
+    assert.equal(checksOverLimit(null), 0);
+    assert.equal(checksOverLimit(checks.slice(0, 5)), 0);
+  });
+
+  it("sends the largest integer seed a JSON number carries exactly", async () => {
+    const { seedsToWire } = await import("../src/wire.js");
+    assert.deepEqual(
+      seedsToWire({ environment: Number.MAX_SAFE_INTEGER, sampling: -3 }),
+      { environment: Number.MAX_SAFE_INTEGER, sampling: -3 });
+  });
+});
+
+describe("text the control plane's parser takes", () => {
+  // A LONE SURROGATE is escaped by JSON.stringify and refused by the control
+  // plane's parser: a 422 for the batch, then a record dropped by the split.
+  const lone = "case-\ud800";
+  const emoji = "case-\u{1F600}";
+  const at = "2026-11-10T09:00:00Z";
+  const outcome = { outcome_id: "o-1", outcome: "resolved", episode_id: "e-1", occurred_at: at };
+  const feedback = { feedback_id: "f-1", signal: "accepted", episode_id: "e-1", turn_index: 0, occurred_at: at };
+
+  it("refuses an id with a lone surrogate, and keeps an emoji", () => {
+    for (const check of [productionIdentifier, productionTurnIdentifier]) {
+      assert.equal(check(lone), null);
+      assert.equal(check(emoji), emoji);
+    }
+    for (const field of ["outcome_id", "turn_id", "conversation_id", "episode_id"]) {
+      assert.throws(() => productionOutcome({ ...outcome, [field]: lone }), ContractError, field);
+      assert.equal(productionOutcome({ ...outcome, [field]: emoji })[field], emoji);
+    }
+    for (const field of ["feedback_id", "episode_id"]) {
+      assert.throws(() => turnFeedback({ ...feedback, [field]: lone }), ContractError, field);
+    }
+  });
+
+  it("refuses a note with a lone surrogate", () => {
+    assert.throws(() => productionOutcome({ ...outcome, note: `x${lone}` }),
+      /note must be well-formed Unicode text/);
+    assert.equal(productionOutcome({ ...outcome, note: emoji }).note, emoji);
   });
 });

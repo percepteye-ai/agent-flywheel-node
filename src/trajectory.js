@@ -15,16 +15,36 @@
  *
  * Zero dependencies, `node:fs` only. This runs inside someone else's agent.
  */
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+
+import { parseJsonWithConstants, reportedOutcome, toolCallToWire } from "./wire.js";
 
 export const TRAJECTORY_DIR_ENV = "PERCEPTEYE_TRAJECTORY_DIR";
 export const TOOL_CALLS_FILENAME = "tool_calls.jsonl";
+/** Where an agent's own environment states its grade: `runner.py OUTCOME_FILENAME`. */
+export const OUTCOME_FILENAME = "outcome.json";
 
 /** Keys the contract accepts, in the order `to_wire()` emits them. */
 const OPTIONAL_KEYS = [
   "output", "error", "error_class", "latency_ms", "agent_name", "tool_call_id",
 ];
+
+/**
+ * A tool call's arguments as the contract's OBJECT, the way the Python SDK's
+ * `record_tool_call` builds them (`dict(arguments or {})`): an object as
+ * given; an array of `[key, value]` pairs as the object those pairs make;
+ * anything else -- another array, a string, nothing -- as `{}`. An array went
+ * onto the wire as an array before, which the intake refuses as a turn.
+ */
+export function argumentsObject(args) {
+  if (Array.isArray(args)) {
+    const pairs = args.every((p) => Array.isArray(p) && p.length === 2
+      && typeof p[0] === "string");
+    return pairs ? Object.fromEntries(args) : {};
+  }
+  return args && typeof args === "object" ? args : {};
+}
 
 /**
  * One record, shaped to match `ToolCallOutcome.to_wire()` exactly.
@@ -38,7 +58,7 @@ export function toWire({ name, args, outcome, status_code = null, entity_ids,
                          ...rest }) {
   const d = {
     name,
-    arguments: args && typeof args === "object" ? args : {},
+    arguments: argumentsObject(args),
     outcome,
     status_code: status_code ?? null,
   };
@@ -138,12 +158,44 @@ export function readTrajectory(dir) {
       const row = JSON.parse(line);
       // The reader the Python end uses builds each row with REQUIRED
       // subscripts and counts anything else as malformed. Mirror that: a row
-      // missing either field is not a tool call, it is corruption.
-      if (row && typeof row === "object" && row.name && row.outcome) calls.push(row);
-      else malformed += 1;
+      // missing either field is not a tool call, it is corruption -- and so
+      // is one the contract refuses (`toolCallToWire`: Python's
+      // `ToolCallOutcome`), which also scrubs an `unknown` call's status.
+      if (row && typeof row === "object" && row.name && row.outcome) {
+        calls.push(toolCallToWire(row));
+      } else {
+        malformed += 1;
+      }
     } catch {
       malformed += 1;
     }
   }
   return { calls, malformed };
+}
+
+/**
+ * Read AND REMOVE `<dir>/outcome.json`: what the agent's own environment
+ * stated about the episode that just ran, as `wire.js reportedOutcome` reads
+ * it. `{}` when there is no directory, no file, or nothing well-formed in it.
+ *
+ * REMOVED ONCE READ, because the rollout driver has one trajectory directory
+ * for the process and not one per rollout (the Python runner makes a fresh
+ * directory each time): a file left behind would grade the next episode with
+ * this one's reward. Never throws.
+ */
+export function takeReportedOutcome(dir) {
+  if (!dir) return {};
+  const path = join(dir, OUTCOME_FILENAME);
+  let data = null;
+  try {
+    data = parseJsonWithConstants(readFileSync(path, "utf8"));
+  } catch {
+    /* absent, unreadable or not JSON: the episode stated nothing */
+  }
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* a file we cannot remove is read again; nothing here can fix that */
+  }
+  return reportedOutcome(data);
 }

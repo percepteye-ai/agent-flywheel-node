@@ -75,6 +75,13 @@
  *   so it cannot be detected after the fact and is read from `api.config`
  *   instead, using the host's own predicate.
  *
+ * `subagent_spawned`           AVAILABLE, not conversation-gated. Its context
+ *   names `requesterSessionKey` and `childSessionKey` -- the only place a
+ *   subagent's parent is named at all (its session key is
+ *   `agent:<id>:subagent:<uuid>`, openclaw-tools-KulZ1cdH.js:11227) -- and it
+ *   fires after the subagent's run was started (:11619). Used to hold a
+ *   rollout that spawned one out of training (`onSubagentSpawned`).
+ *
  * llm_input / llm_output are available, but they bracket a host attempt
  * rather than each provider invocation and carry no call id. Tool loops,
  * retries, and compaction can issue several provider calls inside one
@@ -107,17 +114,32 @@
  *             which is why `unattended.js` has no transport of its own.
  */
 import { GET_A_KEY } from "./config.js";
-import { applyDeclaration } from "./declaration.js";
+import {
+  applyDeclaration,
+  declarationRegistrationFields,
+} from "./declaration.js";
 import { FRAMEWORK } from "./describe.js";
 import { ConfigurationError, LeaseLost } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import { conversationAccessGranted, lastAssistantText } from "./host.js";
 import { SDK_UA } from "./http.js";
 import { createModelCallCounter } from "./model-calls.js";
-import { createOutbox, outboxDir } from "./outbox.js";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { createOutbox, outboxDir, pathSegment } from "./outbox.js";
+import { isSubagentSessionKey } from "./scope.js";
+import { percepteyeHome } from "./session.js";
 import { declareRulebook, rulesNeverSent } from "./transport.js";
+import {
+  readTrajectory, takeReportedOutcome, TOOL_CALLS_FILENAME, TRAJECTORY_DIR_ENV,
+} from "./trajectory.js";
 import { createUnattendedRunner, cronTurnStarter } from "./unattended.js";
 import { CONTRACT_VERSION } from "./wire.js";
+import {
+  PROVIDER_ID, PROVIDER_TRANSPORT_API, registerFlywheelProvider,
+  subscribeModelResolve,
+} from "./policy.js";
 
 export const SESSION_START = "session_start";
 export const SESSION_END = "session_end";
@@ -126,9 +148,59 @@ export const BEFORE_AGENT_RUN = "before_agent_run";
 export const BEFORE_TOOL_CALL = "before_tool_call";
 export const GATEWAY_START = "gateway_start";
 export const GATEWAY_STOP = "gateway_stop";
+export const SUBAGENT_SPAWNED = "subagent_spawned";
 
 /** The host's own ceilings, so an oversized task is refused, not dropped. */
 export const MAX_INJECTION_BYTES = 32 * 1024;
+
+/**
+ * The model a rollout asks its gateway for. SYMBOLIC, as Mission Control's
+ * per-rollout gateway documents it (`inference.py`): the agent must not know
+ * or choose which model is under training, and the gateway replaces this
+ * with the checkpoint the rollout was minted for.
+ */
+export const ROLLOUT_MODEL = "policy";
+
+/**
+ * A lease the control plane states within this many seconds of the rollout's
+ * deadline is AT the deadline, which caps it: the two are serialized
+ * separately, and a beat a second early buys nothing either way. The Python
+ * runner's `_LEASE_AT_DEADLINE_SLACK_S`.
+ */
+const LEASE_AT_DEADLINE_SLACK_S = 1;
+
+/**
+ * How long before a rollout's deadline it is stopped and reported: the
+ * Python runner's `REPORT_MARGIN_S` floor. A rollout run up to its deadline
+ * exactly has no time left to report into a lease the server has not yet
+ * swept.
+ */
+export const REPORT_MARGIN_MS = 10_000;
+
+/** The first wait before a TRANSIENT registration failure is retried. */
+export const REGISTRATION_RETRY_BASE_MS = 5_000;
+/** The longest wait between registration retries. */
+export const REGISTRATION_RETRY_MAX_MS = 300_000;
+
+/**
+ * Whether a registration failure is TRANSIENT -- worth asking again later:
+ * no answer at all (`statusCode` null: a network error, a timeout), a 5xx,
+ * or a 429. A 4xx is the control plane's refusal and a ConfigurationError is
+ * this install's (no compatible contract, a transport without the method);
+ * neither changes by asking again.
+ */
+export function registrationFailureIsTransient(err) {
+  if (err instanceof ConfigurationError || err?.name === "ConfigurationError") {
+    return false;
+  }
+  if (err?.name !== "TransportError" && err?.name !== "LeaseLost") return false;
+  const status = err?.statusCode ?? null;
+  return status === null || status >= 500 || status === 429;
+}
+
+/** Where a rollout's credential comes from, said one way. */
+export const ROLLOUT_KEY_ORIGIN =
+  "the rollout's own key for its per-rollout gateway (the claim's api_key)";
 
 /**
  * Everything that must be true before this install claims work.
@@ -171,6 +243,20 @@ export function driveVerdict(config, api, pluginId) {
   return { canDrive: true, reason: null };
 }
 
+/**
+ * Where one claimed rollout's tool calls are recorded:
+ * `$PERCEPTEYE_HOME/trajectories/<agentId>/<rolloutId>/`, beside the outbox
+ * and keyed the same way. ONE DIRECTORY PER ROLLOUT, as the Python runner
+ * gives each rollout its own (`_trajectory_dir`): a process-wide directory
+ * would hand one rollout every call the process ever made.
+ */
+export function rolloutTrajectoryDir(agentId, rolloutId, env = process.env) {
+  return join(
+    percepteyeHome(env), "trajectories", pathSegment(agentId ?? "agent"),
+    pathSegment(rolloutId),
+  );
+}
+
 /** The task, as the agent will read it. */
 export function taskText(rollout) {
   return (
@@ -199,6 +285,14 @@ export function createRolloutDriver({
   now = () => Date.now(),
   env = process.env,
   outbox = null,
+  // Whether this host's tool recorder writes a rollout's calls where
+  // `trajectoryDirFor` says (index.js wires it). Only then are they read
+  // back and reported: a driver with no recorder behind it cannot claim to
+  // have observed zero calls.
+  recordsToolCalls = false,
+  // How many rollouts this worker runs at once, across BOTH lanes: what
+  // registration declares (`concurrency`). See `reserve`.
+  concurrency = 1,
 }) {
   if (!transport) throw new ConfigurationError("a transport is required");
   if (typeof enqueue !== "function") {
@@ -229,6 +323,13 @@ export function createRolloutDriver({
 
   /** sessionKey -> the rollout this session is running. */
   const inFlight = new Map();
+  /**
+   * subagent sessionKey -> the rollout session it descends from, as the
+   * host's `subagent_spawned` names it (`onSubagentSpawned`). Bounded.
+   */
+  const subagentOf = new Map();
+  /** Rollouts already said to have spawned a subagent: said once each. */
+  const subagentSaid = new WeakSet();
   /** sessionKey -> fixed-cadence lease renewal for its current rollout. */
   const heartbeats = new Map();
   /** sessionKey -> host run id (or null), once the injected turn starts. */
@@ -262,7 +363,107 @@ export function createRolloutDriver({
    * first left to lapse.
    */
   const claiming = new Set();
+  /**
+   * Sessions that ENDED while a claim for them was in flight. The claim
+   * checks after its await: a session that ended in between (the long poll
+   * can take a while) gets no rollout -- the claimed one goes straight back.
+   * Kept only while that claim is, so it is bounded by `claiming`.
+   */
+  const endedWhileClaiming = new Set();
+  /** Claims in flight in either lane, counted against `concurrency`. */
+  let reserved = 0;
+
+  /**
+   * THE ONE CONCURRENCY GATE. Both lanes take a slot before they claim and
+   * give it back once the claim has settled -- by then a claimed rollout is
+   * in `inFlight`, which holds its place. Each lane used to check only its
+   * own work, so the attended lane and the unattended runner could hold two
+   * rollouts at once on a worker registered with `concurrency: 1`.
+   */
+  function reserve() {
+    if (inFlight.size + reserved >= concurrency) return false;
+    reserved += 1;
+    return true;
+  }
+  function release() {
+    if (reserved > 0) reserved -= 1;
+  }
+  /** sessionKey -> the timer that stops its rollout at `deadlineTs`. */
+  const deadlines = new Map();
   let warnedMissingModelCallCount = false;
+
+  /** Whether the server's deadline for `rollout` has already passed. */
+  const pastDeadline = (rollout) => Number.isFinite(rollout?.deadlineTs)
+    && rollout.deadlineTs > 0 && rollout.deadlineTs * 1000 <= now();
+
+  function clearDeadline(sessionKey) {
+    const timer = deadlines.get(sessionKey);
+    if (timer === undefined) return;
+    deadlines.delete(sessionKey);
+    try { heartbeatCanceller(timer); } catch { /* a timer that is gone */ }
+  }
+
+  // ── WHERE A ROLLOUT SAMPLES ────────────────────────────────────────────
+  //
+  // THROUGH ITS OWN GATEWAY, `rollout.llmUrl` with `rollout.apiKey`, and
+  // nowhere else. Those calls are the policy being trained, and the gateway
+  // is where Mission Control captures them; the Python SDK points a rollout
+  // there with OPENAI_BASE_URL. This lane parsed both fields and read neither,
+  // so every OpenClaw rollout ran on the host's configured model and was
+  // scored as the checkpoint's.
+  //
+  // The mechanism is production's, not a second one: `before_model_resolve`
+  // names the provider this plugin registers (`policy.js
+  // registerFlywheelProvider`), and its transport and credential seams answer
+  // with the routed rollout's address and key. The host's provider contexts
+  // carry no session, so they answer for the rollout the model hook last
+  // routed -- one at a time, which the shared claim gate guarantees -- and
+  // only while it is still in flight: when it ends, a later call through the
+  // provider finds no address, and the session's next turn is not routed.
+  let routed = null;
+  const live = (rollout) => {
+    if (!rollout) return false;
+    for (const held of inFlight.values()) if (held === rollout) return true;
+    return false;
+  };
+  /** This rollout's own trajectory directory, or null without a recorder. */
+  const trajectoryOf = (rollout) => (recordsToolCalls && rollout?.rolloutId
+    ? rolloutTrajectoryDir(transport?.agentId, rollout.rolloutId, env)
+    : null);
+  /** Remove a rollout's trajectory once its calls are reported or moot. */
+  const dropTrajectory = (rollout) => {
+    const dir = trajectoryOf(rollout);
+    if (!dir) return;
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* disk */ }
+  };
+
+  const route = {
+    /**
+     * `before_model_resolve`: our provider for a session running a rollout --
+     * that session only. A subagent the rollout spawns is not routed: its
+     * parent cannot be known before its first model call, so the rollout is
+     * held out of training instead (`onSubagentSpawned`).
+     */
+    handleModelResolve(_event, ctx) {
+      const sessionKey = ctx?.sessionKey ?? ctx?.sessionId;
+      const rollout = sessionKey ? inFlight.get(sessionKey) : null;
+      if (!rollout?.llmUrl) return undefined;
+      routed = rollout;
+      return { providerOverride: PROVIDER_ID, modelOverride: ROLLOUT_MODEL };
+    },
+    /** The provider's address: the routed rollout's gateway, verbatim. */
+    normalizeTransport(ctx) {
+      if (ctx?.provider !== PROVIDER_ID || !live(routed)) return undefined;
+      return { api: PROVIDER_TRANSPORT_API, baseUrl: routed.llmUrl };
+    },
+    /** The provider's credential: the routed rollout's own key. */
+    resolveSyntheticAuth(ctx) {
+      if (ctx?.provider !== PROVIDER_ID || !live(routed) || !routed.apiKey) {
+        return undefined;
+      }
+      return { apiKey: routed.apiKey, source: ROLLOUT_KEY_ORIGIN, mode: "api-key" };
+    },
+  };
 
   function stopHeartbeat(sessionKey) {
     const state = heartbeats.get(sessionKey);
@@ -317,7 +518,7 @@ export function createRolloutDriver({
         // one outcome that has to be SAID rather than discovered from a
         // requeued rollout twenty minutes later.
         state.stopped = true;
-        heartbeats.delete(sessionKey);
+        if (heartbeats.get(sessionKey) === state) heartbeats.delete(sessionKey);
         note(
           `[agent-flywheel] rollout ${rollout.rolloutId}'s lease can no longer ` +
           `be renewed because its heartbeat could not be scheduled ` +
@@ -326,10 +527,26 @@ export function createRolloutDriver({
         );
       }
     };
-    /** The lease is gone. Returns nothing; sets `state.stopped`. */
+    /**
+     * The lease is gone. Returns nothing; sets `state.stopped`.
+     *
+     * ONLY FOR THE STATE STILL IN FORCE. A heartbeat's answer can arrive
+     * after its rollout was reported and the session moved on -- to an
+     * ordinary turn, or to the NEXT rollout -- and a late 410 used to act on
+     * whatever the session held by then: it added the session to
+     * `blockNextRun` (the next ordinary turn was refused as
+     * `percepteye_lease_lost`), deleted the successor's heartbeat without
+     * clearing its timer, wiped its model-call count, fenced its tools and
+     * cancelled its run. A state that is no longer the session's touches
+     * nothing.
+     */
     const onLeaseLost = async () => {
+      const current = heartbeats.get(sessionKey) === state;
       state.stopped = true;
+      if (!current) return;
       heartbeats.delete(sessionKey);
+      if (state.timer !== null) heartbeatCanceller(state.timer);
+      state.timer = null;
       if (reporting.get(sessionKey) === rollout) {
         // The terminal result request races this heartbeat. It owns the
         // authoritative outcome now; a 410 here can simply mean that the
@@ -337,7 +554,11 @@ export function createRolloutDriver({
         // already over, so there is nothing to cancel or fence.
         return;
       }
-      if (inFlight.get(sessionKey) === rollout) inFlight.delete(sessionKey);
+      if (inFlight.get(sessionKey) === rollout) {
+        inFlight.delete(sessionKey);
+        clearDeadline(sessionKey);
+      }
+      dropTrajectory(rollout);
       try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
       const runStarted = activeRuns.has(sessionKey);
       const runId = activeRuns.get(sessionKey) ?? undefined;
@@ -392,14 +613,33 @@ export function createRolloutDriver({
      *
      * So: a beat that fails is treated exactly like a transient failure --
      * the next beat is already due, and a beat that raises is not evidence the
-     * lease is gone. Only a LeaseLost stops the chain.
+     * lease is gone. Only a LeaseLost stops the chain -- or a lease the
+     * control plane states at the rollout's deadline, which no beat can extend.
      */
     const beat = async () => {
       if (state.stopped) return;
       state.timer = null;
       try {
-        await transport.heartbeat(rollout);
+        const answer = await transport.heartbeat(rollout);
+        // THE LEASE IS AT THE DEADLINE: no beat can carry it further. The
+        // control plane caps a lease at the rollout's `deadline_at`, and the
+        // only other answer a beat gets, lease_lost, needs a lease that
+        // lapsed, which cannot happen before the deadline -- by which time
+        // the deadline timer has stopped the rollout. Beating on was a POST
+        // per interval for nothing, in every tenant. The chain ends here; the
+        // state stays until the rollout does. The Python runner's
+        // `_next_beat_at`.
+        const expires = Number(answer?.lease_expires_ts);
+        if (!state.stopped && Number.isFinite(expires)
+            && Number.isFinite(rollout.deadlineTs) && rollout.deadlineTs > 0
+            && expires >= rollout.deadlineTs - LEASE_AT_DEADLINE_SLACK_S) {
+          return;
+        }
       } catch (err) {
+        // Stopped while the request was out (reported, given back, or
+        // superseded): its answer is about a rollout this session no longer
+        // runs, and acting on it is the incident `onLeaseLost` describes.
+        if (state.stopped) return;
         try {
           if (err instanceof LeaseLost || err?.name === "LeaseLost") {
             await onLeaseLost();
@@ -436,7 +676,9 @@ export function createRolloutDriver({
    */
   async function giveBack(sessionKey, rollout, reason, detail) {
     stopHeartbeat(sessionKey);
+    clearDeadline(sessionKey);
     inFlight.delete(sessionKey);
+    dropTrajectory(rollout);
     try {
       modelCalls?.abandon?.(sessionKey);
     } catch {
@@ -454,13 +696,96 @@ export function createRolloutDriver({
 
   /** Record a rollout as running in `sessionKey`, so `onAgentEnd` reports it. */
   function track(sessionKey, rollout) {
+    // An outcome file already there was written before this rollout ran --
+    // by an episode that never reached `onAgentEnd` -- and is not its grade.
+    takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
+    // A FRESH, EMPTY trajectory: a re-claim of the same rollout must not
+    // inherit an earlier attempt's calls, and an attempt that makes none is
+    // then read back as `[]` -- observed zero -- rather than as no file.
+    const dir = trajectoryOf(rollout);
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, TOOL_CALLS_FILENAME), "", "utf8");
+      } catch (err) {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId}'s trajectory could ` +
+          `not be prepared (${err?.message ?? err}); its tool calls will be ` +
+          `reported as not observed.`);
+        dropTrajectory(rollout);
+      }
+    }
     inFlight.set(sessionKey, rollout);
     startHeartbeat(sessionKey, rollout);
+    // THE SERVER'S DEADLINE, honoured: the run is stopped and reported
+    // `deadline_exceeded` REPORT_MARGIN_MS before it, while the lease is
+    // still good, as the Python runner stops its child short of it. It used
+    // to be parsed and read nowhere, so a rollout ran past its budget and
+    // its report chased a row the reaper had already swept.
+    clearDeadline(sessionKey);
+    if (Number.isFinite(rollout?.deadlineTs) && rollout.deadlineTs > 0) {
+      const delay = Math.max(0, rollout.deadlineTs * 1000 - REPORT_MARGIN_MS - now());
+      try {
+        deadlines.set(sessionKey, heartbeatScheduler(() => {
+          deadlines.delete(sessionKey);
+          expire(sessionKey, rollout).catch(() => {});
+        }, delay));
+      } catch {
+        /* no timer: the lease and the reaper still bound it */
+      }
+    }
     try {
       modelCalls?.begin?.(sessionKey);
     } catch {
       /* the result will be reported without an attested count */
     }
+  }
+
+  /**
+   * `subagent_spawned`: a session spawned a subagent. When the spawner is a
+   * rollout's session (or a subagent of one), that rollout's answer now
+   * depends on a model the rollout did not sample: the subagent's session
+   * is not the rollout's, so its calls resolve to the host's own model, and
+   * its result feeds the rollout's answer. Training on that as the policy's
+   * own output would be training on mixed-policy text.
+   *
+   * REFUSED, NOT ROUTED. The parent is identifiable only here -- the host's
+   * subagent session key is `agent:<id>:subagent:<uuid>` and carries no
+   * parent, and neither do the model and session hooks' contexts -- and the
+   * host fires this AFTER it has started the subagent's run, so its first
+   * model call can resolve before this names its parent: routing would be
+   * best effort, and a half-routed subagent is still mixed policy. So the
+   * rollout's model-call count is marked unattestable with this cause
+   * (`modelCalls.markUncertain`): its result is reported without
+   * `llm_call_count`, which the control plane reconciles against what its
+   * gateway observed and holds out of training as `llm_calls_unobserved`.
+   * Said once per rollout. Returns whether the spawn was a rollout's.
+   */
+  function onSubagentSpawned(event, ctx = {}) {
+    const child = ctx?.childSessionKey ?? event?.childSessionKey;
+    const requester = ctx?.requesterSessionKey ?? event?.requesterSessionKey;
+    if (!child || !requester) return false;
+    const root = inFlight.has(requester) ? requester : subagentOf.get(requester);
+    const rollout = root === undefined ? undefined : inFlight.get(root);
+    if (!rollout) return false;
+    subagentOf.delete(child);
+    subagentOf.set(child, root);
+    while (subagentOf.size > 1024) subagentOf.delete(subagentOf.keys().next().value);
+    const reason = `the rollout spawned subagent session ${child}, whose model ` +
+      `calls run on the host's own model, not the rollout's`;
+    try { modelCalls?.markUncertain?.(root, reason); } catch { /* evidence */ }
+    if (!subagentSaid.has(rollout)) {
+      subagentSaid.add(rollout);
+      try {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId}: ${reason}. Its result ` +
+          `is reported without llm_call_count, so the control plane holds it ` +
+          `out of training (llm_calls_unobserved) rather than train on output ` +
+          `another model shaped.`);
+      } catch { /* telemetry */ }
+    }
+    return true;
   }
 
   /** Generic adapter seam: one host-proven provider invocation began. */
@@ -532,16 +857,23 @@ export function createRolloutDriver({
     if (
       !sessionKey || blockNextRun.has(sessionKey)
       || inFlight.has(sessionKey) || claiming.has(sessionKey)
+      // A subagent's session is part of the run that spawned it, never a
+      // rollout of its own: claiming here would hand it a whole episode and
+      // grade the subagent's answer as the agent's.
+      || isSubagentSessionKey(sessionKey)
     ) {
       return null;
     }
     // Reserved SYNCHRONOUSLY, before the first await, so a second event for
     // this session cannot slip past the guard while the claim is in flight.
+    if (!reserve()) return null;
     claiming.add(sessionKey);
     try {
       return await claimAndDeliver(sessionKey);
     } finally {
       claiming.delete(sessionKey);
+      endedWhileClaiming.delete(sessionKey);
+      release();
     }
   }
 
@@ -571,7 +903,30 @@ export function createRolloutDriver({
         `held results stay on disk and are retried before the next claim.`,
       );
     }
-    return transport.claim(maxRollouts);
+    const answer = await transport.claim(maxRollouts);
+    // PAST ITS DEADLINE WHEN IT ARRIVED -- a backlog, a slow claim, a clock
+    // that moved -- is handed straight back, in this one seam both lanes
+    // claim through, rather than run on work the server has given up on.
+    const rollouts = Array.isArray(answer?.rollouts) ? answer.rollouts : [];
+    const runnable = [];
+    for (const rollout of rollouts) {
+      if (!pastDeadline(rollout)) {
+        runnable.push(rollout);
+        continue;
+      }
+      try {
+        await transport.abandon(rollout, {
+          reason: "deadline_exceeded",
+          detail: "deadline had already passed when claimed",
+        });
+      } catch (err) {
+        logger?.warn?.(
+          `[agent-flywheel] could not hand back rollout ${rollout.rolloutId}, ` +
+          `claimed past its deadline; its lease will lapse on its own: ` +
+          `${err?.message ?? err}`);
+      }
+    }
+    return runnable.length === rollouts.length ? answer : { ...answer, rollouts: runnable };
   }
 
   async function claimAndDeliver(sessionKey) {
@@ -588,6 +943,18 @@ export function createRolloutDriver({
     }
     const rollout = claimed?.rollouts?.[0];
     if (!rollout) return null;
+    if (endedWhileClaiming.has(sessionKey)) {
+      // THE SESSION ENDED WHILE THIS WAS BEING CLAIMED. `onSessionEnd` found
+      // nothing in flight to give back, so tracking it now would start a
+      // heartbeat renewing a lease for a session that will never run it --
+      // forever. It goes back at once, and nothing is started.
+      await giveBack(
+        sessionKey, rollout, "entrypoint_error",
+        "the session ended while the rollout was being claimed, so it was " +
+        "never delivered",
+      );
+      return null;
+    }
 
     const text = taskText(rollout);
     // Checked BEFORE sending, because over the ceiling the host returns
@@ -643,6 +1010,54 @@ export function createRolloutDriver({
   }
 
   /**
+   * The rollout's deadline (less the report margin) arrived before its
+   * answer. Stop it and report it `deadline_exceeded` -- the Python runner's
+   * timed-out result: no answer, an exclusion naming the budget, and the
+   * tool calls it made -- through the same durable delivery as any result.
+   * The run is fenced and cancelled exactly as a lost lease's is, because
+   * whatever it does next is no longer this rollout.
+   */
+  async function expire(sessionKey, rollout) {
+    if (inFlight.get(sessionKey) !== rollout || reporting.get(sessionKey) === rollout) {
+      return null;
+    }
+    inFlight.delete(sessionKey);
+    reporting.set(sessionKey, rollout);
+    try {
+      const runStarted = activeRuns.has(sessionKey);
+      const runId = activeRuns.get(sessionKey) ?? undefined;
+      activeRuns.delete(sessionKey);
+      if (!runStarted) blockNextRun.add(sessionKey);
+      else revokedRuns.set(sessionKey, runId ?? null);
+      try { modelCalls?.abandon?.(sessionKey); } catch { /* evidence cleanup */ }
+      if (cancel) {
+        try { await cancel({ sessionKey, runId, rollout }); } catch { /* fenced anyway */ }
+      }
+      const trajectory = readTrajectory(trajectoryOf(rollout));
+      try {
+        logger?.warn?.(
+          `[agent-flywheel] rollout ${rollout.rolloutId} reached its deadline ` +
+          `without an answer; reporting it deadline_exceeded.`);
+      } catch { /* telemetry */ }
+      const delivered = await spool.deliver(rollout, {
+        finalText: "",
+        exclusion: {
+          reason: "deadline_exceeded",
+          detail: `no answer ${REPORT_MARGIN_MS / 1000}s before the rollout's deadline`,
+        },
+        toolCalls: trajectory.calls ?? undefined,
+        toolCallsOmittedCount: trajectory.calls === null
+          ? undefined : trajectory.malformed,
+      });
+      return delivered ? rollout : null;
+    } finally {
+      if (reporting.get(sessionKey) === rollout) reporting.delete(sessionKey);
+      stopHeartbeat(sessionKey);
+      dropTrajectory(rollout);
+    }
+  }
+
+  /**
    * The agent finished. Report the answer.
    *
    * `PluginHookAgentEndEvent` carries no session key -- it is
@@ -668,6 +1083,7 @@ export function createRolloutDriver({
     }
     if (!rollout) return null;
     inFlight.delete(sessionKey);
+    clearDeadline(sessionKey);
 
     if (event?.success === false) {
       // The agent RAN and failed. That is a real attempt and exactly what
@@ -712,6 +1128,22 @@ export function createRolloutDriver({
         `on-policy training.`,
       );
     }
+    // THE AGENT'S OWN GRADE, from `$PERCEPTEYE_TRAJECTORY_DIR/outcome.json`:
+    // reward, success, checks, termination and seeds as its environment
+    // stated them. The Python runner has read this file for a command agent
+    // all along (`runner.py _attach_reported_outcome`); this lane had no
+    // reader, so an agent driven from here could never be scored by its own
+    // environment. Same rules, one table (`wire.js reportedOutcome`).
+    const stated = takeReportedOutcome(env?.[TRAJECTORY_DIR_ENV]);
+    // THE CALLS THE RECORDER OBSERVED in this rollout's session, read by the
+    // reader every lane uses (`readTrajectory`, the Python runner's
+    // `_attach_trajectory`): `null` when there is no trajectory to read, `[]`
+    // for one that recorded none, and every unparseable line counted into
+    // `tool_calls_omitted_count`, which forbids the training grade. This lane
+    // declares `reports_tool_calls: true` at registration -- which tells the
+    // control plane not to refuse it for reporting none -- and used to send
+    // none.
+    const trajectory = readTrajectory(trajectoryOf(rollout));
     try {
       // SPOOLED BEFORE IT IS SENT, and never merely awaited. `deliver` writes
       // the outcome to the outbox before the first network call and settles
@@ -721,11 +1153,18 @@ export function createRolloutDriver({
       // and a rollout the reaper marks `abandoned` twenty minutes later. It
       // does not throw: the failure IS the return value.
       const delivered = await spool.deliver(rollout, {
+        ...stated,
         finalText,
-        // `undefined`, never `[]`. The recorder owns tool calls and writes
-        // them to the trajectory; asserting zero here would overwrite what it
-        // observed with a claim this function cannot make.
-        success: event?.success === true ? true : undefined,
+        // `undefined` -- not reported -- when there is no trajectory, never
+        // a `[]` this function did not read.
+        toolCalls: trajectory.calls ?? undefined,
+        toolCallsOmittedCount: trajectory.calls === null
+          ? undefined : trajectory.malformed,
+        //
+        // A value this lane already has is not replaced by the file's: the
+        // host saying the run succeeded stands, and otherwise the
+        // environment's own verdict is the only one there is.
+        success: event?.success === true ? true : stated.success,
         // Counted from the host's provider-call lifecycle and reconciled by
         // run/call ids. Never copied from the control plane's gateway.
         llmCallCount: modelCallMeasurement.count ?? undefined,
@@ -747,6 +1186,9 @@ export function createRolloutDriver({
       // either landed or failed, not merely when the agent produced an answer.
       if (reporting.get(sessionKey) === rollout) reporting.delete(sessionKey);
       stopHeartbeat(sessionKey);
+      // Spooled with the outcome before the first send, so the directory is
+      // no longer the record of anything.
+      dropTrajectory(rollout);
     }
   }
 
@@ -771,6 +1213,7 @@ export function createRolloutDriver({
     const sessionKey = event?.sessionKey ?? event?.sessionId;
     const rollout = sessionKey ? inFlight.get(sessionKey) : null;
     if (sessionKey) {
+      if (claiming.has(sessionKey)) endedWhileClaiming.add(sessionKey);
       activeRuns.delete(sessionKey);
       blockNextRun.delete(sessionKey);
       revokedRuns.delete(sessionKey);
@@ -797,14 +1240,36 @@ export function createRolloutDriver({
     return sessionKey ? (inFlight.get(sessionKey) ?? null) : null;
   }
 
+  /**
+   * Where the tool recorder writes a call made in `ctx`'s session: that
+   * session's rollout's own trajectory, or null when it runs none. THE
+   * PRODUCER half of the seam `onAgentEnd` reads (index.js routes the
+   * training writer through it).
+   */
+  function trajectoryDirFor(ctx = {}) {
+    return trajectoryOf(rolloutFor(ctx));
+  }
+
+  /**
+   * The gateway is stopping: stop every lease renewal and deadline timer.
+   * A rollout still in flight is not reported -- its run is going down with
+   * the gateway -- and its lease lapses for the control plane to requeue.
+   * Renewing it from a process that is shutting down would hold it instead.
+   */
+  function stopTimers() {
+    for (const sessionKey of [...heartbeats.keys()]) stopHeartbeat(sessionKey);
+    for (const sessionKey of [...deadlines.keys()]) clearDeadline(sessionKey);
+  }
+
   // `track` and `giveBack` are what the UNATTENDED runner needs: it does its
   // own claiming and turn-starting, but reporting and typed abandon must stay
   // in one place, or an unattended rollout and an attended one would end two
   // different ways.
   return {
     onSessionStart, onAgentEnd, onSessionEnd, onBeforeAgentRun,
-    onBeforeToolCall, rolloutFor,
-    onModelCallStarted, onModelCallEnded,
+    onBeforeToolCall, rolloutFor, route, trajectoryDirFor, reserve, release,
+    stopTimers,
+    onModelCallStarted, onModelCallEnded, onSubagentSpawned,
     inFlight, track, giveBack, heartbeats, activeRuns, blockNextRun,
     revokedRuns, reporting,
     // `claim` is what the UNATTENDED runner claims through -- not
@@ -853,6 +1318,9 @@ export function registerRolloutDriver(api, {
   // here would be untestable without mutating the process's environment.
   env = process.env,
   declaration = null,
+  // The clock and the jitter source the registration retry is paced by.
+  now = () => Date.now(),
+  random = Math.random,
 }) {
   // THE CONFIGURED `rules` ON A LANE THAT DOES NOT DRIVE. What stops this
   // install claiming -- the conversation-access opt-in, an injection API --
@@ -884,6 +1352,27 @@ export function registerRolloutDriver(api, {
     logger?.warn?.(
       `[${pluginId}] this host exposes no next-turn injection API, so a ` +
       `claimed task could not be delivered to the agent. Not claiming.`,
+    );
+    declareWithoutDriving();
+    return null;
+  }
+
+  // THE ROUTE TO THE CHECKPOINT BEING TRAINED, opened before anything is
+  // claimed. A rollout that cannot be pointed at its own gateway would run on
+  // this host's configured model and be scored as the checkpoint's -- data
+  // that teaches the policy about a model it is not -- so a host that will
+  // not register the provider gets no rollouts, and is told why.
+  let driver = null;
+  const routeRefusal = registerFlywheelProvider(api, {
+    answer: () => driver?.route,
+    hint: `Supplied for you in training mode: a rollout session authenticates ` +
+      `to its own per-rollout gateway with ${ROLLOUT_KEY_ORIGIN}.`,
+  });
+  if (routeRefusal) {
+    logger?.warn?.(
+      `[${pluginId}] not claiming rollouts: ${routeRefusal}. A rollout must ` +
+      `sample through its own gateway (the checkpoint being trained); on ` +
+      `this host's own model it would be scored as something it is not.`,
     );
     declareWithoutDriving();
     return null;
@@ -923,6 +1412,10 @@ export function registerRolloutDriver(api, {
       // With nothing observed, the host is still known: this is OpenClaw.
       framework: FRAMEWORK,
     }) ?? null;
+    // Where the agent's API spec is published, when `describe` says
+    // (declaration.js): a reference beside the description, never the
+    // document. Absent otherwise: an undeclared registration is unchanged.
+    Object.assign(registrationSpec, declarationRegistrationFields(declaration));
   }
   // The digest is derived from the description, so the same refusal covers it.
   if (consented && isLowerSha256(registrationFingerprint?.execution_sha256)) {
@@ -930,8 +1423,21 @@ export function registerRolloutDriver(api, {
       registrationFingerprint.execution_sha256;
   }
   let registration = null;
+  // NOT CACHED FOREVER WHEN THE FAILURE IS TRANSIENT. A control plane that
+  // was down or answered 5xx at boot used to disable rollouts for the life
+  // of the process -- every later claim awaited the same failed promise --
+  // so a deploy that briefly restarted the control plane silently stopped
+  // every training worker until somebody restarted it too. A transient
+  // failure is now asked again after a jittered, exponentially growing wait
+  // (one attempt per wait, however many claims arrive); a refusal still
+  // stops, once, as before.
+  let registrationFailures = 0;
+  let retryAt = null;
   function ensureRegistered() {
-    if (registration !== null) return registration;
+    if (registration !== null && !(retryAt !== null && now() >= retryAt)) {
+      return registration;
+    }
+    retryAt = null;
     registration = (async () => {
       if (typeof transport?.health !== "function") {
         throw new ConfigurationError(
@@ -963,14 +1469,36 @@ export function registerRolloutDriver(api, {
         // runs". The control plane names whichever is off; say it once.
         const line = practiceLine(answer);
         if (line) logger?.warn?.(`[${pluginId}] ${line}`);
+        registrationFailures = 0;
         return true;
       })
       .catch((err) => {
-        logger?.warn?.(
-          `[${pluginId}] rollouts are disabled for this run because worker ` +
-          `registration failed: ${err?.message ?? err}. Local capture is ` +
-          `unaffected.`,
-        );
+        if (registrationFailureIsTransient(err)) {
+          registrationFailures += 1;
+          const ceiling = Math.min(
+            REGISTRATION_RETRY_MAX_MS,
+            REGISTRATION_RETRY_BASE_MS * 2 ** (registrationFailures - 1),
+          );
+          // Jittered, so a fleet that lost the control plane together does
+          // not come back to it together.
+          const waitMs = Math.round(ceiling * (0.5 + 0.5 * random()));
+          retryAt = now() + waitMs;
+          try {
+            logger?.warn?.(
+              `[${pluginId}] rollouts are paused because worker registration ` +
+              `failed (${err?.message ?? err}); it is retried in ` +
+              `${Math.ceil(waitMs / 1000)}s. Local capture is unaffected.`,
+            );
+          } catch { /* telemetry */ }
+          return false;
+        }
+        try {
+          logger?.warn?.(
+            `[${pluginId}] rollouts are disabled for this run because worker ` +
+            `registration failed: ${err?.message ?? err}. Local capture is ` +
+            `unaffected.`,
+          );
+        } catch { /* telemetry */ }
         return false;
       });
     return registration;
@@ -1013,26 +1541,42 @@ export function registerRolloutDriver(api, {
     heartbeat: (...args) => transport.heartbeat(...args),
   };
 
-  const driver = createRolloutDriver({
+  driver = createRolloutDriver({
     transport: registeredTransport,
     enqueue: (injection) => enqueueFn.call(api.session?.workflow ?? api, injection),
     logger,
     executionIdentity,
     env,
+    // `reports_tool_calls: true` is declared above, so the calls are read
+    // back and sent. The caller routes its tool recorder through
+    // `driver.trajectoryDirFor` (index.js does).
+    recordsToolCalls: true,
+    // The number registration declared, so the gate holds what was promised.
+    concurrency: registrationSpec.concurrency,
   });
 
   // Failures are swallowed at the boundary: a telemetry plugin must never be
   // able to break the agent it is measuring.
+  // The catch itself cannot reject: a host logger that throws there would
+  // otherwise be an unhandled rejection, fatal to the gateway under Node's
+  // default policy.
   const safe = (fn) => (event, ctx) => {
     Promise.resolve()
       .then(() => fn(event, ctx))
-      .catch((err) => logger?.warn?.(
-        `[${pluginId}] rollout hook failed: ${err?.message ?? err}`));
+      .catch((err) => {
+        try {
+          logger?.warn?.(`[${pluginId}] rollout hook failed: ${err?.message ?? err}`);
+        } catch { /* telemetry */ }
+      });
   };
 
+  // Routing returns its decision, so it is not behind `safe`, which discards
+  // what a handler returns.
+  subscribeModelResolve(api, (event, ctx) => driver.route.handleModelResolve(event, ctx));
   api.on(SESSION_START, safe(driver.onSessionStart));
   api.on(AGENT_END, safe(driver.onAgentEnd));
   api.on(SESSION_END, safe(driver.onSessionEnd));
+  api.on(SUBAGENT_SPAWNED, safe(driver.onSubagentSpawned));
   // This gate MUST return its decision. The observation-only wrapper above
   // deliberately fire-and-forgets, which would discard a block result and
   // let a revoked rollout reach the model anyway.
@@ -1100,13 +1644,24 @@ export function registerRolloutDriver(api, {
       startTurn: cronTurnStarter(() => gatewayCtx?.getCron?.()),
       logger,
     });
-    const capture = (_event, ctx) => {
+    const capture = (ctx) => {
       if (ctx?.getCron) gatewayCtx = ctx;
-      unattended.start();
     };
-    api.on(GATEWAY_START, safe(capture));
-    api.on("cron_changed", safe(capture));
-    api.on(GATEWAY_STOP, safe(() => unattended.stop()));
+    api.on(GATEWAY_START, safe((_event, ctx) => {
+      capture(ctx);
+      unattended.start();
+    }));
+    // A cron change re-arms the poller, but never after gateway_stop.
+    api.on("cron_changed", safe((_event, ctx) => {
+      capture(ctx);
+      unattended.resume();
+    }));
+    // The gateway is going down: no more claims, and no lease renewal or
+    // deadline timer left running behind it.
+    api.on(GATEWAY_STOP, safe(() => {
+      unattended.stop();
+      driver.stopTimers();
+    }));
     logger?.info?.(
       `[${pluginId}] training mode: this plugin claims rollouts and runs them, ` +
       `starting its own turns in dedicated 'percepteye-rollout-*' sessions, ` +

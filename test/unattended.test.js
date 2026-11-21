@@ -40,6 +40,7 @@ const trainingApi = () => {
     config: { plugins: { entries: {
       [PLUGIN_ID]: { hooks: { allowConversationAccess: true } } } } },
     session: { workflow: { enqueueNextTurnInjection: async () => ({ enqueued: true }) } },
+    registerProvider: () => {},
   };
 };
 const TRAINING_ENV = () => testEnv({
@@ -303,8 +304,141 @@ describe("a dead seam stops this lane instead of eating the queue", () => {
     await h.runner.tick();
     assert.equal(h.calls.claim, 1);
     h.runner.start();
-    h.runner.stop();
     await h.runner.tick();
+    h.runner.stop();
     assert.equal(h.calls.claim, 2, "a re-armed runner must claim again");
+  });
+});
+
+describe("stopping, starting and pacing (ND-H9)", () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setImmediate(r));
+  };
+
+  it("a starter that THROWS gives the rollout back and leaves nothing tracked", async () => {
+    const h = harness();
+    const runner = createUnattendedRunner({
+      driver: h.driver, logger: { info() {}, warn() {} },
+      startTurn: async () => { throw new Error("cron.add exploded"); },
+    });
+    assert.equal(await runner.tick(), null);
+    assert.equal(h.calls.abandon.length, 1);
+    assert.match(h.calls.abandon[0][1].detail, /cron\.add exploded/);
+    assert.equal(h.driver.inFlight.size, 0);
+    assert.equal(h.driver.heartbeats.size, 0);
+  });
+
+  it("one concurrency gate for both lanes: an attended rollout blocks the unattended claim", async () => {
+    const h = harness();
+    await h.driver.onSessionStart({ sessionKey: "a-person" });
+    assert.equal(h.driver.inFlight.size, 1);
+    await h.runner.tick();
+    assert.equal(h.calls.claim, 1, "the unattended lane claimed past concurrency: 1");
+    assert.equal(h.calls.turns.length, 0);
+  });
+
+  it("...including while the attended claim is still in flight", async () => {
+    // The race the per-lane checks missed: neither rollout is in inFlight yet.
+    const answers = [];
+    let claims = 0;
+    const driver = createRolloutDriver({
+      env: testEnv(),
+      transport: {
+        claim: () => { claims += 1; return new Promise((r) => { answers.push(r); }); },
+        report: async () => {}, abandon: async () => {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+    });
+    const runner = createUnattendedRunner({
+      driver, startTurn: async () => ({ started: true }),
+    });
+    const attended = driver.onSessionStart({ sessionKey: "a-person" });
+    await new Promise((r) => setImmediate(r));
+    const ticking = runner.tick();
+    await new Promise((r) => setImmediate(r));
+    for (const answer of answers) answer({ rollouts: [] });
+    await Promise.all([attended, ticking]);
+    assert.equal(claims, 1, "two claims in flight on a worker registered for one");
+  });
+
+  it("...and an unattended rollout blocks the attended claim", async () => {
+    const h = harness();
+    await h.runner.tick();
+    assert.equal(await h.driver.onSessionStart({ sessionKey: "a-person" }), null);
+    assert.equal(h.calls.claim, 1);
+  });
+
+  it("a claim that lands after stop() is handed back, not started", async () => {
+    let answer;
+    const calls = { abandon: [], turns: [] };
+    const driver = createRolloutDriver({
+      env: testEnv(),
+      transport: {
+        claim: () => new Promise((r) => { answer = r; }),
+        report: async () => {}, abandon: async (r, o) => { calls.abandon.push([r, o]); },
+      },
+      enqueue: async () => ({ enqueued: true }),
+    });
+    const runner = createUnattendedRunner({
+      driver, startTurn: async (t) => { calls.turns.push(t); return { started: true }; },
+    });
+    const ticking = runner.tick();
+    await settle();
+    runner.stop();
+    answer({ rollouts: [{ rolloutId: "r-late", turnInput: "t", leaseToken: "lt" }] });
+    assert.equal(await ticking, null);
+    assert.deepEqual(calls.turns, []);
+    assert.equal(calls.abandon[0][0].rolloutId, "r-late");
+    assert.equal(driver.inFlight.size, 0);
+  });
+
+  it("cron_changed after gateway_stop does not restart the poller; gateway_start does", () => {
+    const h = harness();
+    h.runner.start();
+    h.runner.stop();
+    h.runner.resume();
+    assert.equal(h.runner.polling, false, "a cron change restarted a stopped gateway's poller");
+    h.runner.start();
+    assert.equal(h.runner.polling, true);
+    h.runner.stop();
+  });
+
+  it("is wired that way to the host's hooks", () => {
+    const hooks = new Map();
+    const api = { ...trainingApi(), on: (n, fn) => hooks.set(n, fn) };
+    const out = register(api, {}, TRAINING_ENV());
+    const runner = out.rollouts.unattended;
+    hooks.get("gateway_start")({}, {});
+    hooks.get("gateway_stop")({}, {});
+    return settle().then(() => {
+      hooks.get("cron_changed")({}, { getCron: () => null });
+      return settle();
+    }).then(() => {
+      assert.equal(runner.polling, false);
+    });
+  });
+
+  it("paces itself by the control plane's pollAfterMs", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let claims = 0;
+    const driver = createRolloutDriver({
+      env: testEnv(),
+      transport: {
+        claim: async () => { claims += 1; return { rollouts: [], pollAfterMs: 1_000 }; },
+        report: async () => {}, abandon: async () => {},
+      },
+      enqueue: async () => ({ enqueued: true }),
+    });
+    const runner = createUnattendedRunner({
+      driver, pollMs: 30_000, startTurn: async () => ({ started: true }),
+    });
+    runner.start();
+    t.mock.timers.tick(30_000);
+    await settle();
+    assert.equal(claims, 1);
+    t.mock.timers.tick(1_000);
+    await settle();
+    assert.equal(claims, 2, "the next poll waited pollMs, not the server's pollAfterMs");
+    runner.stop();
   });
 });

@@ -50,14 +50,37 @@ export async function main(argv, {
     stderr.write(`agent-flywheel: ${err.message}\n${USAGE}`);
     return 2;
   }
-  const [command] = parsed.positionals;
-  if (parsed.values.help || !command) {
-    (command ? stdout : stderr).write(USAGE);
-    return command ? 0 : 2;
+  const [command, ...extra] = parsed.positionals;
+  // Asked-for help is an answer, not an error: stdout, exit 0, whatever else
+  // is on the line. Help nobody asked for (no command) is the error's usage.
+  if (parsed.values.help) {
+    stdout.write(USAGE);
+    return 0;
+  }
+  if (!command) {
+    stderr.write(USAGE);
+    return 2;
   }
   if (command !== "login" && command !== "logout") {
     stderr.write(`agent-flywheel: unknown command ${JSON.stringify(command)}\n${USAGE}`);
     return 2;
+  }
+  // Refused, never ignored: `login my-agent` read as a login for the DEFAULT
+  // agent stores a key under an id the person did not type.
+  if (extra.length) {
+    stderr.write(
+      `agent-flywheel: unexpected argument ${JSON.stringify(extra[0])} ` +
+      `(the agent is named with --agent-id)\n${USAGE}`,
+    );
+    return 2;
+  }
+  // An EMPTY value fell back to the default agent or control plane: a key
+  // stored somewhere the person did not ask for.
+  for (const name of ["agent-id", "control-plane-url"]) {
+    if (parsed.values[name] !== undefined && !parsed.values[name].trim()) {
+      stderr.write(`agent-flywheel: --${name} needs a value\n${USAGE}`);
+      return 2;
+    }
   }
 
   let config;
@@ -65,8 +88,9 @@ export async function main(argv, {
     // The plugin's own resolution of the agent id and control plane, so the
     // key lands where the plugin will look for it.
     config = resolveConfig({
-      ...(parsed.values["agent-id"] ? { agentId: parsed.values["agent-id"] } : {}),
-      ...(parsed.values["control-plane-url"]
+      ...(parsed.values["agent-id"] !== undefined
+        ? { agentId: parsed.values["agent-id"] } : {}),
+      ...(parsed.values["control-plane-url"] !== undefined
         ? { controlPlaneUrl: parsed.values["control-plane-url"] } : {}),
       mode: "production",
     }, env);

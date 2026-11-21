@@ -1,6 +1,6 @@
 /**
- * Every control-plane call this package makes, and the one that must never be
- * replayed.
+ * Every control-plane call this package makes, and how each one is made safe
+ * to resend.
  *
  * NO COUNT IN THAT SENTENCE, deliberately. It used to open "the nine
  * control-plane calls" and went stale the moment `captureCurrent` was added --
@@ -16,11 +16,16 @@
  */
 import { createHash } from "node:crypto";
 
+import { pythonJson } from "./declaration.js";
 import { TransportError } from "./errors.js";
 import { isLowerSha256 } from "./execution-identity.js";
 import {
-  ContractError, PRODUCTION_TURN_BATCH_MAX_ITEMS, productionAgentIdentifier,
-  productionIdentifier, productionTurnIdentifier, rolloutOutputToWire,
+  ContractError, PRODUCTION_OUTCOME_BATCH_MAX_ITEMS,
+  PRODUCTION_TURN_BATCH_MAX_ITEMS, TURN_FEEDBACK_BATCH_MAX_ITEMS,
+  productionAgentIdentifier,
+  productionIdentifier, productionOutcome, productionTaskIdentifier,
+  productionTurnIdentifier,
+  rolloutOutputToWire, turnFeedback,
   rolloutRequestFromWire, rulebookReceiptFromWire, rulebookRequestToWire,
 } from "./wire.js";
 
@@ -76,16 +81,7 @@ import {
  * fixture.
  */
 function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(", ")}]`;
-  if (value && typeof value === "object") {
-    const body = Object.keys(value).sort()
-      .map((k) => `${pyStr(k)}: ${stableStringify(value[k])}`)
-      .join(", ");
-    return `{${body}}`;
-  }
-  if (typeof value === "string") return pyStr(value);
-  if (value === undefined) return "null";
-  return JSON.stringify(value);
+  return pythonJson(value, { sortKeys: true });
 }
 
 /**
@@ -100,19 +96,6 @@ function bodyDigest(value) {
     .update(stableStringify(value))
     .digest("hex")
     .slice(0, 32);
-}
-
-/** Everything `ensure_ascii=True` escapes and `JSON.stringify` does not. */
-const NON_ASCII = new RegExp("[\\u007f-\\uffff]", "g");
-
-/** One string, escaped the way `json.dumps(ensure_ascii=True)` escapes it. */
-function pyStr(s) {
-  // JSON.stringify already escapes quotes, backslashes and control characters
-  // exactly as Python does; only the non-ASCII codepoints must be folded down.
-  return JSON.stringify(s).replace(
-    NON_ASCII,
-    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
 }
 
 const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
@@ -133,17 +116,56 @@ export function quoteIdentifier(value) {
   );
 }
 
-/** One opaque, control-plane-authored rollout id as a safe URL segment. */
-function rolloutPath(rollout, suffix) {
-  const rolloutId = rollout?.rolloutId;
-  if (typeof rolloutId !== "string" || !rolloutId) {
-    throw new ContractError("rollout_id must be a non-empty string");
+/** Longest identifier `urlSegment` puts in a path. */
+export const MAX_URL_SEGMENT_CHARS = 256;
+const SEGMENT_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * ONE caller-supplied identifier as ONE URL path segment, or a
+ * `ContractError` naming why it cannot be one. THE ONE RULE for every
+ * identifier this package interpolates into a path -- a rollout id, an agent
+ * id, a run id -- and the Python SDK's rule, refusal for refusal: empty, `.`,
+ * `..`, a `/` or `\`, a control character, more than
+ * `MAX_URL_SEGMENT_CHARS` characters, or text that is not well-formed
+ * Unicode is refused; anything else is percent-encoded by `quoteIdentifier`.
+ *
+ * Refused rather than encoded, because encoding is not enough: `%2F` and
+ * `%2E%2E` are decoded back to a separator or a dot segment by the proxies
+ * and routers in front of the control plane, and a path that resolves
+ * somewhere else is a request to a different resource.
+ */
+export function urlSegment(value, what = "identifier") {
+  if (typeof value !== "string" || !value) {
+    throw new ContractError(`${what} must be a non-empty string`);
+  }
+  if (value === "." || value === "..") {
+    throw new ContractError(`${what} must not be "." or ".."`);
+  }
+  if (value.includes("/") || value.includes("\\")) {
+    throw new ContractError(`${what} must not contain "/" or "\\"`);
+  }
+  if (SEGMENT_CONTROL.test(value)) {
+    throw new ContractError(`${what} must not contain a control character`);
+  }
+  // Counted in CODE POINTS, as Python's len() counts them: an astral
+  // character is two UTF-16 units, so `.length` refused an id of 129 emoji
+  // that the Python SDK's `_path_segment` takes.
+  if (value.length > MAX_URL_SEGMENT_CHARS
+      && [...value].length > MAX_URL_SEGMENT_CHARS) {
+    throw new ContractError(
+      `${what} must be at most ${MAX_URL_SEGMENT_CHARS} characters`,
+    );
   }
   try {
-    return `/rollouts/${quoteIdentifier(rolloutId)}/${suffix}`;
+    return quoteIdentifier(value);
   } catch {
-    throw new ContractError("rollout_id contains invalid Unicode");
+    throw new ContractError(`${what} contains invalid Unicode`);
   }
+}
+
+/** One opaque, control-plane-authored rollout id as a safe URL segment. */
+function rolloutPath(rollout, suffix) {
+  return `/rollouts/${urlSegment(rollout?.rolloutId, "rollout_id")}/${suffix}`;
 }
 
 /**
@@ -251,6 +273,27 @@ export async function declareRulebook({
   return null;
 }
 
+/**
+ * Statuses on `GET /agents/{id}/capture` that are the control plane's answer,
+ * not a blip: a key it does not accept (401), a key or agent it will not
+ * answer for (403), no such agent or no such route (404 -- a control plane
+ * older than the read). The Python SDK's `CAPTURE_READ_REFUSALS`.
+ */
+export const CAPTURE_READ_REFUSALS = new Set([401, 403, 404]);
+
+/**
+ * The verdict-read body for an answer that grants nothing: an answered
+ * refusal (`capture.turns` false) whose reason names what the control plane
+ * said, so `captureVerdict` reads it as an answer. The Python SDK's
+ * `capture_read_refusal`, word for word.
+ */
+export function captureReadRefusal(what) {
+  return { capture: { turns: false, reason:
+    "the control plane did not grant this agent production capture when " +
+    `asked (${what}), so nothing is uploaded. Turns are still captured ` +
+    "locally." } };
+}
+
 /** Bounded, header-safe idempotency identity for an opaque rollout id. */
 function rolloutOperationKey(operation, rollout) {
   const rolloutId = rollout?.rolloutId;
@@ -335,7 +378,12 @@ export class AttachTransport {
    */
   async registerRulebook(rules) {
     const jsonBody = rulebookRequestToWire(rules);
-    const agent = quoteIdentifier(this.agentId);
+    let agent;
+    try {
+      agent = urlSegment(this.agentId, "agent_id");
+    } catch (err) {
+      return { receipt: null, refusal: rulebookRefusal(err) };
+    }
     let reply;
     try {
       reply = await this._c.request("POST", `/agents/${agent}/rulebook`, {
@@ -408,12 +456,18 @@ export class AttachTransport {
   /**
    * Claim up to `maxRollouts` rollouts. Returns `{rollouts, pollAfterMs}`.
    *
-   * CLAIMING IS NOT REPLAYABLE, and this is the one call in the package that
-   * turns ambiguous retries OFF. The control plane does not honour
-   * Idempotency-Key on this route, so resending a claim that MAY already have
-   * been processed leases a SECOND batch while the first is held by nobody --
-   * those rollouts then sit untouched until their leases lapse. Only a failure
-   * that provably never reached the server is retried.
+   * REPLAYABLE THROUGH ITS KEY. A resent claim that MAY already have been
+   * processed would lease a SECOND batch while the first is held by nobody --
+   * those rollouts would then sit untouched until their leases lapse. What
+   * prevents it is the Idempotency-Key: ONE fresh key per call, sent unchanged
+   * on every retry of that call, and the control plane answers a replay of a
+   * key with the batch it already leased under it (re-issuing each rollout's
+   * inference key) instead of leasing more. So an ambiguous failure -- a
+   * timeout, a connection reset -- is retried like any other.
+   *
+   * `pollAfterMs` is the server's own backoff: 0 is an answer ("poll again
+   * now") and is kept, a negative one is read as 0, and only an absent or
+   * non-numeric one falls back to 1000.
    */
   async claim(maxRollouts) {
     const jsonBody = {
@@ -429,12 +483,15 @@ export class AttachTransport {
       jsonBody,
       idempotencyKey: crypto.randomUUID(),
       timeoutMs: this.waitMs + 10_000,
-      retryIfAmbiguous: false,
     });
     const raw = body.rollouts || [];
+    const pollAfter = typeof body.poll_after_ms === "number"
+      && Number.isFinite(body.poll_after_ms)
+      ? Math.max(0, Math.trunc(body.poll_after_ms))
+      : 1000;
     return {
       rollouts: raw.map(rolloutRequestFromWire),
-      pollAfterMs: Number(body.poll_after_ms) || 1000,
+      pollAfterMs: pollAfter,
     };
   }
 
@@ -457,25 +514,46 @@ export class AttachTransport {
    * because keeping the current policy is the safe answer there -- the two
    * look alike and their safe directions are opposite, which is why this one
    * says so.
+   *
+   * A DEFINITIVE ANSWER IS AN ANSWER, though. A 401, 403 or 404 on this read,
+   * or a 2xx body with no `capture` block in it, is the control plane
+   * deciding, not a blip: it will say the same thing to the next read.
+   * Resolved as `{}` it read as "consent unknown", so an outcome reported
+   * meanwhile was kept on disk for good and every report re-asked. Each
+   * resolves to an answered refusal naming what was said
+   * (`captureReadRefusal`); only a failure with no answer, or a status outside
+   * `CAPTURE_READ_REFUSALS`, is `{}`. The Python SDK's `capture_current`.
    */
   async captureCurrent(agentId) {
     if (productionAgentIdentifier(agentId) === null) return {};
+    let agent;
     try {
-      return (await this._c.request(
-        "GET", `/agents/${encodeURIComponent(agentId)}/capture`)) || {};
+      agent = urlSegment(agentId, "agent_id");
     } catch {
       return {};
     }
+    let body;
+    try {
+      body = await this._c.request("GET", `/agents/${agent}/capture`);
+    } catch (err) {
+      if (err instanceof TransportError
+          && CAPTURE_READ_REFUSALS.has(err.statusCode)) {
+        return captureReadRefusal(String(err.message));
+      }
+      return {};
+    }
+    const cap = body?.capture;
+    if (cap && typeof cap === "object" && !Array.isArray(cap)) return body;
+    return captureReadRefusal("it answered with no capture verdict in the body");
   }
 
   /**
    * Upload a batch of captured PRODUCTION turns.
    *
-   * REPLAYABLE, unlike `claim`. The server keys each turn on
-   * (org, agent, turn_id) and answers an identical resubmission as a
-   * duplicate, so an ambiguous retry costs nothing -- whereas a replayed claim
-   * would lease a second piece of work. This therefore leaves the client's
-   * default retry behaviour ON.
+   * REPLAYABLE. The server keys each turn on (org, agent, turn_id) and
+   * answers an identical resubmission as a duplicate, so an ambiguous retry
+   * costs nothing. This therefore leaves the client's default retry
+   * behaviour ON.
    *
    * The idempotency key covers the BATCH, matching
    * `agent_flywheel.transport.report_turns`, so a network-level
@@ -516,7 +594,7 @@ export class AttachTransport {
       }
       if (
         Object.hasOwn(turn, "task_id")
-        && productionIdentifier(turn.task_id) === null
+        && productionTaskIdentifier(turn.task_id) === null
       ) {
         throw new ContractError(`production turn ${index} has an invalid task_id`);
       }
@@ -524,6 +602,71 @@ export class AttachTransport {
     return this._c.request("POST", "/turns", {
       jsonBody: { agent_id: agentId, turns },
       idempotencyKey: `turns-${quoteIdentifier(agentId)}-${bodyDigest(turns)}`,
+    });
+  }
+
+  /**
+   * Upload a batch of reported outcomes: `POST /outcomes`.
+   *
+   * How production turns or conversations actually turned out, each in the
+   * shape `productionOutcome` validates -- which every outcome is passed
+   * through again here, so a batch that leaves is one the published schema
+   * accepts. REPLAYABLE, like `reportTurns`: the control plane keys each
+   * outcome on its `outcome_id` and answers a replay as a duplicate. The
+   * idempotency key is the turn batch's derivation over the outcomes,
+   * matching `agent_flywheel.transport.report_outcomes`.
+   */
+  reportOutcomes(agentId, outcomes) {
+    if (productionAgentIdentifier(agentId) === null) {
+      throw new ContractError(
+        "production outcome agent_id does not match the published production agent identifier grammar",
+      );
+    }
+    if (
+      !Array.isArray(outcomes)
+      || outcomes.length < 1
+      || outcomes.length > PRODUCTION_OUTCOME_BATCH_MAX_ITEMS
+    ) {
+      throw new ContractError(
+        `production outcome batches must contain between 1 and ${PRODUCTION_OUTCOME_BATCH_MAX_ITEMS} outcomes`,
+      );
+    }
+    const body = outcomes.map(productionOutcome);
+    return this._c.request("POST", "/outcomes", {
+      jsonBody: { agent_id: agentId, outcomes: body },
+      idempotencyKey: `outcomes-${quoteIdentifier(agentId)}-${bodyDigest(body)}`,
+    });
+  }
+
+  /**
+   * Upload a batch of per-turn feedback: `POST /turn-feedback`.
+   *
+   * What the user did with one turn of one episode, each in the shape
+   * `turnFeedback` validates -- which every report is passed through again
+   * here. REPLAYABLE, like `reportOutcomes`: the control plane keys each
+   * report on its `feedback_id` and answers a replay as a duplicate. The
+   * idempotency key is the outcome batch's derivation over the feedback,
+   * matching `agent_flywheel.transport.report_turn_feedback`.
+   */
+  reportTurnFeedback(agentId, feedback) {
+    if (productionAgentIdentifier(agentId) === null) {
+      throw new ContractError(
+        "turn feedback agent_id does not match the published production agent identifier grammar",
+      );
+    }
+    if (
+      !Array.isArray(feedback)
+      || feedback.length < 1
+      || feedback.length > TURN_FEEDBACK_BATCH_MAX_ITEMS
+    ) {
+      throw new ContractError(
+        `turn feedback batches must contain between 1 and ${TURN_FEEDBACK_BATCH_MAX_ITEMS} reports`,
+      );
+    }
+    const body = feedback.map(turnFeedback);
+    return this._c.request("POST", "/turn-feedback", {
+      jsonBody: { agent_id: agentId, feedback: body },
+      idempotencyKey: `turn-feedback-${quoteIdentifier(agentId)}-${bodyDigest(body)}`,
     });
   }
 
