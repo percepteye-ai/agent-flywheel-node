@@ -58,12 +58,28 @@ export interface FlywheelTurn {
   readonly signal: AbortSignal | undefined;
   /** The approved system prompt when a person approved one, otherwise `yours`. */
   systemPrompt(yours?: string): string;
+  /** The tool descriptions approved with that prompt, or null. */
+  readonly toolDescriptions: Readonly<Record<string, string>> | null;
+  /** The approved description of tool `name` when one applies, otherwise `yours`. */
+  toolDescription(name: string, yours?: string): string;
   /** Record one executed tool call. Returns whether it was recorded. */
   recordToolCall(call: ToolCall): boolean;
   /** Throws `ToolCallBlocked` when the call must not run. Adapters call it. */
   guardToolCall(name: string, args?: Record<string, unknown>): Promise<void>;
   /** Report the model's input, once per turn. Adapters call it. */
   observeModelInput(input: ModelInput): boolean;
+  /**
+   * Whether a model call or tool execution observed now is recorded on this
+   * turn's model boundary (a production turn whose agent may upload model
+   * content). Adapters and the model-client wrappers ask it first.
+   */
+  capturingModelContent(): boolean;
+  /**
+   * Record one model call (`operation: "chat"`) or tool execution
+   * (`operation: "execute_tool"`) of this turn, as it happened. Adapters
+   * call it. Observe only; returns whether it was recorded.
+   */
+  recordModelOperation(op: Record<string, unknown>): boolean;
 }
 
 /** What an agent function returns: the answer, or the answer and a verdict. */
@@ -161,6 +177,14 @@ export function currentTurn(): FlywheelTurn | null;
 export function recordToolCall(call: ToolCall): boolean;
 /** A tool call refused because its rollout's lease was revoked. */
 export class ToolCallBlocked extends Error {}
+
+// ── One-line model-client wrappers (observe only) ────────────────────────
+/** Observe an `openai` client's Chat Completions and Responses calls; returns the same client. */
+export function wrapOpenAI<T>(client: T): T;
+/** Observe an `@anthropic-ai/sdk` client's Messages calls; returns the same client. */
+export function wrapAnthropic<T>(client: T): T;
+/** Observe an `@google/genai` client's content generation; returns the same client. */
+export function wrapGemini<T>(client: T): T;
 
 export class InvalidOutcome extends Error {}
 export class InvalidFeedback extends Error {}

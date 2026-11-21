@@ -4,8 +4,10 @@
  * THE HOST HALF of production model-content capture. `genai-otlp.js` renders
  * an observation -- a turn's model calls and tool executions -- into one OTel
  * GenAI trace, byte-identically with the Python SDK. This module builds that
- * observation from the two OpenClaw hooks that can see a model boundary, and
- * from nothing else:
+ * observation for an OpenClaw run from the two OpenClaw hooks that can see a
+ * model boundary, and from nothing else (a framework turn's adapters record
+ * each call as it happens instead, through `chatOperation` and
+ * `toolOperation` at the bottom of this file):
  *
  *   `llm_input`  the assembled SYSTEM PROMPT, the HISTORY the run starts
  *                from, the user's PROMPT as the model boundary spells it, the
@@ -37,8 +39,8 @@
  *     counted them: `llm_input` carries only their count (`imagesCount`), so
  *     their bytes are read from the transcript's copy of the prompt, where
  *     the host puts them after its text, and a different count is refused;
- *   - a transcript whose last user message is not the prompt `llm_input`
- *     carried: a message steered into the running session
+ *   - a transcript whose last user message is neither the prompt `llm_input`
+ *     carried nor the message right after its history: a message steered into the running session
  *     (`activeSession.steer`, which fires no second `llm_input`) that the
  *     model saw mid-run, after the input this module was told about.
  *
@@ -108,7 +110,7 @@ function msToNanos(ms) {
   return (BigInt(Math.trunc(ms)) * 1000000n).toString();
 }
 
-function providerName(value) {
+export function providerName(value) {
   const id = text(value);
   return id ? (PROVIDERS.get(id) ?? id) : null;
 }
@@ -206,10 +208,13 @@ function semconvMessage(message) {
   throw new Refused(`a ${JSON.stringify(message.role)} message the host converts unseen`);
 }
 
-function toolDefinitions(tools) {
+export function toolDefinitions(tools) {
   if (!Array.isArray(tools) || !tools.length) return null;
   const out = [];
-  for (const tool of tools) {
+  for (let tool of tools) {
+    // An OpenAI-style `{type: "function", function: {...}}`, as LangChain.js
+    // binds tools, is the function it names.
+    if (isObject(tool) && !text(tool.name) && isObject(tool.function)) tool = tool.function;
     if (!isObject(tool) || !text(tool.name)) continue;
     const def = { type: "function", name: tool.name };
     if (typeof tool.description === "string") def.description = tool.description;
@@ -248,6 +253,9 @@ export function inputFromLlmInput(event, at) {
       input,
       tools: toolDefinitions(event.tools),
       images,
+      // How many messages the run started from, before its prompt: where
+      // the prompt sits in the transcript when its spelling does not say.
+      historyCount: history.length,
     };
   } catch (err) {
     if (err instanceof Refused) return null;
@@ -277,8 +285,10 @@ function userImages(content) {
  * OpenClaw stores the prompt BARE and may only PREFIX it at the model
  * boundary -- the `[DOW YYYY-MM-DD HH:MM TZ] ` stamp it derives from the
  * message's own timestamp, a prompt-build hook's prepended context -- so the
- * boundary's spelling ends with the stored text. Anything else is refused:
- * the run's start is then unknown, and a guessed one is worse than none.
+ * boundary's spelling ends with the stored text. When it does not (the
+ * prompt was rewritten, not prefixed), `operationsFromRun` finds the prompt
+ * by its place after the run's history instead; a guessed start is never
+ * taken.
  */
 function isRunPrompt(message, prompt) {
   if (typeof prompt !== "string") return false;
@@ -301,7 +311,14 @@ export function operationsFromRun(first, messages, endAt) {
   if (!first || !Array.isArray(messages)) return null;
   const lastUser = lastUserIndex(messages);
   if (lastUser < 0) return null;
-  if (!isRunPrompt(messages[lastUser], first.prompt)) return null;
+  // The prompt is found by its spelling, or -- when the model was sent a
+  // rewrite of it (a prompt-build hook that wraps or appends, a template)
+  // -- by its PLACE: right after the history the run started from. A user
+  // message steered in mid-run is at neither, and is still refused.
+  if (!isRunPrompt(messages[lastUser], first.prompt)
+      && lastUser !== first.historyCount) {
+    return null;
+  }
   // The prompt's images, from the transcript's copy of it: exactly as many
   // as `llm_input` counted, after its text, as the host sends them.
   const images = userImages(messages[lastUser].content);
@@ -399,4 +416,90 @@ export function operationsFromRun(first, messages, endAt) {
   });
   if (!operations.some((op) => op.operation === "chat")) return null;
   return { start: first.at, end: end.toString(), operations };
+}
+
+/**
+ * A medium named by a URL, as the Python SDK's `_media.data_url_part`: a
+ * base64 `data:` URL is its bytes (a `blob`), anything else an address.
+ */
+export function dataUrlPart(url, { modality = null, mimeType = null } = {}) {
+  if (typeof url !== "string" || !url) return null;
+  if (url.startsWith("data:") && url.includes(";base64,")) {
+    const [head, data] = url.split(";base64,", 2);
+    return mediaPart({
+      mimeType: head.slice("data:".length).split(";")[0] || mimeType, data, modality,
+    });
+  }
+  return mediaPart({ mimeType, uri: url, modality });
+}
+
+/** The conventions' `finish_reason` for a native one (both SDKs' table). */
+const FINISH_REASONS = new Map(Object.entries({
+  stop: "stop", end_turn: "stop", stop_sequence: "stop",
+  tool_calls: "tool_call", tool_use: "tool_call", function_call: "tool_call",
+  "tool-calls": "tool_call", toolUse: "tool_call",
+  length: "length", max_tokens: "length",
+  content_filter: "content_filter", "content-filter": "content_filter",
+}));
+
+/**
+ * ONE OBSERVED MODEL CALL as a model-boundary `chat` operation -- the shape
+ * the Python SDK's adapters record (`_chat_operation`), keys in its order.
+ * `output` is the assistant message as GenAI parts; `errorType` replaces it
+ * for a call that failed. Clocks are decimal nanoseconds.
+ */
+export function chatOperation({
+  start, end, provider = null, requestModel = null, responseModel = null,
+  system = [], input = [], tools = null, responseFormat = null,
+  output = null, nativeFinish = null, errorType = null,
+}) {
+  const op = {
+    operation: "chat",
+    span_id: newSpanId(),
+    start_time_unix_nano: start,
+    end_time_unix_nano: end,
+    provider_name: provider ?? null,
+  };
+  if (text(requestModel)) op.request_model = requestModel;
+  if (Array.isArray(system) && system.length) op.system_instructions = system;
+  op.input_messages = input;
+  if (Array.isArray(tools) && tools.length) op.tool_definitions = tools;
+  if (responseFormat) op.response_format = responseFormat;
+  if (errorType) {
+    op.error_type = errorType;
+    return op;
+  }
+  if (!output) return op;
+  const calls = output.parts.some((p) => p.type === "tool_call");
+  const native = text(nativeFinish);
+  op.output_messages = [{
+    ...output,
+    finish_reason: calls ? "tool_call" : (FINISH_REASONS.get(native) ?? native ?? "stop"),
+  }];
+  if (native) op.finish_reasons = [native];
+  if (text(responseModel)) op.response_model = responseModel;
+  return op;
+}
+
+/**
+ * ONE TOOL EXECUTION as a model-boundary `execute_tool` operation: what the
+ * tool was called with and what it handed back to the model (Python's
+ * `_record_execution`).
+ */
+export function toolOperation({
+  start, end, name, toolCallId = null, args = {}, result = undefined, errorType = null,
+}) {
+  const op = {
+    operation: "execute_tool",
+    span_id: newSpanId(),
+    start_time_unix_nano: start,
+    end_time_unix_nano: end,
+    tool_name: text(name) ?? "tool",
+    tool_type: "function",
+  };
+  if (text(toolCallId)) op.tool_call_id = toolCallId;
+  op.arguments = args;
+  if (errorType) op.error_type = errorType;
+  else op.result = result === undefined ? null : result;
+  return op;
 }

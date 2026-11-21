@@ -144,7 +144,10 @@ describe("feedback on a production turn", () => {
     });
   });
 
-  it("is what reportTurnFeedback does with a turnId, queuing nothing for the route", () => {
+  it("is what reportTurnFeedback does with a turnId, AND queues it for the route", () => {
+    // Design 2026-11-21, contract A: a production turn's feedback is uploaded
+    // over the SDK's own transport by its turn_id, as well as recorded on its
+    // trace. Mutation: skip the queue for a turnId -- red.
     withTracer((t) => {
       const root = mkdtempSync(join(tmpdir(), "percepteye-span-feedback-"));
       const u = createTurnUploader({ transport: {}, agentId: "a1", root });
@@ -152,8 +155,20 @@ describe("feedback on a production turn", () => {
       assert.equal(u.reportTurnFeedback("accepted", {
         turnId: TURN, occurredAt: AT, feedbackId: "fb-9" }), "fb-9");
       assert.equal(t.spans.at(-1).name, "percepteye.turn.feedback");
-      assert.deepEqual(readdirSync(root).filter((n) => n.startsWith(".feedback.")), []);
+      const queued = readdirSync(root).filter((n) => n.startsWith(".feedback."));
+      assert.equal(queued.length, 1);
+      assert.deepEqual(JSON.parse(readFileSync(join(root, queued[0]), "utf8")), {
+        feedback_id: "fb-9", occurred_at: AT, signal: "accepted", turn_id: TURN,
+      });
     });
+  });
+
+  it("queues a turnId's feedback with no tracer at all", () => {
+    const root = mkdtempSync(join(tmpdir(), "percepteye-span-feedback-"));
+    const u = createTurnUploader({ transport: {}, agentId: "a1", root });
+    assert.equal(u.reportTurnFeedback("corrected", {
+      turnId: TURN, occurredAt: AT, feedbackId: "fb-10" }), "fb-10");
+    assert.equal(readdirSync(root).filter((n) => n.startsWith(".feedback.")).length, 1);
   });
 
   it("names a turn this process never recorded", () => {

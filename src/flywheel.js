@@ -34,9 +34,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import { ConfigurationError } from "./errors.js";
+import { nowUnixNano } from "./genai-otlp.js";
 import { PLUGIN_ID } from "./config.js";
 import { register as registerPlugin } from "./index.js";
-import { PROVIDER_ID } from "./policy.js";
+import { PROVIDER_ID, TOOL_DESCRIPTIONS } from "./policy.js";
 import { normalizeAgentId } from "./scope.js";
 
 /** Hooks whose handlers RETURN a decision; the first one given wins. */
@@ -292,8 +293,13 @@ export function flywheel(options = {}, env = process.env) {
   });
 
   /** The `t` an agent function is handed. */
-  function makeTurn({ input, ctx, model, prompt, signal, rolloutId = null, turnId = null }) {
+  function makeTurn({
+    input, ctx, model, prompt, signal, rolloutId = null, turnId = null,
+    toolDescriptions = null,
+  }) {
     let saidInput = false;
+    const startedAt = nowUnixNano();
+    const tools = toolDescriptions ? Object.freeze({ ...toolDescriptions }) : null;
     return Object.freeze({
       input,
       rolloutId,
@@ -301,9 +307,20 @@ export function flywheel(options = {}, env = process.env) {
       conversationId: rolloutId ? null : (ctx.sessionKey ?? null),
       model,
       signal,
+      /**
+       * The tool descriptions approved WITH the system prompt this turn
+       * applies, `{toolName: description}`, or null (design 2026-11-21,
+       * contract B). The AI SDK middleware applies them by itself; with
+       * LangChain.js, `applyToolDescriptions(tools)` before binding.
+       */
+      toolDescriptions: tools,
       /** The approved system prompt when one applies, otherwise `yours`. */
       systemPrompt(yours = "") {
         return prompt ?? yours;
+      },
+      /** The approved description of tool `name` when one applies, otherwise `yours`. */
+      toolDescription(name, yours = "") {
+        return tools && Object.hasOwn(tools, name) ? tools[name] : yours;
       },
       /** One executed tool call, with its stated outcome when you know it. */
       recordToolCall({
@@ -332,6 +349,32 @@ export function flywheel(options = {}, env = process.env) {
           try { h(event, ctx); } catch { /* one lost record */ }
         }
         return (handle?.recorder?.written ?? 0) > before;
+      },
+      /**
+       * Whether a model call or tool execution observed now is recorded on
+       * this turn's model boundary: a production turn of an agent the control
+       * plane said may upload model content. Adapters ask it first and do no
+       * work when it is false (the Python SDK's `model_capture_active`).
+       */
+      capturingModelContent() {
+        try {
+          return handle?.capture?.turns?.mayRecordModelContent?.() === true;
+        } catch {
+          return false;
+        }
+      },
+      /**
+       * Record ONE model call (`operation: "chat"`) or tool execution
+       * (`operation: "execute_tool"`) of this turn, as it happened -- the
+       * Python SDK's `record_model_boundary`. Observe only; never throws.
+       */
+      recordModelOperation(op) {
+        try {
+          return handle?.capture?.turns?.onModelOperation?.(
+            op, ctx, { start: startedAt }) === true;
+        } catch {
+          return false;
+        }
       },
       /**
        * Throws `ToolCallBlocked` when this call must not run -- a training
@@ -390,9 +433,12 @@ export function flywheel(options = {}, env = process.env) {
       }, ctx);
       const built = await decide("before_prompt_build", { prompt: content, messages: [] }, ctx);
       const model = await resolveModel(ctx);
+      const applies = typeof built?.systemPrompt === "string";
       const turn = makeTurn({
         input: content, ctx, model,
-        prompt: typeof built?.systemPrompt === "string" ? built.systemPrompt : null,
+        prompt: applies ? built.systemPrompt : null,
+        // Only WITH the text they were approved with, from the same answer.
+        toolDescriptions: applies ? (built[TOOL_DESCRIPTIONS] ?? null) : null,
         signal: undefined, turnId: runId,
       });
       let result;

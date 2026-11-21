@@ -43,6 +43,10 @@ const SHARED = {
   // SDK's `adapters._media.media_part`).
   "media_parts.json":
     "a317549fe426f8351a4aabf8e97bda99f35ab7af0dd74b5587eac5e50f0eccac",
+  // One provider request and response and the chat operation both SDKs'
+  // model-client wrappers record for it (`model-wrappers.test.js`).
+  "model_wrappers.json":
+    "1295db195a9ee7fc4982c763db85747e17e0d3690acf7eca8aed4bc54512adf0",
   // A production turn and the feedback on it, as both SDKs export them over
   // OTLP (`turn-feedback-span.test.js`); what the control plane's reader of
   // the feedback event is driven with.

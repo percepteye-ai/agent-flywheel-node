@@ -628,11 +628,21 @@ describe("the feedback wire", () => {
     assert.equal(
       batch.properties.feedback.maxItems, TURN_FEEDBACK_BATCH_MAX_ITEMS);
     assert.equal(feedback.additionalProperties, false);
-    assert.deepEqual(
-      [...feedback.required].sort(), Object.keys(feedback.properties).sort());
+    // Every field is required but the TURN, which is named exactly one way
+    // (design 2026-11-21, contract A): an episode's, or a production turn's.
+    const joins = new Set(["episode_id", "turn_index", "turn_id"]);
+    assert.deepEqual([...feedback.required].sort(),
+      Object.keys(feedback.properties).filter((k) => !joins.has(k)).sort());
+    assert.deepEqual(feedback.oneOf, [
+      { required: ["episode_id", "turn_index"], not: { required: ["turn_id"] } },
+      { required: ["turn_id"], not: { anyOf: [
+        { required: ["episode_id"] }, { required: ["turn_index"] }] } },
+    ]);
     for (const name of ["pattern", "minLength", "maxLength", "type"]) {
       assert.equal(feedback.properties.episode_id[name],
         outcome.properties.episode_id[name]);
+      assert.equal(feedback.properties.turn_id[name],
+        outcome.properties.turn_id[name]);
     }
     assert.ok(outcome.anyOf.some(
       (branch) => JSON.stringify(branch) === '{"required":["episode_id"]}'));

@@ -1,6 +1,6 @@
 {
   "name": "@percepteye/agent-flywheel",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Agent Flywheel for JavaScript and TypeScript agents: capture the turns your agent serves, run the graded training rollouts your control plane sends, and apply the system prompt and model a person approved. Works with any framework (Vercel AI SDK, LangChain.js, LangGraph.js, Mastra, the OpenAI SDK or plain code) through one import, and loads as a plugin into OpenClaw and DeepSeek Harness. Never alters a tool result. Zero runtime dependencies.",
   "license": "MIT",
   "author": "PerceptEye",

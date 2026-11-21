@@ -416,6 +416,50 @@ export function recordModelBoundary(dir, boundary) {
   }
 }
 
+/**
+ * Append ONE observed model call or tool execution to the turn's model
+ * boundary, as it happens: the Python SDK's `record_model_boundary`. The
+ * framework adapters (`/ai-sdk`, `/langchain`) see every model call and
+ * every tool execution of a turn, so nothing is reconstructed. `start` (the
+ * turn's own start, decimal nanoseconds) goes on the trace header the first
+ * record writes. Never throws; returns whether anything was written.
+ */
+export function recordModelOperation(dir, op, start) {
+  if (!op || typeof op !== "object" || typeof op.operation !== "string") return false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, OBSERVATION_FILENAME);
+    let size = 0;
+    try { size = statSync(path).size; } catch { size = 0; }
+    const lines = [];
+    if (size === 0) {
+      lines.push(traceRecord({ traceId: newTraceId(), spanId: newSpanId(), start }));
+    }
+    lines.push(operationRecord(op));
+    appendFileSync(path, lines.join("\n") + "\n", "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Close a turn whose operations `recordModelOperation` wrote: when its scope
+ * ended. Only a turn that recorded something gets the line, so a turn whose
+ * agent called no model leaves no file behind (Python's
+ * `_record_model_boundary_end`). Never throws.
+ */
+export function recordModelBoundaryEnd(dir, end) {
+  try {
+    const path = join(dir, OBSERVATION_FILENAME);
+    if (statSync(path).size === 0) return false;
+    appendFileSync(path, endRecord(end) + "\n", "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The turn's recorded model boundary, or `null` when none was recorded. */
 export function readModelBoundary(dir) {
   let raw;

@@ -652,3 +652,6 @@ export default {
 export {
   currentTurn, flywheel, recordToolCall, ToolCallBlocked,
 } from "./flywheel.js";
+// One-line model-client wrappers, for an agent that calls a provider's client
+// directly: every model call of a turn on its model boundary, observe only.
+export { wrapAnthropic, wrapGemini, wrapOpenAI } from "./wrappers.js";

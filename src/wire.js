@@ -349,10 +349,20 @@ export const TURN_FEEDBACK_BATCH_MAX_ITEMS = 64;
 const FEEDBACK_WIRE_KEYS = new Set([
   "feedback_id", "episode_id", "turn_index", "signal", "occurred_at",
 ]);
+/** Either way of naming the turn: an episode's, or a production turn's. */
+const FEEDBACK_OR_TURN_KEYS = new Set([...FEEDBACK_WIRE_KEYS, "turn_id"]);
+/** A report that names its turn both ways. */
+const NAMES_ONE_TURN =
+  "feedback names one turn: a production turn's turn_id, or an episode's " +
+  "episode_id and turn_index, not both";
 
 /**
  * One per-turn feedback report exactly as the wire carries it, or
  * `InvalidFeedback` naming what is wrong.
+ *
+ * It names ONE turn: an episode's `episode_id` and `turn_index`, or a
+ * production turn's `turn_id` (then `{feedback_id, turn_id, signal,
+ * occurred_at}`, `turnFeedbackOnASpan`'s rules).
  *
  * THE one validator, as `productionOutcome` is for outcomes:
  * `reportTurnFeedback` builds its record through it and the transport passes
@@ -360,7 +370,17 @@ const FEEDBACK_WIRE_KEYS = new Set([
  * `turn_feedback`, rule for rule and message for message.
  */
 export function turnFeedback(wire) {
-  const signal = feedbackHead(wire, FEEDBACK_WIRE_KEYS);
+  const signal = feedbackHead(wire, FEEDBACK_OR_TURN_KEYS);
+  if (wire.turn_id !== undefined && wire.turn_id !== null) {
+    // A PRODUCTION TURN, named by its own id in place of an episode and a
+    // position (design 2026-11-21, contract A).
+    if ((wire.episode_id !== undefined && wire.episode_id !== null)
+        || (wire.turn_index !== undefined && wire.turn_index !== null)) {
+      throw new InvalidFeedback(NAMES_ONE_TURN);
+    }
+    return turnFeedbackOnASpan(Object.fromEntries(
+      [...SPAN_FEEDBACK_KEYS].filter((k) => k in wire).map((k) => [k, wire[k]])));
+  }
   if (productionIdentifier(wire.episode_id) === null) {
     throw new InvalidFeedback("episode_id is not a valid identifier");
   }
@@ -414,8 +434,8 @@ function feedbackTime(wire) {
 
 /**
  * What feedback on a PRODUCTION TURN carries: the turn's own id in place of
- * an episode and a position. Not sent to `POST /turn-feedback` (whose turns
- * are an episode's); it is an event on that turn's trace.
+ * an episode and a position. Sent to `POST /turn-feedback` (which takes
+ * either), and recorded as an event on that turn's trace.
  */
 const SPAN_FEEDBACK_KEYS = new Set(["feedback_id", "turn_id", "signal", "occurred_at"]);
 

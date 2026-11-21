@@ -548,6 +548,25 @@ describe("what the plugin cannot see, it does not render", () => {
     ]);
   });
 
+  it("finds a REWRITTEN prompt by its place after the run's history", () => {
+    // A prompt-build hook or template that wraps the user's text (not only
+    // prefixes it) no longer loses the whole run: the prompt is the message
+    // right after the history llm_input carried.
+    const root = tmp();
+    const turns = createTurnCapture({ root });
+    turns.gateModelContent(() => true);
+    const ctx = { runId: "r", sessionKey: CONVERSATION };
+    const wrapped = "Customer says: Where is my order 4417?\nAnswer briefly.";
+    turns.onLlmInput(llmInput("r", { prompt: wrapped }), ctx);
+    turns.onAgentEnd({ runId: "r", messages: transcript() }, ctx);
+    const chats = spans(turnWire(join(root, "r"), { modelContentAgent: "a" })
+      .genai_trace).filter((s) => attrs(s)["gen_ai.operation.name"] === "chat");
+    assert.equal(chats.length, 2);
+    assert.deepEqual(JSON.parse(attrs(chats[0])["gen_ai.input.messages"]), [
+      { role: "user", parts: [{ type: "text", content: wrapped }] },
+    ]);
+  });
+
   it("records an errored model call as an error, never as an answer", () => {
     const root = tmp();
     const turns = createTurnCapture({ root });

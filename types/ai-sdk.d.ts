@@ -9,9 +9,12 @@ export function flywheelTools<T>(tools: T): T;
 /** A middleware for `wrapLanguageModel` that reports the model's input. */
 export function flywheelMiddleware(): {
   middlewareVersion: "v2";
+  transformParams: (options: { params: any }) => Promise<any>;
   wrapGenerate: (options: { doGenerate: () => PromiseLike<any>; params: any; model: any }) => Promise<any>;
   wrapStream: (options: { doStream: () => PromiseLike<any>; params: any; model: any }) => Promise<any>;
 };
 
 /** The model input `flywheelMiddleware` reports, from the AI SDK's call options. */
 export function modelInputOf(params: unknown, model: unknown): ModelInput;
+/** `params` with each named function tool's description replaced by `overlay`'s, as a copy. */
+export function applyToolDescriptionsToParams<T>(params: T, overlay: Record<string, string> | null): T;

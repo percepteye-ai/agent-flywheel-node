@@ -15,3 +15,5 @@ export function flywheelCallbacks(turn?: FlywheelTurn | null): {
 
 /** The chat-model input `flywheelCallbacks` reports. */
 export function modelInputOf(llm: unknown, messages: unknown, extraParams?: unknown, runName?: string): ModelInput;
+/** `tools` with the current turn's approved descriptions applied, as copies. */
+export function applyToolDescriptions<T>(tools: T, turn?: FlywheelTurn | null): T;

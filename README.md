@@ -35,9 +35,9 @@ One `npm install`. Zero runtime dependencies. It keeps running where it runs tod
      checks. Every other badge here is a hardcoded shields `/badge/`.
 
      Separately: the `tests` badge below is hardcoded and nothing checks it;
-     its 1243 was true on 2026-11-20 (it had drifted to 1213, 1203, 1012, 1001, 989, 983, 944, 862, 861, 859, 850, 829, 826, 781, 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
+     its 1267 was true on 2026-11-21 (it had drifted to 1243, 1213, 1203, 1012, 1001, 989, 983, 944, 862, 861, 859, 850, 829, 826, 781, 780, 773, 763, 749, 745, 729, 725, 683, 666, 633, 596, 490,
      and before that 373, while the suite grew). Re-derive with `npm test`
-     (prints "tests 1243" / "skipped 0", with the Python SDK checkout found)
+     (prints "tests 1267" / "skipped 0", with the Python SDK checkout found)
      before trusting it — the Python SDK's equivalent badge had drifted to 54
      short. -->
 [![ci](https://img.shields.io/github/actions/workflow/status/percepteye-ai/agent-flywheel-node/ci.yml?branch=main&label=ci&style=for-the-badge&logo=githubactions&logoColor=white&color=22c55e)](https://github.com/percepteye-ai/agent-flywheel-node/actions)
@@ -45,7 +45,7 @@ One `npm install`. Zero runtime dependencies. It keeps running where it runs tod
 [![node](https://img.shields.io/badge/node-%E2%89%A522.22.3-8b5cf6?style=for-the-badge&logo=nodedotjs&logoColor=white)](package.json)
 [![TypeScript](https://img.shields.io/badge/types-included-3178c6?style=for-the-badge&logo=typescript&logoColor=white)](types/index.d.ts)
 [![runtime dependencies](https://img.shields.io/badge/runtime_deps-0-f59e0b?style=for-the-badge)](#-why-it-earns-its-place)
-[![tests](https://img.shields.io/badge/tests-1243_·_0_skips-22c55e?style=for-the-badge)](#-develop)
+[![tests](https://img.shields.io/badge/tests-1267_·_0_skips-22c55e?style=for-the-badge)](#-develop)
 [![license](https://img.shields.io/badge/license-MIT-14b8a6?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -372,7 +372,7 @@ fw.reportTurnFeedback("corrected", { episodeId, turnIndex: 3 });  // what the us
 
 `episodeId` is one more thing an outcome can name, alone or beside a `turnId` or `conversationId`. `reportTurnFeedback` is the Python SDK's `report_turn_feedback`: one word from a closed vocabulary — `accepted`, `corrected`, `repeated`, `escalated`, `abandoned` (`TURN_FEEDBACK_SIGNALS`) — and anything else throws `InvalidFeedback` naming the five. It returns the feedback's id (`feedbackId` is the idempotency key if you want your own; `occurredAt` defaults to now) and is queued as one `.feedback.<digest>.json` file, uploaded without being awaited and retried exactly as an outcome is. Neither is your end users' production traffic, so **neither waits for production capture to be enabled**: an outcome naming only an episode, and all feedback, are sent as soon as the SDK has a key. Both are weak labels — kept beside the episode's evidence as readings, never a grade. No answer of the control plane reaches your code. Per-turn feedback follows the outcomes' rules: a report the control plane refuses — in a 4xx, or by name inside a 200 (`accepted: false`) — is dropped alone, named in one warning with the control plane's own word, and the rest of its batch is sent; a 403 (a key without the scope) stops sending for that process and keeps what is waiting on disk; a 401 or 410 keeps it for a later flush. Only a control plane with no feedback route at all (a 404 or 405: it predates it) has what was waiting dropped, said once, and no more sent by that process. A control plane whose episode intake is switched off answers 503 with a Retry-After: the request is retried as the header says, and what is waiting stays for a later flush. An id or a note holding a lone surrogate throws where you wrote it, as the control plane would refuse it.
 
-**Feedback on a production turn rides its trace.** A production turn has no episode, so `fw.reportTurnFeedback("corrected", { turnId })` names it by the id it was captured under instead, and its feedback goes where the turn went: your TracerProvider (with `@opentelemetry/api` installed). The turn's span has ended by the time its user acts, and an ended span takes no event, so the SDK records a span of its own, `percepteye.turn.feedback`, LINKED to the turn's spans (OpenTelemetry's relation between causally related spans that are not parent and child) and carrying the turn's `percepteye.turn.id`, with one event: `percepteye.turn.feedback` at `occurredAt`, attributes `percepteye.turn.feedback.signal` and `percepteye.turn.feedback.id`. It starts a trace of its own. An OTLP export of your traces to the control plane delivers it with the turn. It returns the feedback's id once that span is recorded and `null` when nothing records it — nothing is queued, because `POST /turn-feedback` takes an episode's turns only. Name a turn one way: `turnId`, or `episodeId` and `turnIndex`. The Python SDK's `report_turn_feedback(..., turn_id=)`, the same span.
+**Feedback on a production turn is uploaded and rides its trace.** A production turn has no episode, so `fw.reportTurnFeedback("corrected", { turnId })` names it by the id it was captured under instead. It is queued and uploaded like an episode's (`POST /turn-feedback` takes a production turn by its `turn_id`), and it also goes where an OTLP-exported turn went: your TracerProvider (with `@opentelemetry/api` installed). The turn's span has ended by the time its user acts, and an ended span takes no event, so the SDK records a span of its own, `percepteye.turn.feedback`, LINKED to the turn's spans (OpenTelemetry's relation between causally related spans that are not parent and child) and carrying the turn's `percepteye.turn.id`, with one event: `percepteye.turn.feedback` at `occurredAt`, attributes `percepteye.turn.feedback.signal` and `percepteye.turn.feedback.id`. It starts a trace of its own. An OTLP export of your traces to the control plane delivers it with the turn. It returns the feedback's id once it is queued or that span is recorded, and `null` when neither happened. Name a turn one way: `turnId`, or `episodeId` and `turnIndex`. The Python SDK's `report_turn_feedback(..., turn_id=)`, the same upload and the same span.
 
 **What your model saw is a second, separate opt-in, also off by default.** With the model-content tier granted for the agent, the SDK also records each turn's model boundary — the system prompt, the history, the prompt and the tool definitions the adapters reported, and the answer — and the turn uploads it as one [OpenTelemetry GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) trace (`genai_trace`), rendered byte-for-byte as the Python SDK renders it. Without the grant none of it is recorded, not even locally; when the control plane refuses a trace by name the SDK stops recording it. The control plane grants the tier only while exactly one active Product declares the agent, because a trace is kept only for a turn it can attribute to a Product. A turn the SDK cannot reconstruct faithfully records no model boundary at all rather than a guessed one.
 
@@ -496,6 +496,20 @@ Nothing is pushed into your agent. The SDK pulls, and **hands your agent the swa
 4. The turn that noticed keeps its prompt. The next turn runs the new one, and the log names the switch. An empty answer or a failed read keeps the prompt already applied; a withdrawal is the one answer that takes it away, and your own prompt runs from the next turn.
 
 The delay is roughly one `ttl_s` plus one turn after the approval, with no redeploy and no restart. The model half is read once at startup; picking up a new model needs a restart.
+
+### Tool descriptions, approved with the prompt
+
+An approved prompt may also carry rewritten descriptions for your agent's tools. `/prompt/current` serves them as `tool_descriptions` beside the text, `promptDecision` exposes them as `tool_descriptions` only when the decision applies (an absent or malformed overlay is none), and a turn running that prompt hands them to your agent as `t.toolDescriptions` and `t.toolDescription(name, yours)`. The AI SDK middleware applies them to the tools each call sends; with LangChain.js, `model.bindTools(applyToolDescriptions(tools))` (from `/langchain`) inside the turn binds copies. Your tools are never edited.
+
+### Turn feedback and full traces feed it
+
+The optimizer learns from the whole trace -- every model call and tool execution of a turn, which the AI SDK middleware, `flywheelTools` and the LangChain.js callbacks record -- and from what your users did with each turn: `fw.reportTurnFeedback("corrected", { turnId })` uploads that signal for a production turn. For an agent that calls a provider directly, one line records every model call of a turn under the model-content tier, observing only:
+
+```js
+import OpenAI from "openai";
+import { wrapOpenAI } from "@percepteye/agent-flywheel";   // also wrapAnthropic, wrapGemini
+const client = wrapOpenAI(new OpenAI());
+```
 
 ### Approving a new prompt
 
@@ -678,7 +692,7 @@ The install, the one host setting it needs (`allowConversationAccess`), what eac
 ## 🛠 Develop
 
 ```bash
-npm test     # 1243 tests, no install step — node:test, zero dependencies
+npm test     # 1267 tests, no install step — node:test, zero dependencies
 ```
 
 The tests that compare this package with the Python SDK (fixtures, the wire schema, the evidence vocabulary) read a Python checkout: name one with `PERCEPTEYE_PYTHON_SDK`, or keep it as a sibling directory. A named checkout that lacks a file fails the test; with none found, those tests skip.

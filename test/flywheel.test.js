@@ -9,6 +9,8 @@ import { join } from "node:path";
 import {
   currentTurn, flywheel, recordToolCall, ToolCallBlocked,
 } from "../src/index.js";
+import { flywheelMiddleware } from "../src/adapters/ai-sdk.js";
+import { applyToolDescriptions } from "../src/adapters/langchain.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 
@@ -216,6 +218,62 @@ describe("flywheel().turn(): the approved pair, handed to the agent", () => {
         assert.deepEqual(t.model, {
           baseURL: `${cp.base}/llm/v1/agents/support-agent/v1`, apiKey: "pefw_test", model: "ckpt-7",
         });
+        return "ok";
+      });
+      await fw.close();
+    } finally {
+      await cp.close();
+    }
+  });
+
+  it("hands the tool descriptions approved WITH the prompt, and the adapters apply them", async () => {
+    // Design 2026-11-21, contract B. Mutations: drop the symbol from the
+    // prompt hook's result -- red; drop transformParams -- red.
+    const tools = { lookup: "Look the order up first.", refund: "Refund only shipped orders." };
+    const cp = await fakeControlPlane({
+      policy: served({ base_url: "https://gpu.example/v1", model: "ckpt-7" }),
+      prompt: { ...APPROVED_PROMPT, tool_descriptions: tools },
+    });
+    try {
+      const fw = flywheel({ agentId: "support-agent", logger: quiet }, productionEnv(cp.base));
+      await ready(fw);
+      await fw.turn("hi", async (t) => {
+        assert.deepEqual(t.toolDescriptions, tools);
+        assert.equal(t.toolDescription("lookup", "mine"), tools.lookup);
+        assert.equal(t.toolDescription("unnamed", "mine"), "mine");
+        const params = { prompt: [], tools: [
+          { type: "function", name: "lookup", description: "old", inputSchema: {} },
+          { type: "function", name: "other", description: "kept", inputSchema: {} },
+        ] };
+        const sent = await flywheelMiddleware().transformParams({ params });
+        assert.deepEqual(sent.tools.map((x) => x.description), [tools.lookup, "kept"]);
+        assert.equal(params.tools[0].description, "old", "the caller's params are not edited");
+        class Tool { constructor(name) { this.name = name; this.description = "old"; } }
+        const original = new Tool("refund");
+        const [bound] = applyToolDescriptions([original]);
+        assert.ok(bound instanceof Tool);
+        assert.equal(bound.description, tools.refund);
+        assert.equal(original.description, "old");
+        return "ok";
+      });
+      await fw.close();
+    } finally {
+      await cp.close();
+    }
+  });
+
+  it("hands no tool descriptions when the bundle ships none, and changes no tool", async () => {
+    const cp = await fakeControlPlane({
+      policy: served({ base_url: "https://gpu.example/v1", model: "ckpt-7" }),
+      prompt: APPROVED_PROMPT,
+    });
+    try {
+      const fw = flywheel({ agentId: "support-agent", logger: quiet }, productionEnv(cp.base));
+      await ready(fw);
+      await fw.turn("hi", async (t) => {
+        assert.equal(t.toolDescriptions, null);
+        const params = { prompt: [], tools: [{ type: "function", name: "lookup", description: "old" }] };
+        assert.equal(await flywheelMiddleware().transformParams({ params }), params);
         return "ok";
       });
       await fw.close();

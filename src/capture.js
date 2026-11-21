@@ -99,7 +99,8 @@ import {
   CONVERSATION_ID_FILENAME, TURNS_FILENAME,
   lastWrittenAt, listTurnDirs, readConversationId, readModelBoundary,
   readTaskId, recordConversationId,
-  recordModelBoundary, recordTaskId, recordTurnText,
+  recordModelBoundary, recordModelBoundaryEnd, recordModelOperation,
+  recordTaskId, recordTurnText,
   recordExecutionFingerprint, recordExecutionFingerprintConflict, safeTurnId,
   scanTurns, turnDir, turnIndices, turnWire,
 } from "./turns.js";
@@ -701,6 +702,13 @@ export function createTurnCapture({
     pendingSizes.delete(turnId);
     pendingInputs.delete(turnId);
   };
+  // THE TURNS WHOSE MODEL BOUNDARY IS RECORDED AS IT HAPPENS
+  // (`onModelOperation`): every model call and tool execution, observed by a
+  // framework adapter. Such a turn is never ALSO reconstructed from its first
+  // `llm_input` and its `agent_end` -- that reconstruction sees one prefix and
+  // a transcript, and the framework host's transcript is only the user's
+  // message and the final answer. Bounded like the maps below.
+  const directTurns = new Set();
   // Invalid host ids are never cleaned into a different caller id. They get a
   // fresh safe id, retained only long enough to keep this run's hooks joined.
   const generatedTurnIds = new Map();
@@ -780,6 +788,7 @@ export function createTurnCapture({
     const turnId = turnIdFor(event?.runId ?? ctx?.runId);
     if (turnId === null) return false;
     touch(turnId);
+    if (directTurns.has(turnId)) return false;
     try {
       const prior = pendingInputs.get(turnId);
       // A SECOND llm_input in one run means the model saw a second prefix
@@ -824,6 +833,33 @@ export function createTurnCapture({
     }
   }
 
+  /**
+   * One model call or tool execution of a running turn, observed by a
+   * framework adapter as it happened (`op` is one operation of the model
+   * boundary, see `genai-otlp.js`). `start` is the turn's start, decimal
+   * nanoseconds. OBSERVE ONLY, and nothing is written without model-content
+   * consent. Never throws.
+   */
+  function onModelOperation(op, ctx = {}, { start } = {}) {
+    try {
+      if (!mayRecordModelContent() || !inScope(null, ctx)) return false;
+      const turnId = turnIdFor(ctx?.runId);
+      if (turnId === null) return false;
+      touch(turnId);
+      if (!directTurns.has(turnId)) {
+        directTurns.add(turnId);
+        while (directTurns.size > 4096) directTurns.delete(directTurns.values().next().value);
+      }
+      // Whatever `llm_input` held for this turn is superseded: the calls
+      // themselves are recorded.
+      forgetInput(turnId);
+      return recordModelOperation(turnDir(root, turnId), op,
+        typeof start === "string" && start ? start : nowUnixNano());
+    } catch {
+      return false;
+    }
+  }
+
   /** The agent's answer. */
   function onAgentEnd(event, ctx = {}) {
     if (!inScope(event, ctx)) return false;
@@ -838,7 +874,9 @@ export function createTurnCapture({
     const wroteConversation = conversationId
       ? recordConversationId(dir, conversationId) : false;
     const wroteTaskId = taskId ? recordTaskId(dir, taskId) : false;
-    const wroteBoundary = recordRunBoundary(turnId, dir, event?.messages);
+    const wroteBoundary = directTurns.delete(turnId)
+      ? (forgetInput(turnId), recordModelBoundaryEnd(dir, nowUnixNano()))
+      : recordRunBoundary(turnId, dir, event?.messages);
     const text = lastAssistantText(event?.messages);
     if (!text) return wroteConversation || wroteTaskId || wroteBoundary;
     try {
@@ -906,7 +944,9 @@ export function createTurnCapture({
 
   return {
     root, onMessageReceived, onAgentEnd, onExecutionIdentity, onLlmInput,
-    gateModelContent, resolveToolDir, activeTurns,
+    onModelOperation, gateModelContent, resolveToolDir, activeTurns,
+    /** Whether a model call observed now may be recorded at all. */
+    mayRecordModelContent: () => mayRecordModelContent() === true,
   };
 }
 
@@ -1028,16 +1068,18 @@ export function outcomeWire(outcome, {
  * arguments.
  */
 export function feedbackWire(signal, {
-  episodeId, turnIndex, occurredAt, feedbackId,
+  episodeId, turnIndex, turnId, occurredAt, feedbackId,
 } = {}) {
-  return turnFeedback({
+  const wire = {
     feedback_id: feedbackId === undefined || feedbackId === null
       ? `f_${randomUUID().replaceAll("-", "")}` : feedbackId,
     episode_id: episodeId,
     turn_index: turnIndex,
     signal,
     occurred_at: rfc3339(occurredAt, InvalidFeedback),
-  });
+  };
+  if (turnId !== undefined && turnId !== null) wire.turn_id = turnId;
+  return turnFeedback(wire);
 }
 
 /** Whether a `reportTurnFeedback` call names a production turn (`turnId`). */
@@ -1046,14 +1088,14 @@ function namesAProductionTurn(options) {
 }
 
 /**
- * `reportTurnFeedback` for a PRODUCTION TURN (`turnId`, the run id the turn
- * was captured under, in place of `episodeId` and `turnIndex`): validated by
- * `turnFeedbackOnASpan`, emitted by `recordTurnFeedbackSpan` -- an event on
- * the turn's trace, through the customer's TracerProvider, which an OTLP
- * export to the control plane delivers with the turn. `POST /turn-feedback`
- * takes an episode's turns only, so nothing is queued for it. The id once the
- * span is recorded, else `null`. The Python SDK's
- * `Attachment._report_turn_feedback_on_its_span`.
+ * `reportTurnFeedback`'s SPAN for a PRODUCTION TURN (`turnId`, the run id
+ * the turn was captured under, in place of `episodeId` and `turnIndex`):
+ * validated by `turnFeedbackOnASpan`, emitted by `recordTurnFeedbackSpan` --
+ * an event on the turn's trace, through the customer's TracerProvider, for an
+ * agent whose turns reach the control plane over OTLP. The same report is
+ * ALSO uploaded over `POST /turn-feedback` by the uploader, which takes a
+ * production turn by its `turn_id`. The id once the span is recorded, else
+ * `null`. The Python SDK's `Attachment._report_turn_feedback_on_its_span`.
  */
 export function reportTurnFeedbackOnItsSpan(signal, {
   turnId, episodeId, turnIndex, occurredAt, feedbackId,
@@ -1445,18 +1487,26 @@ export function createTurnUploader({
    * queued, else `null`; the upload happens off the caller's path.
    */
   function reportTurnFeedback(signal, options = {}) {
+    let recorded = false;
+    let wire;
     if (namesAProductionTurn(options)) {
-      return reportTurnFeedbackOnItsSpan(signal, options);
+      // A production turn's feedback is on its trace AND uploaded here, by
+      // its turn_id: one id for both, minted once.
+      const feedbackId = options.feedbackId ?? `f_${randomUUID().replaceAll("-", "")}`;
+      recorded = reportTurnFeedbackOnItsSpan(signal, { ...options, feedbackId }) !== null;
+      wire = feedbackWire(signal, { ...options, feedbackId });
+    } else {
+      wire = feedbackWire(signal, options);
     }
-    const wire = feedbackWire(signal, options);
-    if (turnFeedbackRefused) return null;
+    const said = recorded ? wire.feedback_id : null;
+    if (turnFeedbackRefused) return said;
     const path = feedbackFile(root, wire.feedback_id);
     try {
       mkdirSync(root, { recursive: true });
       replaceFile(path, sortedJson(wire));
     } catch {
       // Capture costs the observation, never the caller.
-      return null;
+      return said;
     }
     flush({
       includeUnanswered: !answersExpected, settleMs: UNANSWERED_SETTLE_MS,
@@ -2406,8 +2456,8 @@ export function registerTurnCapture(api, {
    * feedback is an event on its trace (`reportTurnFeedbackOnItsSpan`).
    */
   function reportTurnFeedback(signal, options = {}) {
-    if (namesAProductionTurn(options)) {
-      // Its trace carries it, not the control plane's route: no key needed.
+    if (namesAProductionTurn(options) && !uploader) {
+      // No control plane to upload to: its trace alone carries it.
       return reportTurnFeedbackOnItsSpan(signal, options);
     }
     if (!uploader) {

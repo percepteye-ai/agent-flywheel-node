@@ -320,6 +320,10 @@ export const providerRefusedReason = (detail) =>
  * inputs, which is how its startup line came to promise a model half that a
  * refused provider registration had already ruled out.
  */
+/** The key the approved tool descriptions ride under on the prompt hook's
+ * result: invisible to a host that merges results by named fields. */
+export const TOOL_DESCRIPTIONS = Symbol.for("percepteye.agent-flywheel.tool_descriptions");
+
 export const PENDING_ANSWER_REASON = "the control plane has not been asked yet";
 
 /**
@@ -374,6 +378,32 @@ const isArchiveRef = (value) =>
  * @returns {{apply: boolean, text: string|null, reason: string,
  *            checksum: string|null}}
  */
+/** Bounds on a served overlay, the control plane's own. */
+const TOOL_DESCRIPTIONS_MAX = 256;
+const TOOL_DESCRIPTION_MAX_CHARS = 8192;
+
+/**
+ * A served tool-description overlay (design 2026-11-21, contract B), or
+ * null. FAIL-OPEN and WHOLE OR NOTHING, word for word the Python SDK's
+ * `tool_descriptions_of`: absent, not an object, empty, over the bounds, or
+ * any entry that is not a non-empty name to a non-empty description, and
+ * there is no overlay -- the agent's own descriptions stand. In name order.
+ */
+export function toolDescriptionsOf(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (!entries.length || entries.length > TOOL_DESCRIPTIONS_MAX) return null;
+  for (const [name, description] of entries) {
+    if (!(name.trim() && typeof description === "string" && description.trim()
+          && description.length <= TOOL_DESCRIPTION_MAX_CHARS)) {
+      return null;
+    }
+  }
+  // Code-point order, as Python's `sorted` orders str keys.
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return Object.fromEntries(entries);
+}
+
 export function promptDecision(prompt) {
   const p = prompt && typeof prompt === "object" ? prompt : {};
   const text = typeof p.text === "string" ? p.text : "";
@@ -383,7 +413,10 @@ export function promptDecision(prompt) {
   // nothing approved is left. Unlike `{}` below, this is an instruction to
   // stop applying: the prompt the host assembles is what runs now.
   if (p.withdrawn === true) {
-    return { apply: false, text: null, checksum, reason: WITHDRAWN_REASON };
+    return {
+      apply: false, text: null, checksum, reason: WITHDRAWN_REASON,
+      tool_descriptions: null,
+    };
   }
 
   // `{}` IS AN ANSWER, and it is "keep what you have". No product declares
@@ -392,7 +425,7 @@ export function promptDecision(prompt) {
   // host's own prompt stands. It never means "run with no prompt".
   if (!text.trim()) {
     return {
-      apply: false, text: null, checksum,
+      apply: false, text: null, checksum, tool_descriptions: null,
       reason: "the control plane is serving no approved prompt for this " +
         "agent (empty answer); the prompt this host assembles stands",
     };
@@ -406,7 +439,7 @@ export function promptDecision(prompt) {
   // Re-certification is manual, so this does not clear on its own.
   if (p.stale_baseline === true) {
     return {
-      apply: false, text: null, checksum,
+      apply: false, text: null, checksum, tool_descriptions: null,
       reason: "stale_baseline=true: this agent's own baseline prompt changed " +
         "after the pair was certified, so the approved text was shaped " +
         "against a prompt this agent no longer ships. Re-certification is " +
@@ -417,7 +450,7 @@ export function promptDecision(prompt) {
   const status = str(p.status);
   if (!SERVABLE_PROMPT_STATUSES.has(status)) {
     return {
-      apply: false, text: null, checksum,
+      apply: false, text: null, checksum, tool_descriptions: null,
       reason: `the served bundle's status is ${JSON.stringify(status)}, not ` +
         `one of ${[...SERVABLE_PROMPT_STATUSES].join("/")}; only an operator-` +
         "approved bundle is applied",
@@ -438,7 +471,7 @@ export function promptDecision(prompt) {
   const sha = str(p.sha256);
   if (sha && checksum && sha !== checksum) {
     return {
-      apply: false, text: null, checksum,
+      apply: false, text: null, checksum, tool_descriptions: null,
       reason: `the bundle disagrees with itself: the prompt's sha256 is ` +
         `${short(sha)} but the checkpoint it was certified against is ` +
         `stamped ${short(checksum)}. Assembly refuses that pair, so this ` +
@@ -446,7 +479,10 @@ export function promptDecision(prompt) {
     };
   }
 
-  return { apply: true, text, checksum, reason: "" };
+  return {
+    apply: true, text, checksum, reason: "",
+    tool_descriptions: toolDescriptionsOf(p.tool_descriptions),
+  };
 }
 
 /**
@@ -772,6 +808,8 @@ export function createPolicySource({
   let policy = {};
   let prompt = {};
   let applied = null;
+  // The tool descriptions approved WITH `applied`, set and cleared with it.
+  let appliedTools = null;
   let appliedModel = null;
   // THE PROMPT HALF'S RUNNING STATE: the decision in force, the generation it
   // was read at, and what the re-read needs (see "RESOLVED AT START; THE
@@ -1012,12 +1050,14 @@ export function createPolicySource({
         : "";
       if (!decision.apply) {
         applied = null;
+        appliedTools = null;
         refusal = decision.reason;
         logger?.info?.(
           `[${pluginId}] the approved system prompt is NOT being applied: ` +
           `${refusal}.`);
       } else {
         applied = decision.text;
+        appliedTools = decision.tool_descriptions ?? null;
         refusal = null;
         logger?.info?.(
           `[${pluginId}] applying the approved system prompt ` +
@@ -1078,6 +1118,7 @@ export function createPolicySource({
         prompt = answer || {};
         if (decision.apply) {
           applied = decision.text;
+        appliedTools = decision.tool_descriptions ?? null;
           refusal = null;
           logger?.info?.(
             `[${pluginId}] the control plane approved a newer system prompt ` +
@@ -1086,12 +1127,14 @@ export function createPolicySource({
             `${PROMPT_HOOK_NAME}.`);
         } else if (prompt.withdrawn === true) {
           applied = null;
+          appliedTools = null;
           refusal = decision.reason;
           logger?.info?.(
             `[${pluginId}] a person withdrew the approved system prompt; ` +
             "the prompt this host assembles runs from the next turn.");
         } else {
           applied = null;
+          appliedTools = null;
           refusal = decision.reason;
           logger?.info?.(
             `[${pluginId}] the newest approved system prompt is NOT being ` +
@@ -1152,7 +1195,13 @@ export function createPolicySource({
           `'${servedAgent.id}'; the approved prompt was returned to it. ` +
           "Whether the host applies the return is the host's decision.");
       }
-      return { systemPrompt: applied };
+      // The tool descriptions ride under a SYMBOL: a host merges results by
+      // their named fields and never sees it; the framework host
+      // (`flywheel.js`) reads it to hand the turn the overlay approved WITH
+      // this exact text (design 2026-11-21, contract B).
+      return appliedTools
+        ? { systemPrompt: applied, [TOOL_DESCRIPTIONS]: appliedTools }
+        : { systemPrompt: applied };
     },
 
     /**
