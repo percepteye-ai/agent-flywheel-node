@@ -272,6 +272,18 @@ Installing the SDK is half of the flywheel. **The other half writes the tasks, g
 
 <br/>
 
+
+### Structured replies: declare them
+
+When your agent needs a reply it will parse as JSON -- a judge's verdict, a
+tool-routing decision -- declare it on the call with `response_format`
+(`{"type": "json_object"}` or `{"type": "json_schema", ...}`). Every model the
+control plane routes to then hands back bare JSON, including models that would
+otherwise wrap it in a markdown fence. A call that declares nothing gets the
+reply exactly as the model wrote it: asking for JSON only in the prompt's
+wording is not a contract the platform reads. The SDK never changes your
+call's `response_format`; it records it on the turn's trace.
+
 ## 🔁 How the loop closes
 
 <p align="center">
