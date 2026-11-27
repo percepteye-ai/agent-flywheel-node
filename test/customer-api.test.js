@@ -1,6 +1,6 @@
 import "./support/home.js";
 /**
- * The customer API reads (contract 1.54.0), case for case with the Python
+ * The customer API reads (contract 1.58.0), case for case with the Python
  * SDK's tests/test_customer_api.py.
  */
 import assert from "node:assert/strict";
@@ -27,8 +27,8 @@ function fake(status, body) {
 const KEY = "mck_test_key_value_123456";
 
 describe("customer api", () => {
-  it("pins contract 1.54.0 and its new codes", () => {
-    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.54.0");
+  it("pins contract 1.58.0 and its new codes", () => {
+    assert.equal(CUSTOMER_CONTRACT_VERSION, "1.58.0");
     assert.deepEqual([...ATTACK_REFUSAL_CODES], [
       "attack_set_is_sealed",
       "attack_resistance_measuring",

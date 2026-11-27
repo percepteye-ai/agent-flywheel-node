@@ -589,7 +589,7 @@ That line is real output from a live run, and it is the same format the Python S
 
 ## 📋 Runs, eligibility and evaluation sets
 
-`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.54.0; every read works against a server from 1.30.0 on) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
+`@percepteye/agent-flywheel/customer-api` reads the customer-automation API (customer contract 1.58.0; every read works against a server from 1.30.0 on) on the same origin as the control plane, under `/api/v2`. It needs a customer-automation key (`mck_`, from `pe login` or the dashboard's Settings), passed as `apiKey` or set as `PERCEPTEYE_MC_API_KEY`. An agent key (`pefw_`) is refused before anything is sent.
 
 ```js
 import { CustomerApiClient } from "@percepteye/agent-flywheel/customer-api";

@@ -1,5 +1,5 @@
 /**
- * Reads of the customer-automation API (customer contract 1.54.0).
+ * Reads of the customer-automation API (customer contract 1.58.0).
  *
  * The rest of this package speaks the agent contract (`flywheel/1`) under
  * `/api/flywheel/v1` with an agent's `pefw_` key. The runs list, training
@@ -26,7 +26,13 @@ import {
 } from "./http.js";
 import { urlSegment } from "./transport.js";
 
-export const CUSTOMER_CONTRACT_VERSION = "1.54.0";
+// 1.55.0-1.58.0 add response fields this SDK passes through as returned
+// (prompt_optimization.needs `recorded_traces`; eligibility's
+// opsd.trainable_model_notes / trainable_models_catalog; a certification's
+// statistical_caveat and a result's promotable; a model selection's
+// base_treatment) and one refusal code (opsd_base_needs_dequantization): no
+// read changes shape. The Python SDK declares the same.
+export const CUSTOMER_CONTRACT_VERSION = "1.58.0";
 const MAJOR = CUSTOMER_CONTRACT_VERSION.split(".")[0];
 
 export const ENV_CUSTOMER_API_KEY = "PERCEPTEYE_MC_API_KEY";
