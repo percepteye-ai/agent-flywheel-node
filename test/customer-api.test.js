@@ -56,6 +56,7 @@ describe("customer api", () => {
       "base_model_unresolvable", "destination_algorithm_unsupported",
       "provider_checkpoint_not_owned", "hillclimb_start_invalid",
       "base_merge_failed", "authority_ruling_requires_org_admin",
+      "opsd_base_needs_dequantization",
     ]);
     assert.deepEqual([...RUN_LIST_REFUSAL_CODES], [
       "launch_uri_outside_org", "run_page_too_deep",
@@ -278,6 +279,9 @@ describe("customer api", () => {
       // 1.54.0: a ruling on the reward plan's Decision by anyone but an org
       // admin.
       authority_ruling_requires_org_admin: 403,
+      // 1.58.0: a base the GPU host trains only once dequantized, reached
+      // before its conversion.
+      opsd_base_needs_dequantization: 409,
     };
     const known = [...RUN_LIST_REFUSAL_CODES, ...PROMPT_RUN_REFUSAL_CODES, ...ATTACK_REFUSAL_CODES,
       ...CYBER_REFUSAL_CODES, ...TRAINING_REFUSAL_CODES, ...AGENT_REFUSAL_CODES];

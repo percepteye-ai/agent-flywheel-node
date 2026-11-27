@@ -105,7 +105,9 @@ export const CYBER_REFUSAL_CODES = Object.freeze([
  * hill climb started from a trained model it cannot start from, and the merge
  * of that model into its base failing, the platform's (1.52.0); a ruling on
  * the reward plan's Decision -- what decides whether an attempt succeeded --
- * by anyone but an org admin (1.54.0).
+ * by anyone but an org admin (1.54.0); a base stored in a format the GPU host
+ * trains only once dequantized, reached before its conversion (409, retryable,
+ * the platform's: the hill climb door converts it first) (1.58.0).
  */
 export const TRAINING_REFUSAL_CODES = Object.freeze([
   "opsd_prompts_exceed_host",
@@ -124,6 +126,7 @@ export const TRAINING_REFUSAL_CODES = Object.freeze([
   "hillclimb_start_invalid",
   "base_merge_failed",
   "authority_ruling_requires_org_admin",
+  "opsd_base_needs_dequantization",
 ]);
 /**
  * Why a round with your agent is refused before anything is spent (1.51.0;
